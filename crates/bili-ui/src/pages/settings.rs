@@ -8,7 +8,6 @@ use crate::theme;
 pub fn settings_page(
     settings: &AppSettings,
     is_vip: bool,
-    settings_path: &str,
     save_status: Option<&str>,
     on_change: &Callback<AppSettings>,
 ) -> View {
@@ -18,26 +17,9 @@ pub fn settings_page(
 
     let effective_qn = settings.quality.effective_max_qn(is_vip);
     let qn_hint = if settings.quality.qn() > effective_qn {
-        format!(
-            "当前账号非大会员，播放最高将以 1080P (qn={effective_qn}) 解析（登录后大会员账号自动生效 {}）",
-            settings.quality.label()
-        )
+        "非大会员画质上限 1080P"
     } else {
-        format!("当前将按 {} (上限 qn={effective_qn}) 请求播放地址", settings.quality.label())
-    };
-
-    let info_title = if save_status.is_some() {
-        "配置持久化状态"
-    } else {
-        "已接入持久化"
-    };
-    let info_msg = save_status
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("设置实时同步并原子写入：{settings_path}"));
-    let info_severity = if save_status.is_some_and(|s| s.contains("失败") || s.contains("回退")) {
-        InfoBarSeverity::Warning
-    } else {
-        InfoBarSeverity::Success
+        settings.quality.label()
     };
 
     let on_quality = {
@@ -160,23 +142,23 @@ pub fn settings_page(
     let playback_card = card(
         StackPanel::new().spacing(16.0).children((
             RadioButtons::new()
-                .header("首选清晰度")
+                .header("清晰度")
                 .items_source(quality_labels)
                 .selected_index(settings.quality.index())
                 .on_selection_changed(on_quality),
             ComboBox::new()
-                .header("编码偏好")
+                .header("视频编码")
                 .items_source(codec_labels)
                 .selected_index(settings.codec.index())
                 .on_selection_changed(on_codec),
             ToggleSwitch::new()
-                .header("进入播放页自动播放")
+                .header("自动播放")
                 .on_content("开")
                 .off_content("关")
                 .is_on(settings.autoplay)
                 .on_toggled(on_autoplay),
             ToggleSwitch::new()
-                .header("硬件解码优先（D3D11VA）")
+                .header("硬件解码")
                 .on_content("开")
                 .off_content("关")
                 .is_on(settings.hardware_decode)
@@ -185,43 +167,55 @@ pub fn settings_page(
     )
     .grid_column(0);
 
-    let danmaku_card = card(
-        StackPanel::new().spacing(16.0).children((
-            Slider::new()
-                .header(format!("默认音量（{}%）", settings.volume))
-                .minimum(0.0)
-                .maximum(100.0)
-                .value(f64::from(settings.volume))
-                .on_value_changed(on_volume),
-            ToggleSwitch::new()
-                .header("弹幕显示")
-                .on_content("开")
-                .off_content("关")
-                .is_on(settings.danmaku_enabled)
-                .on_toggled(on_danmaku),
-            Slider::new()
-                .header(format!("弹幕不透明度（{}%）", opacity_pct))
-                .minimum(10.0)
-                .maximum(100.0)
-                .value(f64::from(opacity_pct))
-                .on_value_changed(on_opacity),
-            NumberBox::new()
-                .header("滚动弹幕最大轨道数（1–20）")
-                .minimum(1.0)
-                .maximum(20.0)
-                .small_change(1.0)
-                .spin_button_placement_mode(NumberBoxSpinButtonPlacementMode::Inline)
-                .value(settings.danmaku_max_lanes as f64)
-                .on_value_changed(on_lanes),
+    let mut danmaku_items: Vec<View> = vec![
+        Slider::new()
+            .header(format!("默认音量 {}%", settings.volume))
+            .minimum(0.0)
+            .maximum(100.0)
+            .value(f64::from(settings.volume))
+            .on_value_changed(on_volume)
+            .into(),
+        ToggleSwitch::new()
+            .header("弹幕")
+            .on_content("开")
+            .off_content("关")
+            .is_on(settings.danmaku_enabled)
+            .on_toggled(on_danmaku)
+            .into(),
+        Slider::new()
+            .header(format!("弹幕透明度 {}%", opacity_pct))
+            .minimum(10.0)
+            .maximum(100.0)
+            .value(f64::from(opacity_pct))
+            .on_value_changed(on_opacity)
+            .into(),
+        NumberBox::new()
+            .header("弹幕轨道上限")
+            .minimum(1.0)
+            .maximum(20.0)
+            .small_change(1.0)
+            .spin_button_placement_mode(NumberBoxSpinButtonPlacementMode::Inline)
+            .value(settings.danmaku_max_lanes as f64)
+            .on_value_changed(on_lanes)
+            .into(),
+        Button::new()
+            .content("Panic!")
+            .on_click(|| panic!("用户从设置页手动触发测试 panic"))
+            .into(),
+    ];
+    if let Some(status) = save_status {
+        danmaku_items.push(
             InfoBar::new()
-                .title(info_title)
-                .message(info_msg)
-                .severity(info_severity)
+                .title("设置异常")
+                .message(status)
+                .severity(InfoBarSeverity::Warning)
                 .is_open(true)
-                .is_closable(false),
-        )),
-    )
-    .grid_column(1);
+                .is_closable(false)
+                .into(),
+        );
+    }
+
+    let danmaku_card = card(StackPanel::new().spacing(16.0).children(danmaku_items)).grid_column(1);
 
     ScrollViewer::new()
         .content(
@@ -229,7 +223,7 @@ pub fn settings_page(
                 .padding(Thickness::new(36.0, 24.0, 36.0, 36.0))
                 .content(
                     StackPanel::new().spacing(16.0).children((
-                        theme::page_header("设置", &qn_hint),
+                        theme::page_header("设置", qn_hint),
                         Grid::new()
                             .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
                             .column_spacing(20.0)
