@@ -20,3 +20,6 @@ bili-video.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 serde = { workspace = true, features = ["derive"] }
+
+[build-dependencies]
+windows-reactor-setup = { path = "D:/Projects/qaq-winui-reactor/crates/libs/reactor-setup" }

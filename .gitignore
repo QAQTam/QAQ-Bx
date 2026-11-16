@@ -5,3 +5,8 @@
 # 本地数据与敏感凭据
 /data
 .qaqh/secrets/
+
+# AppX 打包产物与自签名私钥
+/package/
+/packaging/certs/*.pfx
+/packaging/certs/*.cer

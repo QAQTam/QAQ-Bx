@@ -144,6 +144,7 @@ dependencies = [
  "windows-canvas",
  "windows-core",
  "windows-reactor",
+ "windows-reactor-setup",
  "windows-text",
 ]
 
@@ -2063,6 +2064,10 @@ dependencies = [
  "windows-time",
  "windows-window",
 ]
+
+[[package]]
+name = "windows-reactor-setup"
+version = "0.100.1"
 
 [[package]]
 name = "windows-reference"
