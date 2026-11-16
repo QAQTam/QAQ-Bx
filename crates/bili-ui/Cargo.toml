@@ -1,0 +1,22 @@
+[package]
+name = "bili-ui"
+description = "biliplay 前端：WinUI 3（windows-reactor 声明式组件）"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+windows-reactor.workspace = true
+# reactor 内核 windows-core 0.101 fork(本地 path,与 workspace 其余 windows
+# 依赖同源):VideoSurface 挂载桥用 IUnknown::from_raw 接管引擎转移的
+# swapchain 裸指针。
+windows-core = { path = "D:/Projects/qaq-winui-reactor/crates/libs/core" }
+# 弹幕覆盖层:D2D Canvas(reactor 集成)+ DWrite 文本格式。
+windows-canvas = { path = "D:/Projects/qaq-winui-reactor/crates/libs/canvas", features = ["reactor", "composition"] }
+windows-text = { path = "D:/Projects/qaq-winui-reactor/crates/libs/text" }
+bili-core.workspace = true
+bili-plugin-login.workspace = true
+bili-video.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+serde = { workspace = true, features = ["derive"] }

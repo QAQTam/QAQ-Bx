@@ -1,0 +1,108 @@
+{
+  "json": {
+    "code": 0,
+    "message": "OK",
+    "ttl": 1,
+    "data": {
+      "user_feature": "{\"brush\":0,\"fresh_type\":0,\"pid_layer_sample_ids\":\"{\\\"pegasus-ogv\\\":\\\"90725102\\\"}\",\"prefer_tags\":[1105377,8044323,3235409,76026,1502840,2902988,1502842,3169612,61984,17004815,1097989,7395603,3639654,8046918,551,610,353929,39258,102081,8044319,12540797],\"request_cnt\":5,\"sample_ids\":\"33160101_90725102_90844106\",\"season_types\":\"1\"}",
+      "items": [
+        {
+          "source": "tag",
+          "season_id": 6480,
+          "season_type": 1,
+          "av_feature": "|score 0.057060607|pctr 0.017034880816936493|pdtr 7.978989913226542e-08|pqtr 0.05472797900438309|ppbtr 2.6984367518245733e-10|pcvr_vip 0.0036027829628437757|pcvr_tvod 0.07677442580461502|pvtr60 0.04529707878828049|pvtr300 0.053613804280757904",
+          "title": "宝可梦 光环的超魔神胡帕",
+          "owner": {
+            "mid": 928123,
+            "name": "哔哩哔哩番剧",
+            "face": "https://i1.hdslb.com/bfs/face/040528a1ec634b9907ba3a9ba957819bb07def06.jpg"
+          },
+          "ogv_creative_id": 0,
+          "trackid": "web_ogv_0.router-ogv-2499245-fcvl4.1794758485327.916",
+          "pub_time": "2017-09-22 14:21:29",
+          "long_title": "",
+          "cover": "https://i0.hdslb.com/bfs/bangumi/image/50ef2815110ee342accab356f96e98c7436e3cf9.jpg",
+          "goto": "ogv_season",
+          "stat": {
+            "view": 4023342,
+            "like": 24853,
+            "danmaku": 43971,
+            "vt": 0,
+            "reply": 2097,
+            "fav": 4567,
+            "coin": 6352,
+            "share": 5770
+          },
+          "id": 14681002,
+          "epid": 114712,
+          "rcmd_reason": null
+        },
+        {
+          "source": "type_hot",
+          "season_id": 39725,
+          "season_type": 1,
+          "av_feature": "|score 0.056170266|pctr 0.02553592622280121|pdtr 8.016777242048079e-10|pqtr 0.0004108440480194986|ppbtr 1.9335209506445338e-17|pcvr_vip 4.044050911033992e-06|pcvr_tvod 8.086508350955979e-14|pvtr60 5.7263196850954046e-08|pvtr300 3.156727049896668e-12",
+          "title": "虽然之前就亲亲，但交往后要更多",
+          "owner": {
+            "mid": 928123,
+            "name": "哔哩哔哩番剧",
+            "face": "https://i1.hdslb.com/bfs/face/040528a1ec634b9907ba3a9ba957819bb07def06.jpg"
+          },
+          "ogv_creative_id": 30000000000047710,
+          "trackid": "web_ogv_0.router-ogv-2499245-fcvl4.1794758485327.916",
+          "pub_time": "2022-05-07 00:30:01",
+          "long_title": "",
+          "cover": "http://i0.hdslb.com/bfs/feed-admin/b01c2e3bca51dfe26b4e81721bf93b4fab4c0f41.jpg",
+          "goto": "ogv_season",
+          "stat": {
+            "view": 1965343,
+            "like": 44434,
+            "danmaku": 13954,
+            "vt": 0,
+            "reply": 830,
+            "fav": 6270,
+            "coin": 37697,
+            "share": 440
+          },
+          "id": 468778922,
+          "epid": 477107,
+          "rcmd_reason": {
+            "reason_type": 1,
+            "content": "《理科生第二季》"
+          }
+        },
+        {
+          "source": "tag",
+          "season_id": 5762,
+          "season_type": 1,
+          "av_feature": "|score 0.056140404|pctr 0.020329274237155914|pdtr 5.365364472709189e-07|pqtr 0.03263461962342262|ppbtr 9.134570704005807e-12|pcvr_vip 0.0013661874691024423|pcvr_tvod 1.0684102040581234e-11|pvtr60 0.025004807859659195|pvtr300 0.016273804008960724",
+          "title": "宝可梦 XY1&2",
+          "owner": {
+            "mid": 928123,
+            "name": "哔哩哔哩番剧",
+            "face": "https://i1.hdslb.com/bfs/face/040528a1ec634b9907ba3a9ba957819bb07def06.jpg"
+          },
+          "ogv_creative_id": 0,
+          "trackid": "web_ogv_0.router-ogv-2499245-fcvl4.1794758485327.916",
+          "pub_time": "2016-12-07 15:51:50",
+          "long_title": "",
+          "cover": "https://i0.hdslb.com/bfs/bangumi/image/729aac3076adc73d8eb014a5531ef66804aca4f4.jpg",
+          "goto": "ogv_season",
+          "stat": {
+            "view": 17851591,
+            "like": 39199,
+            "danmaku": 409488,
+            "vt": 0,
+            "reply": 6612,
+            "fav": 7573,
+            "coin": 20567,
+            "share": 8188
+          },
+          "id": 7422161,
+          "epid": 97776,
+          "rcmd_reason": null
+        }
+      ]
+    }
+  }
+}

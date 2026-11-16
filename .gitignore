@@ -1,0 +1,7 @@
+# Rust
+/target
+**/*.rs.bk
+
+# 本地数据与敏感凭据
+/data
+.qaqh/secrets/

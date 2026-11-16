@@ -1,0 +1,335 @@
+{
+  "json": {
+    "code": 0,
+    "message": "0",
+    "ttl": 1,
+    "data": {
+      "item": [
+        {
+          "id": 117603502726074,
+          "bvid": "BV1bTWR68EFx",
+          "cid": 43546182739,
+          "goto": "av",
+          "uri": "https://www.bilibili.com/video/BV1bTWR68EFx",
+          "pic": "http://i2.hdslb.com/bfs/archive/2875644adda6fc54d45b5ab8b078f0980adb8459.jpg",
+          "pic_4_3": "http://i0.hdslb.com/bfs/archive/cbb762d7557080ccd428600fa04422593ba9fe04.jpg",
+          "title": "一觉醒来整个B站都在看trouble maker？韩国人怎么评价泫雅张贤胜的原版和黄仁勋马斯克版！",
+          "duration": 470,
+          "pubdate": 1794487597,
+          "owner": {
+            "mid": 21466767,
+            "name": "辉锅_",
+            "face": "https://i0.hdslb.com/bfs/face/a5cf828c9ed3d56be452541f8520fcd3eab1728c.jpg"
+          },
+          "stat": {
+            "view": 606555,
+            "like": 10559,
+            "danmaku": 731,
+            "vt": 0
+          },
+          "av_feature": null,
+          "is_followed": 0,
+          "rcmd_reason": {
+            "reason_type": 0
+          },
+          "show_info": 1,
+          "track_id": "web_pegasus_0.router-web-pegasus-2479516-f6fct.1794758483561.95",
+          "pos": 0,
+          "room_info": null,
+          "ogv_info": null,
+          "business_info": null,
+          "is_stock": 0,
+          "enable_vt": 0,
+          "vt_display": "",
+          "dislike_switch": 1,
+          "dislike_switch_pc": 1
+        },
+        {
+          "id": 117519885014451,
+          "bvid": "BV1KosQ6pEMY",
+          "cid": 43134748964,
+          "goto": "av",
+          "uri": "https://www.bilibili.com/video/BV1KosQ6pEMY",
+          "pic": "http://i2.hdslb.com/bfs/archive/8568f4712c443b8a22a89a64e74b25d0bf08ea07.jpg",
+          "pic_4_3": "http://i0.hdslb.com/bfs/archive/abd278dcb5b23b049bfe267d9ac5e711f76d320f.jpg",
+          "title": "1GB 显卡就能跑！LFM3-1.7B 模型本地部署 + 实测｜AI 代理、工具调用、256K 超长上下文",
+          "duration": 711,
+          "pubdate": 1793233800,
+          "owner": {
+            "mid": 3706955369547878,
+            "name": "X超哥来了",
+            "face": "https://i2.hdslb.com/bfs/face/f57058fd255f2fec9cf162e1a008a2092647c485.jpg"
+          },
+          "stat": {
+            "view": 6579,
+            "like": 137,
+            "danmaku": 3,
+            "vt": 0
+          },
+          "av_feature": null,
+          "is_followed": 0,
+          "rcmd_reason": {
+            "reason_type": 0
+          },
+          "show_info": 1,
+          "track_id": "web_pegasus_0.router-web-pegasus-2479516-f6fct.1794758483561.95",
+          "pos": 0,
+          "room_info": null,
+          "ogv_info": null,
+          "business_info": null,
+          "is_stock": 0,
+          "enable_vt": 0,
+          "vt_display": "",
+          "dislike_switch": 1,
+          "dislike_switch_pc": 1
+        },
+        {
+          "id": 117500943603524,
+          "bvid": "BV1HYH56YEVf",
+          "cid": 43042343673,
+          "goto": "av",
+          "uri": "https://www.bilibili.com/video/BV1HYH56YEVf",
+          "pic": "http://i1.hdslb.com/bfs/archive/41c91c147688ba2e9997d10e875441f1fc1eb8fe.jpg",
+          "pic_4_3": "http://i0.hdslb.com/bfs/archive/41c91c147688ba2e9997d10e875441f1fc1eb8fe.jpg",
+          "title": "论战圈你不得不信的事实",
+          "duration": 107,
+          "pubdate": 1792922324,
+          "owner": {
+            "mid": 3546848895699493,
+            "name": "汪围巾",
+            "face": "https://i1.hdslb.com/bfs/face/d58601a81202d36423e330bcd062d9118aa070f0.jpg"
+          },
+          "stat": {
+            "view": 6725,
+            "like": 1319,
+            "danmaku": 9,
+            "vt": 0
+          },
+          "av_feature": null,
+          "is_followed": 0,
+          "rcmd_reason": {
+            "reason_type": 0
+          },
+          "show_info": 1,
+          "track_id": "web_pegasus_0.router-web-pegasus-2479516-f6fct.1794758483561.95",
+          "pos": 0,
+          "room_info": null,
+          "ogv_info": null,
+          "business_info": null,
+          "is_stock": 0,
+          "enable_vt": 0,
+          "vt_display": "",
+          "dislike_switch": 1,
+          "dislike_switch_pc": 1
+        },
+        {
+          "id": 0,
+          "bvid": "",
+          "cid": 0,
+          "goto": "ad",
+          "uri": "",
+          "pic": "",
+          "pic_4_3": "",
+          "title": "",
+          "duration": 0,
+          "pubdate": 0,
+          "owner": null,
+          "stat": null,
+          "av_feature": null,
+          "is_followed": 0,
+          "rcmd_reason": null,
+          "show_info": 0,
+          "track_id": "web_pegasus_0.router-web-pegasus-2479516-f6fct.1794758483561.95",
+          "pos": 0,
+          "room_info": null,
+          "ogv_info": null,
+          "business_info": {
+            "id": 0,
+            "contract_id": "",
+            "res_id": 0,
+            "asg_id": 0,
+            "pos_num": 1,
+            "name": "不仅仅会聊天，豆包工作直接交活",
+            "pic": "https://i0.hdslb.com/bfs/sycp/mgk/collage/jpeg/202610/a4548ae97af0bf29489ec99899d305a9.jpeg",
+            "litpic": "",
+            "url": "https://www.doubao.com/work/?ug_apk_token=YDUKa&ad_platform_id=bilibili_lead&track_id=pbaes.Pj-VrYJul8865oNDnxMIAbAG8B--VuiAe1a63rIM2FAmzsQGJqqi4SU4EG5LWPBuJJiT1YG_BfTJED8y38eSGqkZdp1EAYmU9i1v3n3J6aEKerqJptwMY9Mi1BShh-XGiWcG8d-XjEXZnsJbteIGJez6w7dkGRxNCJh34kBMZu_9P3I1FW_YrrX8twce3XiY&ug_semver=v1.0.0&caid=__CAID__&resource_id=__RESOURCEID__&source_id=5637&request_id=1794758483570q10a90a14a199q4831&from_spmid=__FROMSPMID__&creative_id=3981467495&linked_creative_id=4380785729",
+            "style": 0,
+            "is_ad": true,
+            "agency": "",
+            "label": "",
+            "intro": "",
+            "creative_type": 2,
+            "request_id": "1794758483570q10a90a14a199q4831",
+            "creative_id": 4380785729,
+            "src_id": 5637,
+            "area": 0,
+            "is_ad_loc": true,
+            "ad_cb": "CNiwxCEQnb+xsAMYwfj1qBAg6wMoATC58ZICOIUsQh8xNzk0NzU4NDgzNTcwcTEwYTkwYTE0YTE5OXE0ODMxSPK8xP+dNFIG5Y2X5a6BWgblub/opb9iBuS4reWbvWgBcAB4gICAgKA5gAEBiAEAkgENMTcxLjM2LjEyMy41MaAB0AaoAQayASAdio/rjSNpHr1u0WKarKU2W3+cRjjJEGah9CKWaZAI0LoB3gNodHRwczovL3d3dy5kb3ViYW8uY29tL3dvcmsvP3VnX2Fwa190b2tlbj1ZRFVLYSZhZF9wbGF0Zm9ybV9pZD1iaWxpYmlsaV9sZWFkJnRyYWNrX2lkPXBiYWVzLlBqLVZyWUp1bDg4NjVvTkRueE1JQWJBRzhCLS1WdWlBZTFhNjNySU0yRkFtenNRR0pxcWk0U1U0RUc1TFdQQnVKSmlUMVlHX0JmVEpFRDh5MzhlU0dxa1pkcDFFQVltVTlpMXYzbjNKNmFFS2VycUpwdHdNWTlNaTFCU2hoLVhHaVdjRzhkLVhqRVhabnNKYnRlSUdKZXo2dzdka0dSeE5DSmgzNGtCTVp1XzlQM0kxRldfWXJyWDh0d2NlM1hpWSZ1Z19zZW12ZXI9djEuMC4wJmNhaWQ9X19DQUlEX18mcmVzb3VyY2VfaWQ9X19SRVNPVVJDRUlEX18mc291cmNlX2lkPTU2MzcmcmVxdWVzdF9pZD0xNzk0NzU4NDgzNTcwcTEwYTkwYTE0YTE5OXE0ODMxJmZyb21fc3BtaWQ9X19GUk9NU1BNSURfXyZjcmVhdGl2ZV9pZD0zOTgxNDY3NDk1JmxpbmtlZF9jcmVhdGl2ZV9pZD00MzgwNzg1NzI5wgEBMNIBANgBygPgAYCU69wD6AGgnAHwAQD4AfMFgAIEiAIAkgIAmAIWoAIAqAIWsAIAuAIAwAKQoQ/IAp4Y6gIA+ALUpAOIAwGSAwCoAwCwAwC4AwDIAwDSA8sBeyIxIjoiNDM4MDc4NTcyOSIsIjEyIjoiNTYzNyIsIjEzIjoiMTk4MzQ1MiIsIjE2IjoiMTk4MzQ1Ml81Mzg0NCIsIjIiOiI0NTAzNzM3IiwiMjQiOiIxIiwiMjUiOiIxMDM4IiwiMjYiOiIyMzExIiwiMjgiOiIxNmE2NzVkNjAyZDc3NjcyMjZjN2Y1ZmJlZTBlZjkzYiIsIjMiOiI0NTAzNzM3IiwiNCI6IjEwMzgiLCI1IjoiMjMxMSIsIjYiOiI0NTAzNzM3In3gAwDoAwHwAwH6AwVvdGhlcoIECW51bGw6bnVsbIgE0AaQBACYBAGgBAGqBAcI3vuoXxAEqgQHCIXN+2QQAbgECsAEAsoEANAEANgEAOIEqgI1Ni57InBzSWQiOjE2MzY0MywidjIiOiJBVEU1RTh3U3QwVW1zR21jN2YyWHBxSG5fY2hkNDJNZHh6R2l5WlFxamlRQXl6N1RHZjNEb0tBZ2VRZXhtRkVENGQzX25mWG5JaDZlSUs1YlRuSldrZVZPNVBmUnBZTDN6Vkx3TlVfejZ5UmJqZEZ4REdRQmpwUE9Yd3FjTGlaR19qYjRsd3NXV0hadWJILUNmdXNid3ZQQmh4UXItTGZtYXRVaENGcGtTWlBmM2FsXzB3bHlmTUpsajNuRVlBSXVLX0dJOFBvandEUnN5enZNOUliayJ9OzYzLnsicHNJZCI6MTYzNjA3LCJ2MiI6IkJvbGcifTs3MC57InBzSWQiOjE1NTk1OCwidjIiOiJBQSJ96AQA8AQA+gTdBXsiYWNjZWxlcmF0ZV9mYWN0b3IiOjEuMCwiYWNjZWxlcmF0ZV9pZCI6MCwiYWRfdHlwZV9maXgiOiJjcG0iLCJhZHZ2X2luZm8iOiJ7XCJhZGp1c3RfYmVmb3JlX2Nvc3RcIjpcIjc1NS41MDdcIixcImFkanVzdF9yYXRpb1wiOlwiMC42NTBcIixcImJhbGFuY2VyX2lkXCI6MCxcImJhbGFuY2VyX3JhdGlvXCI6XCIwLjAwMFwiLFwiY2hhcmdlX2V4cF9rZXlfZGVwdGhcIjpcIlwiLFwiY2hhcmdlX2V4cF9rZXlfbGlnaHRcIjpcIl9jcGFfY29zdF9waWRfdjRcIixcImNvc3RfZGlmZlwiOlwiLTI2NC40MjhcIn0iLCJiaWRfdHlwZSI6MSwiYml6X3R5cGUiOjEyLCJiaXpfdHlwZV9maXgiOjMsImNwYSI6IntcImNwYV9sZXZlbFwiOjk5LFwiY3BhX3NldFwiOjB9IiwiY3BhVGFyZ2V0VHlwZSI6MiwiZnJvbVRyYWNraWQiOiJ3ZWJfcGVnYXN1c18wLnJvdXRlci13ZWItcGVnYXN1cy0yNDc5NTE2LWY2ZmN0LjE3OTQ3NTg0ODM1NjEuOTUiLCJpYWFfY2hlYXRfZmxvdyI6MCwiaW5uZXIiOjAsImlzX29jcGNfYW50b3Vfb2NwbSI6MCwiaXNfdHJhY2tpbmdfdXJscyI6MCwibWluaV9nYW1lX2lkIjoiIiwibWluaV9nYW1lX3Bvc2l0aW9uX2lkIjoiIiwibW9kZWxTY29yZSI6IntcImN0clwiOlwiNi4yMjAxMTFcIixcImN2cl9sMFwiOlwiMzEwMi4wODM0OTZcIixcImZpbmFsX3BjdHJcIjpcIjYuMjIwMTExXCIsXCJmaW5hbF9wY3ZyXCI6XCIzMTAyLjA4MzQ5NlwifSIsInZpZGVvX3VwX21pZCI6MH2ABQCQBSiQBUOQBUmQBdcBkAWJApAFjgKQBZoCkAWpApAFqgKQBcACkAXCApAFwwKQBcUCkAXLApAFzgKQBdMCkAXWApAF1wKQBdgCkAXZApAF2gKQBd8CkAXhApAF4wKQBeQCkAXlApAF5gKQBfACkAX1ApAF+wKQBf8CkAWNA5AFlAOQBZgDkAWZA5AFmgOQBZsDkAWgA5AFpQOQBacDkAWwA5AFtgOQBbcDkAXAA5AFwQOQBcQDkAXNA5AF4AOQBfUDkAX4A5AF/wOQBcYFkAXvBZAFxAeQBdQHkAXwB5AF+QeQBYEIkAWhEZAFyBGQBdYRkAX7EZAFpxKQBaoSoAUAuAUCwAXch3nIBQjgBQToBQDyBYQBQ0F3UUFUQUNWWFBnUEVSZHlUYUV3MlZXNFVGRmJRQkFIRVoxQUFDQVA1VUJWdUZCUmFBQjZ2SHdnUU9vQWVlK3dlb09zQUVCd0FHZ0g4Z0JBdTBCQUFDQVAvVUJBQUNBUDUwQ21wbVpQNlVDQUFDQVA2MENBQUNBUDdVQ0FBQ0FQdz09+AXq8fCBA4AG/5Pr3AOIBue+weoOkAYDmAYGqAbq8fCBAw==",
+            "title": "不仅仅会聊天，豆包工作直接交活",
+            "server_type": 1,
+            "cm_mark": 1,
+            "stime": 0,
+            "mid": "",
+            "activity_type": 0,
+            "epid": 0,
+            "sub_title": "",
+            "ad_desc": "4000+人感兴趣",
+            "adver_name": "",
+            "null_frame": false,
+            "pic_main_color": "",
+            "card_type": 0,
+            "business_mark": {
+              "bg_border_color": "#999999FF",
+              "bg_color": "",
+              "bg_color_night": "",
+              "border_color": "#999999FF",
+              "border_color_night": "#686868",
+              "img_height": 0,
+              "img_url": "",
+              "img_width": 0,
+              "text": "广告",
+              "text_color": "#999999FF",
+              "text_color_night": "#686868",
+              "type": 2
+            },
+            "inline": {
+              "inline_use_same": 0,
+              "inline_type": 0,
+              "inline_url": "",
+              "inline_barrage_switch": 0
+            },
+            "operater": "",
+            "jump_target": 1,
+            "show_urls": null,
+            "click_urls": null,
+            "feedback_panel": {
+              "close_rec_tips": "操作成功",
+              "feedback_panel_detail": [
+                {
+                  "icon_url": "https://i0.hdslb.com/bfs/sycp/mng/201907/a53df8f189bb12666a39d10ad1babcf5.png",
+                  "jump_type": 1,
+                  "jump_url": "",
+                  "module_id": 1,
+                  "secondary_panel": [
+                    {
+                      "reason_id": 1,
+                      "text": "不想看该内容"
+                    },
+                    {
+                      "reason_id": 2,
+                      "text": "相似内容过多"
+                    },
+                    {
+                      "reason_id": 5,
+                      "text": "广告质量差"
+                    }
+                  ],
+                  "sub_text": "（选择后将优化广告展示）",
+                  "text": "屏蔽广告"
+                },
+                {
+                  "icon_url": "https://i0.hdslb.com/bfs/sycp/mng/202409/539675ae22c4230d299f1525a458b785.png",
+                  "jump_type": 2,
+                  "jump_url": "https://cm.bilibili.com/feedback-pc/#/introduction",
+                  "module_id": 10,
+                  "sub_text": "",
+                  "text": "我为什么会看到此广告"
+                },
+                {
+                  "icon_url": "https://i0.hdslb.com/bfs/sycp/mng/202409/5dcdf2063f6deb0df5e0bcdd0a9b7561.png",
+                  "jump_type": 2,
+                  "jump_url": "https://cm.bilibili.com/feedback-pc/#/ad?creative_id=3981467495&source_id=5637&complain_detail=eyJhZF90eXBlIjoxLCJhdmlkIjowLCJleHBfbmFtZSI6IiIsImdyYWRlX2NvbmNyZXRlX2lkX21hcHBpbmciOiJ7XCIxXCI6XCI0MzgwNzg1NzI5XCIsXCIxMlwiOlwiNTYzN1wiLFwiMTNcIjpcIjE5ODM0NTJcIixcIjE2XCI6XCIxOTgzNDUyXzUzODQ0XCIsXCIyXCI6XCI0NTAzNzM3XCIsXCIyNFwiOlwiMVwiLFwiMjVcIjpcIjEwMzhcIixcIjI2XCI6XCIyMzExXCIsXCIyOFwiOlwiMTZhNjc1ZDYwMmQ3NzY3MjI2YzdmNWZiZWUwZWY5M2JcIixcIjNcIjpcIjQ1MDM3MzdcIixcIjRcIjpcIjEwMzhcIixcIjVcIjpcIjIzMTFcIixcIjZcIjpcIjQ1MDM3MzdcIn0iLCJpbWFnZV9pZCI6MjExNzQwMjkzLCJtYXRlcmlhbF90eXBlIjo0LCJzdHJhdGVneV9pZCI6MCwidGl0bGVfaWQiOjE5OTkwMDYzOCwidHJhaWwiOiI1Ni57XCJwc0lkXCI6MTYzNjQzLFwidjJcIjpcIkFURTVFOHdTdDBVbXNHbWM3ZjJYcHFIbl9jaGQ0Mk1keHpHaXlaUXFqaVFBeXo3VEdmM0RvS0FnZVFleG1GRUQ0ZDNfbmZYbkloNmVJSzViVG5KV2tlVk81UGZScFlMM3pWTHdOVV96NnlSYmpkRnhER1FCanBQT1h3cWNMaVpHX2piNGx3c1dXSFp1YkgtQ2Z1c2J3dlBCaHhRci1MZm1hdFVoQ0Zwa1NaUGYzYWxfMHdseWZNSmxqM25FWUFJdUtfR0k4UG9qd0RSc3l6dk05SWJrXCJ9OzYzLntcInBzSWRcIjoxNjM2MDcsXCJ2MlwiOlwiQm9sZ1wifTs3MC57XCJwc0lkXCI6MTU1OTU4LFwidjJcIjpcIkFBXCJ9In0&request_id=1794758483570q10a90a14a199q4831",
+                  "module_id": 9,
+                  "sub_text": "",
+                  "text": "我要投诉"
+                }
+              ],
+              "open_rec_tips": "将减少展示此类广告",
+              "panel_type_text": "广告",
+              "toast": "将减少相似广告推荐"
+            },
+            "sales_type": 11,
+            "rcmd_reason_style": null,
+            "pc_button": {
+              "button_text": ""
+            },
+            "desc": "4000+人感兴趣",
+            "wx_program_info": null
+          },
+          "is_stock": 0,
+          "enable_vt": 0,
+          "vt_display": "",
+          "dislike_switch": 0,
+          "dislike_switch_pc": 0
+        },
+        {
+          "id": 1755256928,
+          "bvid": "",
+          "cid": 0,
+          "goto": "live",
+          "uri": "https://live.bilibili.com/1755256928",
+          "pic": "https://i0.hdslb.com/bfs/live/user_cover/e6b23f64a253ffab21ea5c142522fb7883c8bd8c.jpg",
+          "pic_4_3": "",
+          "title": "销冠小李B站首播！",
+          "duration": 0,
+          "pubdate": 0,
+          "owner": {
+            "mid": 3494365496347443,
+            "name": "WHIKO小李",
+            "face": "https://i0.hdslb.com/bfs/face/7c04fbc22f0ae51a37bad2963edc870166f66510.jpg"
+          },
+          "stat": null,
+          "av_feature": null,
+          "is_followed": 0,
+          "rcmd_reason": null,
+          "show_info": 0,
+          "track_id": "web_pegasus_0.router-web-pegasus-2479516-f6fct.1794758483561.95",
+          "pos": 0,
+          "room_info": {
+            "room_id": 1755256928,
+            "uid": 3494365496347443,
+            "live_status": 1,
+            "show": {
+              "short_id": 0,
+              "title": "销冠小李B站首播！",
+              "cover": "https://i0.hdslb.com/bfs/live/user_cover/e6b23f64a253ffab21ea5c142522fb7883c8bd8c.jpg",
+              "keyframe": "https://i0.hdslb.com/bfs/live-key-frame/keyframe11152355001755256928sk78dx.jpg",
+              "popularity_count": 69677,
+              "tag_list": null,
+              "live_start_time": 0,
+              "live_id": 0,
+              "hidden_online": false
+            },
+            "area": {
+              "area_id": 0,
+              "area_name": "脱口秀",
+              "parent_area_id": 1,
+              "parent_area_name": "娱乐",
+              "old_area_id": 0,
+              "old_area_name": "",
+              "old_area_tag": "",
+              "area_pk_status": 0,
+              "is_video_room": false
+            },
+            "watched_show": {
+              "switch": true,
+              "num": 217511,
+              "text_small": "21.7万",
+              "text_large": "21.7万人看过",
+              "icon": "https://i0.hdslb.com/bfs/live/a725a9e61242ef44d764ac911691a7ce07f36c1d.png",
+              "icon_location": "",
+              "icon_web": "https://i0.hdslb.com/bfs/live/8d9d0f33ef8bf6f308742752d13dd0df731df19c.png"
+            }
+          },
+          "ogv_info": null,
+          "business_info": null,
+          "is_stock": 0,
+          "enable_vt": 0,
+          "vt_display": "",
+          "dislike_switch": 1,
+          "dislike_switch_pc": 1
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,348 @@
+openapi: 3.1.0
+info:
+  title: bilibili Feed 消费契约（biliplay）
+  version: 1.0.0
+  x-contract-version: 1
+  x-observed-at: "2026-11-16"
+  description: |
+    **biliplay 对 B 站 feed 组接口的消费契约锚 —— 不是 B 站官方文档。**
+
+    来源纪律（项目红线）：全部字段来自 CDP 真机捕获 + 主动重放实测
+    （`.qaqh/research/capture-feed-apis.mjs`，样本 `.qaqh/research/samples/feed/`），
+    零第三方 API 文档。
+
+    ## 版本与向下兼容（见 api/README.md）
+    - `x-contract-version: 1` = 当前消费契约代。服务器**新增字段**视为兼容
+      （Rust 侧忽略未知字段 + 本文件 `additionalProperties: true`）。
+    - 服务器**删除/改名本文件 `required` 字段** = 破坏性变更：
+      `api/fixtures/` 行为锚测试红灯 → 评估迁移并升 `x-contract-version: 2`。
+    - 所有 ID/计数一律 64 位（实测 aid 已达 1.17e14，u32 溢出）。
+
+    ## 实测定案（2026-11-16）
+    - rcmd **无必需参数**（仅 `ps` 亦可 code=0）；`fresh_idx/fresh_idx_1h/brush`
+      为翻页语义锚；页面携带的 `y_num/last_showlist/uniq_id/x-bili-*-json` 等
+      全部可选（业务上下文，客户端可不发）。
+    - rcmd 翻页跨页有重复（实测 48 项 38 唯一）→ **去重是客户端责任**。
+    - 卡片多态：`goto = av | ad | live`（首页流内嵌广告与直播卡；
+      ad 卡 `id` 可为 0 且无 `bvid`）。
+    - WBI 签名：`w_rid = md5(排序后 query 过滤 !'()* + mixin32)`，
+      mixin 表与 nav 密钥见 docs/bilibili-api-inventory.md §4。
+
+servers:
+  - url: https://api.bilibili.com
+
+tags:
+  - name: feed
+    description: 推荐流 / 热门 / 榜单（卡片数据）
+
+paths:
+  /x/web-interface/wbi/index/top/feed/rcmd:
+    get:
+      tags: [feed]
+      operationId: topFeedRcmd
+      summary: 首页综合推荐流（WBI 签名）
+      description: |
+        **推流机制**（JS 切片 + 对照实验定案，详见 docs/recommend-mechanism.md §1/§2）：
+        - `fresh_type` 枚举：Init=0 / Change=3 / DropDown=4（滚动加载）/ Refresh=5。
+        - `ps` 双档：Init/Change/Refresh=10，DropDown=12。
+        - `fresh_idx`/`fresh_idx_1h` 每请求 +1；距上次请求 > 60min 时 `fresh_idx_1h` 归零重进 1h 池。
+        - `brush` 为分类计数：Refresh/Change 用 refresh 计数，DropDown 用 dropDown 计数。
+        - `fetch_row` 行游标：首屏 1，滚动 +3（= ps/列数）。
+        - `last_showlist` 为曝光反馈软约束（对照实验：带/不带均 0 重复）；本地去重是客户端责任。
+        - `uniq_id` 每页面加载生成（AB 实验 id），客户端会话内不变。
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - { name: ps, in: query, schema: { type: integer, minimum: 1, maximum: 30 }, example: 12 }
+        - { name: fresh_type, in: query, schema: { type: integer, enum: [0, 3, 4, 5] }, description: "0Init/3Change/4DropDown(滚动)/5Refresh" }
+        - { name: fresh_idx, in: query, schema: { type: integer }, description: 全局页游标（每请求 +1；Refresh 时重置） }
+        - { name: fresh_idx_1h, in: query, schema: { type: integer }, description: 1h 池页游标（每请求 +1；>60min 未请求则归零） }
+        - { name: brush, in: query, schema: { type: integer }, description: 分类计数（refresh/dropDown 两套） }
+        - { name: fetch_row, in: query, schema: { type: integer }, description: 行游标（首屏 1，滚动 +3） }
+        - { name: y_num, in: query, schema: { type: integer }, description: 当前布局列数（SSR 场景传 0） }
+        - { name: last_y_num, in: query, schema: { type: integer }, description: 上一次列数 }
+        - { name: uniq_id, in: query, schema: { type: string }, description: AB 实验页面 id（会话内不变） }
+        - { name: last_showlist, in: query, schema: { type: string }, description: "曝光反馈（软约束）；页内逗号、页间分号，窗口最近 10 页" }
+        - { name: last_clicklist, in: query, schema: { type: string }, description: "已点击卡 goto_aid，窗口 50" }
+      responses:
+        "200":
+          description: 卡片流（含 av/ad/live 多态卡，按 goto 分派）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    required: [data]
+                    properties:
+                      data: { $ref: "#/components/schemas/RcmdData" }
+              examples:
+                sample: { externalValue: "../fixtures/feed-rcmd.json" }
+
+  /x/web-interface/index/ogv/rcmd:
+    get:
+      tags: [feed]
+      operationId: ogvRcmd
+      summary: 番剧/影视/纪录片/国创/综艺 剧集卡推荐（无 WBI）
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - { name: season_type, in: query, required: true, schema: { type: integer, enum: [1, 2, 3, 4, 5, 7] }, description: "1番剧 2电影 3纪录片 4国创 5电视剧 7综艺（实测全集）" }
+        - { name: request_cnt, in: query, schema: { type: integer }, example: 5 }
+        - { name: brush, in: query, schema: { type: integer } }
+      responses:
+        "200":
+          description: 剧集卡流
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    required: [data]
+                    properties:
+                      data: { $ref: "#/components/schemas/OgvData" }
+              examples:
+                sample: { externalValue: "../fixtures/feed-ogv.json" }
+
+  /x/web-interface/popular:
+    get:
+      tags: [feed]
+      operationId: popular
+      summary: 综合热门（无 WBI，pn/ps 分页）
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - { name: pn, in: query, schema: { type: integer, minimum: 1 }, example: 1 }
+        - { name: ps, in: query, schema: { type: integer, minimum: 1 }, example: 20 }
+      responses:
+        "200":
+          description: 归档卡列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    required: [data]
+                    properties:
+                      data: { $ref: "#/components/schemas/ArchiveListData" }
+              examples:
+                sample: { externalValue: "../fixtures/feed-popular.json" }
+
+  /x/web-interface/popular/precious:
+    get:
+      tags: [feed]
+      operationId: popularPrecious
+      summary: 入站必刷（一次全量，实测 98 条）
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1 }, example: 1 }
+      responses:
+        "200":
+          description: 归档卡列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    required: [data]
+                    properties:
+                      data: { $ref: "#/components/schemas/ArchiveListData" }
+              examples:
+                sample: { externalValue: "../fixtures/feed-precious.json" }
+
+  /x/web-interface/ranking/v2:
+    get:
+      tags: [feed]
+      operationId: rankingV2
+      summary: 排行榜（一次全量，实测 100 条）
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - { name: rid, in: query, schema: { type: integer }, example: 0, description: 分区 id，0=全站 }
+        - { name: type, in: query, schema: { type: string, enum: [all, origin, rookie] }, example: all }
+      responses:
+        "200":
+          description: 归档卡列表（附 score；榜首另有 reward/season 段）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    required: [data]
+                    properties:
+                      data: { $ref: "#/components/schemas/RankingData" }
+              examples:
+                sample: { externalValue: "../fixtures/feed-ranking.json" }
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: SESSDATA
+      description: 实测 Cookie 头携带 SESSDATA+bili_jct+DedeUserID+buvid3 即表达登录态（见 inventory §0）。
+
+  schemas:
+    Envelope:
+      type: object
+      required: [code]
+      properties:
+        code: { type: integer, description: "0=成功；-400参数 -403风控 -412拦截 -101未登录" }
+        message: { type: string }
+        ttl: { type: integer }
+
+    RcmdData:
+      type: object
+      required: [item]
+      properties:
+        item:
+          type: array
+          items: { $ref: "#/components/schemas/FeedCard" }
+
+    ArchiveListData:
+      type: object
+      required: [list]
+      properties:
+        list:
+          type: array
+          items: { $ref: "#/components/schemas/ArchiveCard" }
+        no_more: { type: boolean }
+
+    RankingData:
+      type: object
+      required: [list]
+      properties:
+        list:
+          type: array
+          items: { $ref: "#/components/schemas/ArchiveCard" }
+        note: { type: string }
+        disabled: { type: boolean }
+
+    OgvData:
+      type: object
+      required: [items]
+      properties:
+        user_feature: { type: object, additionalProperties: true }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/OgvCard" }
+
+    # ---- 卡片 ----
+
+    FeedCard:
+      type: object
+      description: |
+        首页推荐卡（多态）。required 仅锚定**所有卡型都必然存在**的字段；
+        av 卡的完整要求见 AvCardFields（goto=av 时按其校验）。
+      required: [id, title, goto]
+      properties:
+        id: { type: integer, format: int64, description: aid；ad 卡可为 0 }
+        bvid: { type: string }
+        cid: { type: integer, format: int64 }
+        title: { type: string }
+        pic: { type: string }
+        duration: { type: integer, description: 秒 }
+        pubdate: { type: integer, description: unix 秒 }
+        goto: { type: string, enum: [av, ad, live, pic, bangumi, pegasus] }
+        owner: { $ref: "#/components/schemas/Owner" }
+        stat: { $ref: "#/components/schemas/Stat" }
+        rcmd_reason: { $ref: "#/components/schemas/RcmdReason" }
+        pos: { type: integer }
+        track_id: { type: string }
+        ogv_info: { type: object, additionalProperties: true }
+        room_info: { type: object, additionalProperties: true, description: goto=live 时存在 }
+        business_info: { type: object, additionalProperties: true, description: goto=ad 时存在（40+ 字段） }
+        uri: { type: string }
+      additionalProperties: true
+
+    AvCardFields:
+      type: object
+      description: goto=av 卡的补充要求（消费面按此校验，spec 仅作文档锚）
+      required: [bvid, cid, pic, duration, pubdate, owner, stat]
+      properties: {}
+
+    ArchiveCard:
+      type: object
+      description: popular / ranking / precious 的归档卡（完整 archive 结构）
+      required: [aid, bvid, cid, title, pic, duration, pubdate, owner, stat]
+      properties:
+        aid: { type: integer, format: int64 }
+        bvid: { type: string }
+        cid: { type: integer, format: int64 }
+        title: { type: string }
+        pic: { type: string }
+        duration: { type: integer }
+        pubdate: { type: integer }
+        ctime: { type: integer }
+        desc: { type: string }
+        tname: { type: string }
+        tid: { type: integer }
+        owner: { $ref: "#/components/schemas/Owner" }
+        stat: { $ref: "#/components/schemas/Stat" }
+        rights: { type: object, additionalProperties: true }
+        dimension: { type: object, additionalProperties: true }
+        rcmd_reason: { $ref: "#/components/schemas/RcmdReason" }
+        score: { type: integer, description: 仅 ranking }
+        videos: { type: integer }
+        state: { type: integer }
+        season_type: { type: integer }
+        ogv_info: { type: object, additionalProperties: true }
+      additionalProperties: true
+
+    OgvCard:
+      type: object
+      description: |
+        ogv/rcmd 剧集卡。实测口径：`pub_time` 为字符串日期（非 unix 秒）；
+        `goto` 实测 "ogv_season"；trackid/ogv_creative_id 类型两态不稳，不进消费面
+        （additionalProperties 兜底保留）。
+      required: [epid, season_id, title, cover]
+      properties:
+        id: { type: integer, format: int64 }
+        epid: { type: integer, format: int64 }
+        season_id: { type: integer, format: int64 }
+        season_type: { type: integer }
+        title: { type: string }
+        long_title: { type: string }
+        cover: { type: string }
+        goto: { type: string }
+        source: { type: string }
+        pub_time: { type: string, description: "字符串日期，实测 \"2017-09-22 14:21:29\"" }
+        owner: { $ref: "#/components/schemas/Owner" }
+        stat: { $ref: "#/components/schemas/Stat" }
+        rcmd_reason: { $ref: "#/components/schemas/RcmdReason" }
+      additionalProperties: true
+
+    Owner:
+      type: object
+      required: [mid, name]
+      properties:
+        mid: { type: integer, format: int64 }
+        name: { type: string }
+        face: { type: string }
+      additionalProperties: true
+
+    Stat:
+      type: object
+      description: |
+        计数族。rcmd 卡只回 view/danmaku/like/vt；archive 卡全集
+        （view/reply/danmaku/like/coin/favorite/share/his_rank/now_rank…）。
+        required 仅锚两端共有的核心项。
+      required: [view, danmaku]
+      properties:
+        aid: { type: integer, format: int64 }
+        view: { type: integer, format: int64 }
+        danmaku: { type: integer, format: int64 }
+        reply: { type: integer, format: int64 }
+        like: { type: integer, format: int64 }
+        coin: { type: integer, format: int64 }
+        favorite: { type: integer, format: int64 }
+        share: { type: integer, format: int64 }
+        vt: { type: integer }
+        vv: { type: integer }
+      additionalProperties: true
+
+    RcmdReason:
+      type: object
+      properties:
+        reason_type: { type: integer }
+      additionalProperties: true

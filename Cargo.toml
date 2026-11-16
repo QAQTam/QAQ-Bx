@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["crates/bili-core", "crates/bili-plugin-login", "crates/bili-cli", "crates/bili-ui", "crates/bili-video"]
+
+[workspace.package]
+edition = "2024"
+version = "0.0.0"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "native-tls", "gzip", "brotli"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+rsa = "0.9"
+sha2 = "0.10"
+md-5 = "0.10"
+# windows-rs 一律走本地 fork(microsoft/windows-rs 下一代 0.100/0.101,未发布故走
+# path);新版 feature 名/模块路径按 SDK 头名(d3d11 / d3dcommon / dxgi / libloaderapi …)。
+# 例外:第三方 crate 连带依赖的 windows-sys 0.52/0.61、windows-targets 等旧版因
+# semver 不兼容无法用 path 覆盖,由 cargo 自行解析并保留。
+windows-sys = { path = "D:/Projects/qaq-winui-reactor/crates/libs/sys", features = ["errhandlingapi", "libloaderapi"] }
+windows = { path = "D:/Projects/qaq-winui-reactor/crates/libs/windows", features = [
+    "d3d11",
+    "d3dcommon",
+    "dxgi",
+] }
+hex = "0.4"
+qrcode = "0.14"
+url = "2"
+anyhow = "1"
+
+bili-core = { path = "crates/bili-core" }
+bili-plugin-login = { path = "crates/bili-plugin-login" }
+bili-video = { path = "crates/bili-video" }
+# UI：microsoft/windows-rs 下一代（本地 checkout，0.101 未发布故走 path）
+windows-reactor = { path = "D:/Projects/qaq-winui-reactor/crates/libs/reactor" }
