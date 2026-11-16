@@ -69,7 +69,7 @@ pub fn home_virtual_source(
             let focused_col = focused_idx.and_then(|idx| {
                 let start = row_idx * cols;
                 let end = start + row_slots.len();
-                (idx >= start && idx < end).then_some(idx - start)
+                (idx >= start && idx < end).then(|| idx - start)
             });
             View::component::<FeedRow>(FeedRowInput {
                 row_revision,
