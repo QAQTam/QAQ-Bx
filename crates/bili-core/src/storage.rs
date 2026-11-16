@@ -13,14 +13,43 @@ use crate::error::{BiliError, Result};
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// 数据目录：优先 `BILIPLAY_DATA_DIR`（非空），否则 `<cwd>/data`（CLI 与 UI 同源）。
+/// 数据目录：优先 `BILIPLAY_DATA_DIR`（非空）；
+/// 若运行在 AppX/MSIX 容器内（`WindowsApps` 目录只读），自动切至 `%LOCALAPPDATA%\biliplay\data`；
+/// 否则回退到 `<cwd>/data`（CLI 与 UI 同源）。
 pub fn resolve_data_dir() -> PathBuf {
-    std::env::var("BILIPLAY_DATA_DIR")
+    if let Some(dir) = std::env::var("BILIPLAY_DATA_DIR")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("data"))
+    {
+        return dir;
+    }
+
+    if is_packaged_app()
+        && let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty())
+    {
+        return PathBuf::from(local).join("biliplay").join("data");
+    }
+
+    std::env::current_dir().unwrap_or_default().join("data")
+}
+
+#[cfg(windows)]
+fn is_packaged_app() -> bool {
+    const APPMODEL_ERROR_NO_PACKAGE: i32 = 15700;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentPackageFullName(package_full_name_length: *mut u32, package_full_name: *mut u16) -> i32;
+    }
+    let mut len: u32 = 0;
+    let rc = unsafe { GetCurrentPackageFullName(&mut len, std::ptr::null_mut()) };
+    rc != APPMODEL_ERROR_NO_PACKAGE
+}
+
+#[cfg(not(windows))]
+fn is_packaged_app() -> bool {
+    false
 }
 
 /// 读取可选 JSON 文件（文件不存在返回 `Ok(None)`，解析失败返回可读错误）。

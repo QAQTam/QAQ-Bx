@@ -8,20 +8,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bili_core::account::NavClient;
+use bili_core::account::{AccountStat, NavClient, RelationKind, RelationPage, RelationUser};
 use bili_core::danmaku::{DanmakuClient, DanmakuElem};
 use bili_core::feed::{fetch_rcmd_batch, FeedCard, FeedClient, FeedKind, FeedSession};
+use bili_core::notify::{
+    AtNotice, FeedCursor, LikeNotice, ReplyNotice, SystemNotice, UnreadSummary, WhisperMessage,
+    WhisperSession,
+};
 use bili_core::player::{PlayerClient, StreamChoice, VideoMeta};
 use bili_core::settings::{AppSettings, FileSettingsStore, SETTINGS_FILE};
 use bili_video::engine::{OverlayDanmaku, VideoConfig, VideoEngine};
 use windows_reactor::*;
 
-use crate::auth::{Auth, AuthState, FlowCell, LoginFlowState, PollOutcome, ProbeReport};
+use crate::auth::{
+    avatar_thumbnail_url, Auth, AuthState, FlowCell, LoginFlowState, PollOutcome, ProbeReport,
+};
 use crate::data::{self, VideoItem};
 use crate::feed_pager;
 use crate::gamepad::{self, GamepadAction, GamepadEvent};
 use crate::image_cache::ImageCache;
 use crate::pages;
+use crate::pages::account::{
+    AccountCallbacks, AccountViewData, ListSliceState, NotifyTab, OpenTarget, WhisperThreadState,
+};
 use crate::router::{self, Route, NAV_ROUTES};
 use crate::runtime::{block_on, cover_semaphore};
 use crate::smtc::{SmtcCommand, SmtcController};
@@ -34,6 +43,8 @@ const COVER_FLUSH_INTERVAL: Duration = Duration::from_millis(80);
 const PRERESOLVE_TTL: Duration = Duration::from_secs(180);
 /// Hover 预解析最多缓存条目数。
 const MAX_PRERESOLVE_CACHE: usize = 16;
+/// 关注/粉丝挂件每页拉取条数。
+const RELATION_PAGE_SIZE: u32 = 20;
 /// 同时在飞的 Hover 预解析上限（防连续快速扫过触发风控）。
 const MAX_PRERESOLVE_INFLIGHT: usize = 4;
 /// 离屏封面纹理裁剪窗口（保留当前行上下各 4 屏，更远仅保留轻量元数据）。
@@ -191,6 +202,29 @@ pub struct AppShell {
     logout_confirm: bool,
     /// 登录页操作结果提示（如登出失败原因）。
     auth_notice: Option<String>,
+    /// 个人中心与通知中心状态（登录后有效，登出/切换账号时递增 `notify_gen` 拦截旧回调）。
+    notify_gen: u64,
+    account_stat: Option<AccountStat>,
+    unread_summary: UnreadSummary,
+    followings: ListSliceState<RelationUser>,
+    followings_next_pn: u32,
+    followers: ListSliceState<RelationUser>,
+    followers_next_pn: u32,
+    notify_tab: NotifyTab,
+    notify_replies: ListSliceState<ReplyNotice>,
+    notify_replies_cursor: Option<FeedCursor>,
+    notify_ats: ListSliceState<AtNotice>,
+    notify_ats_cursor: Option<FeedCursor>,
+    notify_likes: ListSliceState<LikeNotice>,
+    notify_likes_cursor: Option<FeedCursor>,
+    notify_systems: ListSliceState<SystemNotice>,
+    notify_systems_cursor: Option<u64>,
+    notify_sessions: ListSliceState<WhisperSession>,
+    notify_sessions_end_ts: Option<u64>,
+    selected_whisper: Option<(u64, i32)>,
+    whisper_threads: HashMap<(u64, i32), WhisperThreadState>,
+    avatar_cache: Arc<ImageCache>,
+    avatar_inflight: HashSet<String>,
     route: Route,
     history: Vec<Route>,
     pane_open: bool,
@@ -303,8 +337,72 @@ pub enum Message {
     LoginPolled(PollOutcome),
     AuthCancelLogin,
     AuthLogout,
+    AuthCancelLogout,
     /// None = 成功；Some = 失败原因。
     AuthLoggedOut(Option<String>),
+
+    // ---- 个人中心与通知中心 ----
+    OpenNotifications,
+    OpenVideoTarget(OpenTarget),
+    AccountRefresh,
+    AccountStatLoaded {
+        seq: u64,
+        stat: Option<AccountStat>,
+    },
+    UnreadLoaded {
+        seq: u64,
+        summary: Option<UnreadSummary>,
+    },
+    SelectNotifyTab(NotifyTab),
+    LoadMoreNotifyTab(NotifyTab),
+    RetryNotifyTab(NotifyTab),
+    RepliesLoaded {
+        seq: u64,
+        append: bool,
+        res: Result<bili_core::notify::FeedPage<ReplyNotice>, String>,
+    },
+    AtsLoaded {
+        seq: u64,
+        append: bool,
+        res: Result<bili_core::notify::FeedPage<AtNotice>, String>,
+    },
+    LikesLoaded {
+        seq: u64,
+        append: bool,
+        res: Result<bili_core::notify::FeedPage<LikeNotice>, String>,
+    },
+    SystemsLoaded {
+        seq: u64,
+        append: bool,
+        res: Result<bili_core::notify::SystemPage, String>,
+    },
+    SessionsLoaded {
+        seq: u64,
+        append: bool,
+        res: Result<bili_core::notify::SessionPage, String>,
+    },
+    SelectWhisperSession((u64, i32)),
+    RefreshWhisperThread((u64, i32)),
+    WhisperThreadLoaded {
+        seq: u64,
+        talker_id: u64,
+        session_type: i32,
+        res: Result<Vec<WhisperMessage>, String>,
+    },
+    NotifyAvatarLoaded {
+        seq: u64,
+        url: String,
+        image: Option<EncodedImage>,
+    },
+    OpenRelations(RelationKind),
+    RefreshRelations(RelationKind),
+    LoadMoreRelations(RelationKind),
+    RelationsLoaded {
+        seq: u64,
+        kind: RelationKind,
+        append: bool,
+        res: Result<RelationPage, String>,
+    },
 }
 
 impl AppShell {
@@ -324,6 +422,30 @@ impl AppShell {
         {
             item.cover = self.image_cache.get(url);
         }
+        self.start_playback(item, context);
+    }
+
+    fn open_video_target(&mut self, target: OpenTarget, context: &ComponentContext<Self>) {
+        if self.home_index.contains_key(&target.bvid) || data::find(&target.bvid).is_some() {
+            self.open_video(&target.bvid, context);
+            return;
+        }
+        let item = VideoItem {
+            bvid: target.bvid.clone(),
+            aid: 0,
+            cid: 0,
+            title: if target.title.trim().is_empty() {
+                target.bvid
+            } else {
+                target.title
+            },
+            author: String::new(),
+            duration_secs: 0,
+            play_count: 0,
+            danmaku_count: 0,
+            cover: None,
+            pic_url: None,
+        };
         self.start_playback(item, context);
     }
 
@@ -717,7 +839,10 @@ impl AppShell {
                     if next != self.home_focus_idx {
                         self.home_focus_idx = next;
                         self.rebuild_home_source();
-                        gamepad::inject_mouse_wheel(240);
+                        let step = crate::theme::CARD_HEIGHT + crate::theme::CARD_GAP;
+                        if !crate::winrt_ext::scroll_focused_viewer_by(-step) {
+                            gamepad::inject_mouse_wheel(240);
+                        }
                     }
                 }
             }
@@ -737,7 +862,10 @@ impl AppShell {
                         if next != self.home_focus_idx {
                             self.home_focus_idx = next;
                             self.rebuild_home_source();
-                            gamepad::inject_mouse_wheel(-240);
+                            let step = crate::theme::CARD_HEIGHT + crate::theme::CARD_GAP;
+                            if !crate::winrt_ext::scroll_focused_viewer_by(step) {
+                                gamepad::inject_mouse_wheel(-240);
+                            }
                         }
                     }
                 }
@@ -861,6 +989,282 @@ impl AppShell {
                 Some(context.set_local_timeout(COVER_FLUSH_INTERVAL, || Message::FlushCovers));
         }
     }
+
+    fn reset_account_data(&mut self) {
+        self.notify_gen = self.notify_gen.wrapping_add(1);
+        self.account_stat = None;
+        self.unread_summary = UnreadSummary::default();
+        self.followings = ListSliceState::default();
+        self.followings_next_pn = 1;
+        self.followers = ListSliceState::default();
+        self.followers_next_pn = 1;
+        self.notify_replies = ListSliceState::default();
+        self.notify_replies_cursor = None;
+        self.notify_ats = ListSliceState::default();
+        self.notify_ats_cursor = None;
+        self.notify_likes = ListSliceState::default();
+        self.notify_likes_cursor = None;
+        self.notify_systems = ListSliceState::default();
+        self.notify_systems_cursor = None;
+        self.notify_sessions = ListSliceState::default();
+        self.notify_sessions_end_ts = None;
+        self.selected_whisper = None;
+        self.whisper_threads.clear();
+        self.avatar_cache.clear();
+        self.avatar_inflight.clear();
+    }
+
+    fn fetch_account_summary(&mut self, context: &ComponentContext<Self>) {
+        let seq = self.notify_gen;
+        let auth = self.auth_service.clone();
+        let nav = auth.nav_client();
+        context.spawn_background(move |_| {
+            let stat = block_on(nav.fetch_stat()).ok();
+            Message::AccountStatLoaded { seq, stat }
+        });
+        let auth_u = self.auth_service.clone();
+        context.spawn_background(move |_| {
+            let summary = block_on(auth_u.notify_client().fetch_unread()).ok();
+            Message::UnreadLoaded { seq, summary }
+        });
+    }
+
+    fn relation_slot(&self, kind: RelationKind) -> (&ListSliceState<RelationUser>, u32) {
+        match kind {
+            RelationKind::Following => (&self.followings, self.followings_next_pn),
+            RelationKind::Follower => (&self.followers, self.followers_next_pn),
+        }
+    }
+
+    fn relation_slot_mut(
+        &mut self,
+        kind: RelationKind,
+    ) -> (&mut ListSliceState<RelationUser>, &mut u32) {
+        match kind {
+            RelationKind::Following => (&mut self.followings, &mut self.followings_next_pn),
+            RelationKind::Follower => (&mut self.followers, &mut self.followers_next_pn),
+        }
+    }
+
+    fn fetch_relations(
+        &mut self,
+        kind: RelationKind,
+        append: bool,
+        context: &ComponentContext<Self>,
+    ) {
+        let AuthState::LoggedIn(user) = &self.auth else {
+            return;
+        };
+        let mid = user.mid;
+        let seq = self.notify_gen;
+        let nav = self.auth_service.nav_client();
+        let pn = {
+            let (slice, next_pn) = self.relation_slot_mut(kind);
+            if slice.loading {
+                return;
+            }
+            slice.loading = true;
+            slice.error = None;
+            if append { (*next_pn).max(1) } else { 1 }
+        };
+        context.spawn_background(move |_| Message::RelationsLoaded {
+            seq,
+            kind,
+            append,
+            res: block_on(nav.fetch_relations(mid, kind, pn, RELATION_PAGE_SIZE))
+                .map_err(|e| e.to_string()),
+        });
+    }
+
+    fn ensure_account_loaded(&mut self, context: &ComponentContext<Self>) {
+        if !matches!(self.auth, AuthState::LoggedIn(_)) {
+            return;
+        }
+        if self.account_stat.is_none() {
+            self.fetch_account_summary(context);
+        }
+        self.ensure_active_tab_loaded(context);
+    }
+
+    fn ensure_active_tab_loaded(&mut self, context: &ComponentContext<Self>) {
+        if !matches!(self.auth, AuthState::LoggedIn(_)) {
+            return;
+        }
+        let already = match self.notify_tab {
+            NotifyTab::Reply => self.notify_replies.loaded_once || self.notify_replies.loading,
+            NotifyTab::At => self.notify_ats.loaded_once || self.notify_ats.loading,
+            NotifyTab::Like => self.notify_likes.loaded_once || self.notify_likes.loading,
+            NotifyTab::System => self.notify_systems.loaded_once || self.notify_systems.loading,
+            NotifyTab::Whisper => self.notify_sessions.loaded_once || self.notify_sessions.loading,
+        };
+        if !already {
+            self.fetch_notify_tab(self.notify_tab, false, context);
+        }
+    }
+
+    fn fetch_notify_tab(&mut self, tab: NotifyTab, append: bool, context: &ComponentContext<Self>) {
+        if !matches!(self.auth, AuthState::LoggedIn(_)) {
+            return;
+        }
+        let seq = self.notify_gen;
+        let client = self.auth_service.notify_client();
+        match tab {
+            NotifyTab::Reply => {
+                if self.notify_replies.loading {
+                    return;
+                }
+                self.notify_replies.loading = true;
+                self.notify_replies.error = None;
+                let cursor = if append { self.notify_replies_cursor } else { None };
+                context.spawn_background(move |_| Message::RepliesLoaded {
+                    seq,
+                    append,
+                    res: block_on(client.fetch_replies(cursor)).map_err(|e| e.to_string()),
+                });
+            }
+            NotifyTab::At => {
+                if self.notify_ats.loading {
+                    return;
+                }
+                self.notify_ats.loading = true;
+                self.notify_ats.error = None;
+                let cursor = if append { self.notify_ats_cursor } else { None };
+                context.spawn_background(move |_| Message::AtsLoaded {
+                    seq,
+                    append,
+                    res: block_on(client.fetch_ats(cursor)).map_err(|e| e.to_string()),
+                });
+            }
+            NotifyTab::Like => {
+                if self.notify_likes.loading {
+                    return;
+                }
+                self.notify_likes.loading = true;
+                self.notify_likes.error = None;
+                let cursor = if append { self.notify_likes_cursor } else { None };
+                context.spawn_background(move |_| Message::LikesLoaded {
+                    seq,
+                    append,
+                    res: block_on(client.fetch_likes(cursor)).map_err(|e| e.to_string()),
+                });
+            }
+            NotifyTab::System => {
+                if self.notify_systems.loading {
+                    return;
+                }
+                self.notify_systems.loading = true;
+                self.notify_systems.error = None;
+                let cursor = if append { self.notify_systems_cursor } else { None };
+                context.spawn_background(move |_| Message::SystemsLoaded {
+                    seq,
+                    append,
+                    res: block_on(client.fetch_system_notifies(cursor)).map_err(|e| e.to_string()),
+                });
+            }
+            NotifyTab::Whisper => {
+                if self.notify_sessions.loading {
+                    return;
+                }
+                self.notify_sessions.loading = true;
+                self.notify_sessions.error = None;
+                let end_ts = if append { self.notify_sessions_end_ts } else { None };
+                context.spawn_background(move |_| Message::SessionsLoaded {
+                    seq,
+                    append,
+                    res: block_on(client.fetch_sessions(end_ts)).map_err(|e| e.to_string()),
+                });
+            }
+        }
+    }
+
+    fn fetch_whisper_thread(
+        &mut self,
+        talker_id: u64,
+        session_type: i32,
+        context: &ComponentContext<Self>,
+    ) {
+        if !matches!(self.auth, AuthState::LoggedIn(_)) {
+            return;
+        }
+        let entry = self
+            .whisper_threads
+            .entry((talker_id, session_type))
+            .or_default();
+        if entry.loading {
+            return;
+        }
+        entry.loading = true;
+        entry.error = None;
+        let seq = self.notify_gen;
+        let client = self.auth_service.notify_client();
+        context.spawn_background(move |_| Message::WhisperThreadLoaded {
+            seq,
+            talker_id,
+            session_type,
+            res: block_on(client.fetch_session_messages(talker_id, session_type))
+                .map_err(|e| e.to_string()),
+        });
+    }
+
+    fn spawn_notify_avatars<'a>(
+        &mut self,
+        urls: impl IntoIterator<Item = &'a str>,
+        context: &ComponentContext<Self>,
+    ) {
+        let seq = self.notify_gen;
+        for raw in urls {
+            if raw.is_empty() {
+                continue;
+            }
+            let thumb = avatar_thumbnail_url(raw);
+            if self.avatar_cache.get(&thumb).is_some()
+                || !self.avatar_inflight.insert(thumb.clone())
+            {
+                continue;
+            }
+            let auth = self.auth_service.clone();
+            let cache = self.avatar_cache.clone();
+            let url = thumb;
+            context.spawn_background(move |_| {
+                let image = block_on(async {
+                    let _permit = cover_semaphore().acquire().await.ok()?;
+                    let img = auth.fetch_image_async(&url).await?;
+                    cache.put(url.clone(), img.clone());
+                    Some(img)
+                });
+                Message::NotifyAvatarLoaded { seq, url, image }
+            });
+        }
+    }
+}
+
+fn apply_feed_page<T>(
+    slice: &mut ListSliceState<T>,
+    cursor_slot: &mut Option<FeedCursor>,
+    append: bool,
+    res: Result<bili_core::notify::FeedPage<T>, String>,
+    avatar_of: impl Fn(&T) -> &str,
+) -> Vec<String> {
+    slice.loading = false;
+    slice.loaded_once = true;
+    match res {
+        Ok(page) => {
+            let urls: Vec<String> = page.items.iter().map(|i| avatar_of(i).to_string()).collect();
+            if append {
+                slice.items.extend(page.items);
+            } else {
+                slice.items = page.items;
+            }
+            *cursor_slot = page.next_cursor;
+            slice.has_more = page.has_more;
+            slice.error = None;
+            urls
+        }
+        Err(err) => {
+            slice.error = Some(err);
+            Vec::new()
+        }
+    }
 }
 
 fn spawn_resolve_media(
@@ -931,6 +1335,7 @@ impl Component for AppShell {
     type Message = Message;
 
     fn create(_input: &(), context: &ComponentContext<Self>) -> Self {
+        crate::winrt_ext::apply_global_font(crate::theme::DEFAULT_FONT_FAMILY);
         let auth_service = Arc::new(Auth::new());
         let nav = auth_service.nav_client();
         let settings_store = Arc::new(FileSettingsStore::new(
@@ -1081,6 +1486,28 @@ impl Component for AppShell {
             flow,
             logout_confirm: false,
             auth_notice: None,
+            notify_gen: 1,
+            account_stat: None,
+            unread_summary: UnreadSummary::default(),
+            followings: ListSliceState::default(),
+            followings_next_pn: 1,
+            followers: ListSliceState::default(),
+            followers_next_pn: 1,
+            notify_tab: NotifyTab::default(),
+            notify_replies: ListSliceState::default(),
+            notify_replies_cursor: None,
+            notify_ats: ListSliceState::default(),
+            notify_ats_cursor: None,
+            notify_likes: ListSliceState::default(),
+            notify_likes_cursor: None,
+            notify_systems: ListSliceState::default(),
+            notify_systems_cursor: None,
+            notify_sessions: ListSliceState::default(),
+            notify_sessions_end_ts: None,
+            selected_whisper: None,
+            whisper_threads: HashMap::new(),
+            avatar_cache: Arc::new(ImageCache::with_capacity(128)),
+            avatar_inflight: HashSet::new(),
             route,
             history: Vec::new(),
             pane_open: true,
@@ -1121,12 +1548,19 @@ impl Component for AppShell {
                 {
                     self.history.push(self.route);
                     self.route = route;
+                    if route == Route::Login {
+                        self.ensure_account_loaded(context);
+                    }
                 }
             }
             Message::PaneOpenChanged(open) => self.pane_open = open,
             Message::TogglePane => self.pane_open = !self.pane_open,
             Message::OpenVideo(bvid) => {
                 self.open_video(&bvid, context);
+                self.sync_smtc(context);
+            }
+            Message::OpenVideoTarget(target) => {
+                self.open_video_target(target, context);
                 self.sync_smtc(context);
             }
             Message::TogglePlay => {
@@ -1209,6 +1643,16 @@ impl Component for AppShell {
             } => {
                 if seq != self.playback_gen {
                     return; // 过期解析结果直接丢弃，防止切视频后串台覆盖
+                }
+                if let Some(cur) = self.now_playing.as_mut() {
+                    cur.aid = meta.aid;
+                    cur.cid = meta.cid;
+                    if cur.title.is_empty() || cur.title == cur.bvid {
+                        cur.title = meta.title.clone();
+                    }
+                    if cur.duration_secs == 0 && meta.duration > 0 {
+                        cur.duration_secs = meta.duration as u32;
+                    }
                 }
                 self.pending_open_preresolve = None;
                 self.apply_resolved_media(video_url, audio_url, meta, seq, context);
@@ -1704,6 +2148,14 @@ impl Component for AppShell {
                 if let Some(notice) = report.notice {
                     self.auth_notice = Some(notice);
                 }
+                if matches!(self.auth, AuthState::LoggedIn(_)) {
+                    self.fetch_account_summary(context);
+                    if self.route == Route::Login {
+                        self.ensure_active_tab_loaded(context);
+                    }
+                } else {
+                    self.reset_account_data();
+                }
             }
             Message::AuthStartLogin => {
                 if matches!(
@@ -1758,6 +2210,7 @@ impl Component for AppShell {
                 }
                 PollOutcome::Success => {
                     self.clear_login_session();
+                    self.reset_account_data();
                     // 会话已建立 → 递增认证代次重新探测用户信息（头像/昵称/续期状态）。
                     self.auth = AuthState::Unknown;
                     self.auth_gen = self.auth_gen.wrapping_add(1);
@@ -1791,14 +2244,281 @@ impl Component for AppShell {
                     Message::AuthLoggedOut(auth.logout_blocking().err())
                 });
             }
+            Message::AuthCancelLogout => {
+                self.logout_confirm = false;
+            }
             Message::AuthLoggedOut(error) => match error {
-                Some(reason) => self.auth_notice = Some(format!("登出失败：{reason}")),
+                Some(reason) => self.auth_notice = Some(format!("退出失败：{reason}")),
                 None => {
                     self.auth_gen = self.auth_gen.wrapping_add(1);
                     self.auth_notice = None;
                     self.auth = AuthState::Guest;
+                    self.reset_account_data();
                 }
             },
+
+            // ---- 个人中心与通知中心 ----
+            Message::OpenNotifications => {
+                self.logout_confirm = false;
+                if self.route != Route::Login {
+                    self.history.push(self.route);
+                    self.route = Route::Login;
+                }
+                if self.notify_tab.unread(self.unread_summary) == 0
+                    && let Some(unread_tab) = NotifyTab::ALL
+                        .into_iter()
+                        .find(|tab| tab.unread(self.unread_summary) > 0)
+                {
+                    self.notify_tab = unread_tab;
+                }
+                self.ensure_account_loaded(context);
+            }
+            Message::AccountRefresh => {
+                if !matches!(self.auth, AuthState::LoggedIn(_)) {
+                    return;
+                }
+                let tab = self.notify_tab;
+                let selected = self.selected_whisper;
+                self.reset_account_data();
+                self.notify_tab = tab;
+                self.fetch_account_summary(context);
+                self.fetch_notify_tab(tab, false, context);
+                if tab == NotifyTab::Whisper
+                    && let Some((tid, stype)) = selected
+                {
+                    self.selected_whisper = Some((tid, stype));
+                    self.fetch_whisper_thread(tid, stype, context);
+                }
+            }
+            Message::AccountStatLoaded { seq, stat } => {
+                if seq == self.notify_gen && stat.is_some() {
+                    self.account_stat = stat;
+                }
+            }
+            Message::UnreadLoaded { seq, summary } => {
+                if seq == self.notify_gen
+                    && let Some(s) = summary
+                {
+                    self.unread_summary = s;
+                }
+            }
+            Message::SelectNotifyTab(tab) => {
+                self.notify_tab = tab;
+                self.ensure_active_tab_loaded(context);
+            }
+            Message::LoadMoreNotifyTab(tab) => {
+                self.fetch_notify_tab(tab, true, context);
+            }
+            Message::RetryNotifyTab(tab) => {
+                let append = match tab {
+                    NotifyTab::Reply => !self.notify_replies.items.is_empty(),
+                    NotifyTab::At => !self.notify_ats.items.is_empty(),
+                    NotifyTab::Like => !self.notify_likes.items.is_empty(),
+                    NotifyTab::System => !self.notify_systems.items.is_empty(),
+                    NotifyTab::Whisper => !self.notify_sessions.items.is_empty(),
+                };
+                self.fetch_notify_tab(tab, append, context);
+            }
+            Message::RepliesLoaded { seq, append, res } => {
+                if seq != self.notify_gen {
+                    return;
+                }
+                let urls = apply_feed_page(
+                    &mut self.notify_replies,
+                    &mut self.notify_replies_cursor,
+                    append,
+                    res,
+                    |i| &i.sender_avatar,
+                );
+                self.spawn_notify_avatars(urls.iter().map(String::as_str), context);
+            }
+            Message::AtsLoaded { seq, append, res } => {
+                if seq != self.notify_gen {
+                    return;
+                }
+                let urls = apply_feed_page(
+                    &mut self.notify_ats,
+                    &mut self.notify_ats_cursor,
+                    append,
+                    res,
+                    |i| &i.sender_avatar,
+                );
+                self.spawn_notify_avatars(urls.iter().map(String::as_str), context);
+            }
+            Message::LikesLoaded { seq, append, res } => {
+                if seq != self.notify_gen {
+                    return;
+                }
+                let urls = apply_feed_page(
+                    &mut self.notify_likes,
+                    &mut self.notify_likes_cursor,
+                    append,
+                    res,
+                    |i| &i.sender_avatar,
+                );
+                self.spawn_notify_avatars(urls.iter().map(String::as_str), context);
+            }
+            Message::SystemsLoaded { seq, append, res } => {
+                if seq != self.notify_gen {
+                    return;
+                }
+                self.notify_systems.loading = false;
+                self.notify_systems.loaded_once = true;
+                match res {
+                    Ok(page) => {
+                        if append {
+                            let existing: HashSet<u64> =
+                                self.notify_systems.items.iter().map(|i| i.id).collect();
+                            for item in page.items {
+                                if !existing.contains(&item.id) {
+                                    self.notify_systems.items.push(item);
+                                }
+                            }
+                        } else {
+                            self.notify_systems.items = page.items;
+                        }
+                        self.notify_systems_cursor = page.next_cursor;
+                        self.notify_systems.has_more = page.has_more;
+                        self.notify_systems.error = None;
+                    }
+                    Err(err) => self.notify_systems.error = Some(err),
+                }
+            }
+            Message::SessionsLoaded { seq, append, res } => {
+                if seq != self.notify_gen {
+                    return;
+                }
+                self.notify_sessions.loading = false;
+                self.notify_sessions.loaded_once = true;
+                match res {
+                    Ok(page) => {
+                        let urls: Vec<String> = page
+                            .sessions
+                            .iter()
+                            .map(|s| s.talker_avatar.clone())
+                            .collect();
+                        if append {
+                            self.notify_sessions.items.extend(page.sessions);
+                        } else {
+                            self.notify_sessions.items = page.sessions;
+                        }
+                        self.notify_sessions_end_ts = page.end_ts;
+                        self.notify_sessions.has_more = page.has_more;
+                        self.notify_sessions.error = None;
+                        self.spawn_notify_avatars(urls.iter().map(String::as_str), context);
+                        if self.selected_whisper.is_none()
+                            && let Some(first) = self.notify_sessions.items.first()
+                        {
+                            let key = (first.talker_id, first.session_type);
+                            self.selected_whisper = Some(key);
+                            if !self.whisper_threads.contains_key(&key) {
+                                self.fetch_whisper_thread(key.0, key.1, context);
+                            }
+                        }
+                    }
+                    Err(err) => self.notify_sessions.error = Some(err),
+                }
+            }
+            Message::SelectWhisperSession((talker_id, session_type)) => {
+                self.selected_whisper = Some((talker_id, session_type));
+                if !self.whisper_threads.contains_key(&(talker_id, session_type)) {
+                    self.fetch_whisper_thread(talker_id, session_type, context);
+                }
+            }
+            Message::RefreshWhisperThread((talker_id, session_type)) => {
+                self.fetch_whisper_thread(talker_id, session_type, context);
+            }
+            Message::WhisperThreadLoaded {
+                seq,
+                talker_id,
+                session_type,
+                res,
+            } => {
+                if seq != self.notify_gen {
+                    return;
+                }
+                let entry = self
+                    .whisper_threads
+                    .entry((talker_id, session_type))
+                    .or_default();
+                entry.loading = false;
+                match res {
+                    Ok(msgs) => {
+                        entry.messages = msgs;
+                        entry.error = None;
+                    }
+                    Err(err) => entry.error = Some(err),
+                }
+            }
+            Message::NotifyAvatarLoaded { seq, url, image } => {
+                if seq != self.notify_gen {
+                    return;
+                }
+                self.avatar_inflight.remove(&url);
+                let _ = image;
+            }
+            Message::OpenRelations(kind) => {
+                let (slice, _) = self.relation_slot(kind);
+                if !slice.loading && !slice.loaded_once {
+                    self.fetch_relations(kind, false, context);
+                }
+            }
+            Message::RefreshRelations(kind) => {
+                self.fetch_relations(kind, false, context);
+            }
+            Message::LoadMoreRelations(kind) => {
+                self.fetch_relations(kind, true, context);
+            }
+            Message::RelationsLoaded {
+                seq,
+                kind,
+                append,
+                res,
+            } => {
+                if seq != self.notify_gen {
+                    return;
+                }
+                let urls: Option<Vec<String>> = {
+                    let (slice, next_pn) = self.relation_slot_mut(kind);
+                    slice.loading = false;
+                    slice.loaded_once = true;
+                    match res {
+                        Ok(page) => {
+                            let faces: Vec<String> =
+                                page.items.iter().map(|u| u.face.clone()).collect();
+                            if append {
+                                let existing: HashSet<u64> =
+                                    slice.items.iter().map(|u| u.mid).collect();
+                                for u in page.items {
+                                    if !existing.contains(&u.mid) {
+                                        slice.items.push(u);
+                                    }
+                                }
+                            } else {
+                                slice.items = page.items;
+                            }
+                            *next_pn = page.next_pn;
+                            slice.has_more = page.has_more;
+                            slice.error = None;
+                            if page.total > 0 {
+                                let stat = self.account_stat.get_or_insert_with(Default::default);
+                                match kind {
+                                    RelationKind::Following => stat.following = page.total,
+                                    RelationKind::Follower => stat.follower = page.total,
+                                }
+                            }
+                            Some(faces)
+                        }
+                        Err(err) => {
+                            slice.error = Some(err);
+                            None
+                        }
+                    }
+                };
+                if let Some(urls) = urls {
+                    self.spawn_notify_avatars(urls.iter().map(String::as_str), context);
+                }
+            }
         }
     }
 
@@ -1842,22 +2562,58 @@ impl Component for AppShell {
                 _ => self.home_view(context),
             }
         } else if self.route == Route::Login {
+            let (account_view, account_cb) = match &self.auth {
+                AuthState::LoggedIn(user) => (
+                    Some(AccountViewData {
+                        user,
+                        stat: self.account_stat,
+                        unread: self.unread_summary,
+                        followings: &self.followings,
+                        followers: &self.followers,
+                        active_tab: self.notify_tab,
+                        replies: &self.notify_replies,
+                        ats: &self.notify_ats,
+                        likes: &self.notify_likes,
+                        systems: &self.notify_systems,
+                        sessions: &self.notify_sessions,
+                        selected_talker: self.selected_whisper,
+                        selected_thread: self
+                            .selected_whisper
+                            .and_then(|key| self.whisper_threads.get(&key)),
+                        avatar_cache: &self.avatar_cache,
+                        logout_confirm: self.logout_confirm,
+                        auth_notice: self.auth_notice.as_deref(),
+                    }),
+                    Some(AccountCallbacks {
+                        on_refresh: context.message(Message::AccountRefresh),
+                        on_logout: context.message(Message::AuthLogout),
+                        on_cancel_logout: context.message(Message::AuthCancelLogout),
+                        on_open_relations: context.callback(Message::OpenRelations),
+                        on_refresh_relations: context.callback(Message::RefreshRelations),
+                        on_load_more_relations: context.callback(Message::LoadMoreRelations),
+                        on_select_tab: context.callback(Message::SelectNotifyTab),
+                        on_load_more: context.callback(Message::LoadMoreNotifyTab),
+                        on_retry_tab: context.callback(Message::RetryNotifyTab),
+                        on_select_session: context.callback(Message::SelectWhisperSession),
+                        on_refresh_thread: context.callback(Message::RefreshWhisperThread),
+                        on_open_video: context.callback(Message::OpenVideoTarget),
+                    }),
+                ),
+                _ => (None, None),
+            };
             pages::login::login_page(
                 &self.auth,
                 &self.login_flow,
-                self.logout_confirm,
-                self.auth_notice.clone(),
+                account_view,
+                account_cb,
                 context.message(Message::AuthStartLogin),
                 context.message(Message::AuthCancelLogin),
-                context.message(Message::AuthLogout),
             )
         } else if self.route == Route::Settings {
-            let settings_path = self.settings_store.path().display().to_string();
             let on_change = context.callback(Message::UpdateSettings);
             pages::settings::settings_page(
                 &self.settings,
                 is_vip,
-                &settings_path,
                 self.settings_notice.as_deref(),
                 &on_change,
             )
@@ -1907,7 +2663,7 @@ impl Component for AppShell {
                 .is_selected(self.route == Route::Login)
                 .selects_on_invoked(true)
                 .icon(Symbol::Account)
-                .content("检查登录态…"),
+                .content("账号"),
             AuthState::Guest => NavigationViewItem::new()
                 .tag(Route::Login.tag())
                 .is_selected(self.route == Route::Login)
@@ -1949,17 +2705,51 @@ impl Component for AppShell {
                 layers
             }));
 
-        let title_bar = TitleBar::new()
+        let route_subtitle = if self.route == Route::Login {
+            match &self.auth {
+                AuthState::LoggedIn(_) => "个人中心",
+                _ => "登录",
+            }
+        } else {
+            self.route.label()
+        };
+
+        let mut title_bar = TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)
             .title("biliplay")
-            .subtitle(self.route.label())
+            .subtitle(route_subtitle)
             .is_back_button_visible(true)
             .is_back_button_enabled(!self.history.is_empty())
             .is_pane_toggle_button_visible(true)
             .on_back_requested(context.message(Message::Back))
             .on_pane_toggle_requested(context.message(Message::TogglePane))
             .grid_row(0)
-            .content(TextBox::new().placeholder_text("搜索视频、UP主、直播间……（待接入）"));
+            .content(TextBox::new().placeholder_text("搜索"));
+
+        if matches!(self.auth, AuthState::LoggedIn(_)) {
+            let total_unread = self.unread_summary.total();
+            let mut bell_parts: Vec<View> =
+                vec![SymbolIcon::new().symbol(Symbol::Mail).into()];
+            if total_unread > 0 {
+                bell_parts.push(
+                    InfoBadge::new()
+                        .value(total_unread.min(99) as i32)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .into(),
+                );
+            }
+            title_bar = title_bar.right_header(
+                Button::new()
+                    .style(ButtonStyle::Subtle)
+                    .on_click(context.message(Message::OpenNotifications))
+                    .content(
+                        StackPanel::new()
+                            .orientation(Orientation::Horizontal)
+                            .spacing(6.0)
+                            .children(bell_parts),
+                    ),
+            );
+        }
 
         // 播放页自带全量传输控制 → 隐藏迷你条。
         let mini = if self.route != Route::Player

@@ -13,6 +13,7 @@ mod shell;
 mod smtc;
 mod theme;
 mod widgets;
+mod winrt_ext;
 
 fn main() {
     windows_reactor::App::run_component::<shell::AppShell>(()).unwrap();
