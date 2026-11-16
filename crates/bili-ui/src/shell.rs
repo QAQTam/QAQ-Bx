@@ -41,6 +41,8 @@ use crate::widgets::video_card::{self, HomeSlot};
 const COVER_FLUSH_INTERVAL: Duration = Duration::from_millis(80);
 /// Hover 预解析缓存有效期（CDN 签名时效内安全复用）。
 const PRERESOLVE_TTL: Duration = Duration::from_secs(180);
+/// 窄屏（竖屏手机/掌机）自适应断点。
+const COMPACT_BREAKPOINT: f64 = 760.0;
 /// Hover 预解析最多缓存条目数。
 const MAX_PRERESOLVE_CACHE: usize = 16;
 /// 关注/粉丝挂件每页拉取条数。
@@ -258,6 +260,10 @@ pub struct AppShell {
     home_focus_idx: usize,
     /// 首页右侧半窗预览是否展开。
     home_half_pane: bool,
+    /// 当前窗口宽度（用于宽屏左侧栏 ↔ 窄屏底栏自适应切换）。
+    window_width: f64,
+    /// 窄屏底栏“更多”1×5 向上弹窗开关。
+    more_menu_open: bool,
     /// MSIX / Store 打包运行时的 Windows App Notifications 激活注册句柄。
     _app_notifications: Option<crate::winrt_ext::AppNotificationGuard>,
     toast_rx: Option<Arc<Mutex<std::sync::mpsc::Receiver<()>>>>,
@@ -296,6 +302,9 @@ pub enum Message {
     ExpandHalfPane,
     CloseHalfPane,
     ResizeHalfPane(f64),
+    ToggleMoreMenu,
+    CloseMoreMenu,
+    NavigateCompact(Route),
     /// Windows 控制中心媒体按钮回调（None 表示通道已关闭）。
     SmtcAction(Option<SmtcCommand>),
     /// Xbox 手柄事件回调（None 表示通道已关闭）。
@@ -947,9 +956,11 @@ impl AppShell {
 
     /// 首页视图（Home 路由与播放页无播放项时的兜底共用）。
     fn home_view(&self, context: &ViewContext<Self>) -> View {
+        let compact = self.window_width < COMPACT_BREAKPOINT;
         pages::home::home_page(
             &self.home_source,
             &self.home_state,
+            compact,
             &context.message(Message::HomeRefresh),
             &context.message(Message::HomeRetry),
         )
@@ -1449,6 +1460,9 @@ impl Component for AppShell {
             timer = Some(context.set_local_timeout(PLAYBACK_TICK, || Message::PositionTick));
         }
 
+        let initial_win_w = settings
+            .window
+            .map_or(1280.0, |w| f64::from(w.width).max(320.0));
         let volume = settings.volume;
         let home_on_open = context.callback(Message::OpenVideo);
         let home_on_hover = context.callback(Message::PreResolveVideo);
@@ -1578,6 +1592,8 @@ impl Component for AppShell {
             gamepad_rx,
             home_focus_idx: 0,
             home_half_pane: false,
+            window_width: initial_win_w,
+            more_menu_open: false,
             _app_notifications: app_notifications,
             toast_rx,
         }
@@ -1905,8 +1921,31 @@ impl Component for AppShell {
                     self.maybe_prefetch_next_page(context);
                 }
             }
+            Message::ToggleMoreMenu => {
+                self.more_menu_open = !self.more_menu_open;
+            }
+            Message::CloseMoreMenu => {
+                self.more_menu_open = false;
+            }
+            Message::NavigateCompact(target) => {
+                self.more_menu_open = false;
+                self.home_half_pane = false;
+                self.logout_confirm = false;
+                if self.route != target {
+                    self.history.push(self.route);
+                    self.route = target;
+                    if target == Route::Login && self.auth_gen > 0 {
+                        self.ensure_account_loaded(context);
+                    }
+                }
+            }
             Message::WindowResized(size) => {
-                let vw = (size.width - 56.0).max(320.0);
+                self.window_width = size.width.max(320.0);
+                if self.window_width >= COMPACT_BREAKPOINT {
+                    self.more_menu_open = false;
+                }
+                let side_pad = if self.window_width < COMPACT_BREAKPOINT { 0.0 } else { 56.0 };
+                let vw = (size.width - side_pad).max(320.0);
                 let vh = (size.height - 136.0).max(320.0);
                 self.home_viewport_w = vw;
                 self.home_viewport_h = vh;
@@ -2614,6 +2653,7 @@ impl Component for AppShell {
         context.window_visuals(visuals);
         context.on_window_size(context.callback(Message::WindowResized));
 
+        let compact = self.window_width < COMPACT_BREAKPOINT;
         let on_open = context.callback(Message::OpenVideo);
         let is_vip = matches!(&self.auth, AuthState::LoggedIn(user) if user.vip.is_vip());
 
@@ -2625,6 +2665,7 @@ impl Component for AppShell {
                         playing: self.playing,
                         position: self.position,
                         volume: self.volume,
+                        compact,
                         mount_tick: self.mount_tick,
                         duration_secs: self.display_duration(item),
                         notice: self.player_notice.clone(),
@@ -2689,6 +2730,7 @@ impl Component for AppShell {
             pages::settings::settings_page(
                 &self.settings,
                 is_vip,
+                compact,
                 self.settings_notice.as_deref(),
                 &on_change,
             )
@@ -2753,65 +2795,6 @@ impl Component for AppShell {
             .icon(Route::Settings.icon())
             .content(Route::Settings.label());
 
-        let navigation = NavigationView::new()
-            .pane_display_mode(NavigationViewPaneDisplayMode::LeftCompact)
-            .is_pane_toggle_button_visible(false)
-            .is_back_button_visible(NavigationViewBackButtonVisible::Collapsed)
-            .is_settings_visible(false)
-            .always_show_header(false)
-            .pane_title(crate::notifications::APP_DISPLAY_NAME)
-            .is_pane_open(self.pane_open)
-            .on_is_pane_open_changed(context.callback(Message::PaneOpenChanged))
-            .on_selected_tag_changed(context.callback(|tag: Option<Rc<str>>| {
-                Message::NavTagSelected(tag.map(|tag| tag.to_string()))
-            }))
-            .grid_row(1)
-            .keyed_menu_items(menu_items)
-            .footer_menu_items((account, settings_item))
-            .content(Grid::new().keyed_children({
-                let mut layers = if self.route == Route::Player {
-                    vec![
-                        keyed("home", self.home_view(context)),
-                        keyed(
-                            key,
-                            Border::new()
-                                .background(ThemeBrush::SolidBackground)
-                                .content(content),
-                        ),
-                    ]
-                } else if self.route == Route::Home && self.home_half_pane {
-                    let mut list = vec![keyed(key, content)];
-                    if let (Some(item), Some(engine)) = (self.now_playing.as_ref(), self.engine.as_ref()) {
-                        list.push(keyed(
-                            format!("half-pane:{}", item.bvid),
-                            View::component::<pages::player::HalfPanePreview>(
-                                pages::player::HalfPaneInput {
-                                    item: item.clone(),
-                                    mount_tick: self.mount_tick,
-                                    width: self.settings.half_pane_width,
-                                    notice: self.player_notice.clone(),
-                                    engine: engine.clone(),
-                                    on_expand: context.message(Message::ExpandHalfPane),
-                                    on_close: context.message(Message::CloseHalfPane),
-                                    on_resize: context.callback(Message::ResizeHalfPane),
-                                },
-                            ),
-                        ));
-                    }
-                    list
-                } else {
-                    vec![keyed(key, content)]
-                };
-                if self.gamepad_active {
-                    let focus_title = self.focused_home_video().map(|v| v.title.as_str());
-                    layers.push(keyed(
-                        "gamepad-hint",
-                        gamepad::gamepad_hint_bar(self.route, focus_title),
-                    ));
-                }
-                layers
-            }));
-
         let route_subtitle = if self.route == Route::Login {
             match &self.auth {
                 AuthState::LoggedIn(_) => "个人中心",
@@ -2828,7 +2811,7 @@ impl Component for AppShell {
             .subtitle(route_subtitle)
             .is_back_button_visible(true)
             .is_back_button_enabled(!self.history.is_empty())
-            .is_pane_toggle_button_visible(true)
+            .is_pane_toggle_button_visible(!compact)
             .on_back_requested(context.message(Message::Back))
             .on_pane_toggle_requested(context.message(Message::TogglePane))
             .grid_row(0)
@@ -2878,6 +2861,149 @@ impl Component for AppShell {
             None
         };
 
+        if compact {
+            let content_host = Grid::new().grid_row(1).keyed_children({
+                let mut layers = if self.route == Route::Player {
+                    vec![
+                        keyed("home", self.home_view(context)),
+                        keyed(
+                            key,
+                            Border::new()
+                                .background(ThemeBrush::SolidBackground)
+                                .content(content),
+                        ),
+                    ]
+                } else if self.route == Route::Home && self.home_half_pane {
+                    let mut list = vec![keyed(key, content)];
+                    if let (Some(item), Some(engine)) = (self.now_playing.as_ref(), self.engine.as_ref()) {
+                        list.push(keyed(
+                            format!("half-pane:{}", item.bvid),
+                            View::component::<pages::player::HalfPanePreview>(
+                                pages::player::HalfPaneInput {
+                                    item: item.clone(),
+                                    mount_tick: self.mount_tick,
+                                    width: self.settings.half_pane_width,
+                                    max_width: self.window_width,
+                                    notice: self.player_notice.clone(),
+                                    engine: engine.clone(),
+                                    on_expand: context.message(Message::ExpandHalfPane),
+                                    on_close: context.message(Message::CloseHalfPane),
+                                    on_resize: context.callback(Message::ResizeHalfPane),
+                                },
+                            ),
+                        ));
+                    }
+                    list
+                } else {
+                    vec![keyed(key, content)]
+                };
+                if self.gamepad_active {
+                    let focus_title = self.focused_home_video().map(|v| v.title.as_str());
+                    layers.push(keyed(
+                        "gamepad-hint",
+                        gamepad::gamepad_hint_bar(self.route, focus_title),
+                    ));
+                }
+                if self.more_menu_open {
+                    layers.push(keyed(
+                        "more-scrim",
+                        Border::new()
+                            .background(Brush::Solid(Color::argb(1, 0, 0, 0)))
+                            .on_pointer_pressed(context.callback(|_| Message::CloseMoreMenu)),
+                    ));
+                    layers.push(keyed(
+                        "more-popup",
+                        compact_more_popup(self.route, context),
+                    ));
+                }
+                layers
+            });
+
+            let bottom_bar = compact_bottom_bar(self.route, self.more_menu_open, context);
+
+            return if let Some(mini) = mini {
+                Grid::new()
+                    .rows([
+                        GridLength::Auto,
+                        GridLength::Star(1.0),
+                        GridLength::Auto,
+                        GridLength::Auto,
+                    ])
+                    .children((
+                        title_bar,
+                        content_host,
+                        mini.grid_row(2),
+                        bottom_bar.grid_row(3),
+                    ))
+                    .into()
+            } else {
+                Grid::new()
+                    .rows([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
+                    .children((title_bar, content_host, bottom_bar.grid_row(2)))
+                    .into()
+            };
+        }
+
+        let navigation = NavigationView::new()
+            .pane_display_mode(NavigationViewPaneDisplayMode::LeftCompact)
+            .is_pane_toggle_button_visible(false)
+            .is_back_button_visible(NavigationViewBackButtonVisible::Collapsed)
+            .is_settings_visible(false)
+            .always_show_header(false)
+            .pane_title("biliplay")
+            .is_pane_open(self.pane_open)
+            .on_is_pane_open_changed(context.callback(Message::PaneOpenChanged))
+            .on_selected_tag_changed(context.callback(|tag: Option<Rc<str>>| {
+                Message::NavTagSelected(tag.map(|tag| tag.to_string()))
+            }))
+            .grid_row(1)
+            .keyed_menu_items(menu_items)
+            .footer_menu_items((account, settings_item))
+            .content(Grid::new().keyed_children({
+                let mut layers = if self.route == Route::Player {
+                    vec![
+                        keyed("home", self.home_view(context)),
+                        keyed(
+                            key,
+                            Border::new()
+                                .background(ThemeBrush::SolidBackground)
+                                .content(content),
+                        ),
+                    ]
+                } else if self.route == Route::Home && self.home_half_pane {
+                    let mut list = vec![keyed(key, content)];
+                    if let (Some(item), Some(engine)) = (self.now_playing.as_ref(), self.engine.as_ref()) {
+                        list.push(keyed(
+                            format!("half-pane:{}", item.bvid),
+                            View::component::<pages::player::HalfPanePreview>(
+                                pages::player::HalfPaneInput {
+                                    item: item.clone(),
+                                    mount_tick: self.mount_tick,
+                                    width: self.settings.half_pane_width,
+                                    max_width: self.window_width,
+                                    notice: self.player_notice.clone(),
+                                    engine: engine.clone(),
+                                    on_expand: context.message(Message::ExpandHalfPane),
+                                    on_close: context.message(Message::CloseHalfPane),
+                                    on_resize: context.callback(Message::ResizeHalfPane),
+                                },
+                            ),
+                        ));
+                    }
+                    list
+                } else {
+                    vec![keyed(key, content)]
+                };
+                if self.gamepad_active {
+                    let focus_title = self.focused_home_video().map(|v| v.title.as_str());
+                    layers.push(keyed(
+                        "gamepad-hint",
+                        gamepad::gamepad_hint_bar(self.route, focus_title),
+                    ));
+                }
+                layers
+            }));
+
         if let Some(mini) = mini {
             Grid::new()
                 .rows([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
@@ -2902,6 +3028,193 @@ fn nav_item(tag: &str, label: &str, icon: Option<Symbol>, selected: bool) -> Key
         item = item.icon(symbol);
     }
     KeyedView::new(tag.to_string(), item)
+}
+
+const COMPACT_MORE_ROUTES: [Route; 5] = [
+    Route::Following,
+    Route::Live,
+    Route::Favorites,
+    Route::History,
+    Route::Settings,
+];
+
+/// Android Material 3 × Fluent 窄屏底部导航栏（4 个常驻 + 1 个“更多”向上展开 1×5 弹窗）。
+fn compact_bottom_bar(
+    active_route: Route,
+    more_open: bool,
+    context: &mut ViewContext<AppShell>,
+) -> Grid {
+    let primary: [(Route, &str); 4] = [
+        (Route::Home, "推荐"),
+        (Route::Popular, "热门"),
+        (Route::Search, "搜索"),
+        (Route::Login, "我的"),
+    ];
+    let more_active = more_open || COMPACT_MORE_ROUTES.contains(&active_route);
+
+    let tab_btn = |col: usize, symbol: Symbol, label: &str, selected: bool, on_click: Callback<()>| {
+        let pill_bg = if selected {
+            Brush::Theme(ThemeBrush::Accent)
+        } else {
+            Brush::Solid(Color::argb(0, 0, 0, 0))
+        };
+        let icon_fg = if selected {
+            Brush::Solid(Color::rgb(255, 255, 255))
+        } else {
+            Brush::Theme(ThemeBrush::PrimaryText)
+        };
+        Button::new()
+            .grid_column(col as i32)
+            .style(ButtonStyle::Subtle)
+            .horizontal_alignment(HorizontalAlignment::Stretch)
+            .vertical_alignment(VerticalAlignment::Stretch)
+            .horizontal_content_alignment(HorizontalAlignment::Center)
+            .vertical_content_alignment(VerticalAlignment::Center)
+            .on_click(on_click)
+            .content(
+                StackPanel::new().spacing(3.0).children((
+                    Border::new()
+                        .width(56.0)
+                        .height(28.0)
+                        .corner_radius(14.0)
+                        .background(pill_bg)
+                        .horizontal_alignment(HorizontalAlignment::Center)
+                        .content(
+                            FontIcon::new()
+                                .glyph(symbol_glyph(symbol))
+                                .font_size(14.0)
+                                .foreground(icon_fg)
+                                .opacity(if selected { 1.0 } else { 0.72 })
+                                .horizontal_alignment(HorizontalAlignment::Center)
+                                .vertical_alignment(VerticalAlignment::Center),
+                        ),
+                    TextBlock::new()
+                        .text(label)
+                        .font_size(11.0)
+                        .font_weight(if selected {
+                            FontWeight::SEMI_BOLD
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .foreground(if selected {
+                            ThemeBrush::AccentText
+                        } else {
+                            ThemeBrush::PrimaryText
+                        })
+                        .opacity(if selected { 1.0 } else { 0.72 })
+                        .horizontal_alignment(HorizontalAlignment::Center),
+                )),
+            )
+    };
+
+    let mut children: Vec<View> = primary
+        .iter()
+        .enumerate()
+        .map(|(col, &(route, label))| {
+            tab_btn(
+                col,
+                route.icon(),
+                label,
+                active_route == route,
+                context.message(Message::NavigateCompact(route)),
+            )
+            .into()
+        })
+        .collect();
+
+    children.push(
+        tab_btn(
+            4,
+            Symbol::More,
+            "更多",
+            more_active,
+            context.message(Message::ToggleMoreMenu),
+        )
+        .into(),
+    );
+
+    Grid::new()
+        .children((Border::new()
+            .height(64.0)
+            .background(ThemeBrush::CardBackground)
+            .border_brush(ThemeBrush::CardStroke)
+            .border_thickness(Thickness::new(0.0, 1.0, 0.0, 0.0))
+            .content(
+                Grid::new()
+                    .columns([
+                        GridLength::Star(1.0),
+                        GridLength::Star(1.0),
+                        GridLength::Star(1.0),
+                        GridLength::Star(1.0),
+                        GridLength::Star(1.0),
+                    ])
+                    .children(children),
+            ),))
+}
+
+/// 窄屏底栏右侧向上展开的 1×5 悬浮菜单。
+fn compact_more_popup(active_route: Route, context: &mut ViewContext<AppShell>) -> View {
+    let rows: Vec<View> = COMPACT_MORE_ROUTES
+        .iter()
+        .map(|&route| {
+            let selected = active_route == route;
+            Button::new()
+                .style(if selected {
+                    ButtonStyle::Accent
+                } else {
+                    ButtonStyle::Subtle
+                })
+                .horizontal_alignment(HorizontalAlignment::Stretch)
+                .horizontal_content_alignment(HorizontalAlignment::Left)
+                .on_click(context.message(Message::NavigateCompact(route)))
+                .content(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(10.0)
+                        .margin(Thickness::xy(6.0, 4.0))
+                        .children((
+                            FontIcon::new()
+                                .glyph(symbol_glyph(route.icon()))
+                                .font_size(14.0)
+                                .vertical_alignment(VerticalAlignment::Center),
+                            TextBlock::new()
+                                .text(route.label())
+                                .font_size(13.0)
+                                .vertical_alignment(VerticalAlignment::Center),
+                        )),
+                )
+                .into()
+        })
+        .collect();
+
+    Border::new()
+        .width(168.0)
+        .margin(Thickness::new(0.0, 0.0, 12.0, 10.0))
+        .padding(Thickness::xy(6.0, 6.0))
+        .corner_radius(12.0)
+        .background(ThemeBrush::SolidBackground)
+        .border_brush(ThemeBrush::CardStroke)
+        .border_thickness(1.0)
+        .horizontal_alignment(HorizontalAlignment::Right)
+        .vertical_alignment(VerticalAlignment::Bottom)
+        .content(StackPanel::new().spacing(4.0).children(rows))
+        .into()
+}
+
+fn symbol_glyph(symbol: Symbol) -> &'static str {
+    match symbol {
+        Symbol::Home => "\u{E80F}",
+        Symbol::Like => "\u{E8E1}",
+        Symbol::Find => "\u{E721}",
+        Symbol::Account => "\u{E77B}",
+        Symbol::More => "\u{E712}",
+        Symbol::People => "\u{E716}",
+        Symbol::Camera => "\u{E722}",
+        Symbol::Favorite => "\u{E734}",
+        Symbol::Clock => "\u{E823}",
+        Symbol::Setting => "\u{E713}",
+        _ => "\u{E712}",
+    }
 }
 
 #[cfg(test)]

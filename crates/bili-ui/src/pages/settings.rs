@@ -8,6 +8,7 @@ use crate::theme;
 pub fn settings_page(
     settings: &AppSettings,
     is_vip: bool,
+    compact: bool,
     save_status: Option<&str>,
     on_change: &Callback<AppSettings>,
 ) -> View {
@@ -235,20 +236,29 @@ pub fn settings_page(
         );
     }
 
-    let danmaku_card = card(StackPanel::new().spacing(16.0).children(danmaku_items)).grid_column(1);
+    let danmaku_card = card(StackPanel::new().spacing(16.0).children(danmaku_items));
+    let cards_body: View = if compact {
+        StackPanel::new()
+            .spacing(16.0)
+            .children((playback_card, danmaku_card))
+            .into()
+    } else {
+        Grid::new()
+            .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
+            .column_spacing(20.0)
+            .children((playback_card, danmaku_card.grid_column(1)))
+            .into()
+    };
 
+    let pad_x = if compact { 16.0 } else { 36.0 };
     ScrollViewer::new()
         .content(
             Border::new()
-                .padding(Thickness::new(36.0, 24.0, 36.0, 36.0))
+                .padding(Thickness::new(pad_x, 20.0, pad_x, 36.0))
                 .content(
-                    StackPanel::new().spacing(16.0).children((
-                        theme::page_header("设置", qn_hint),
-                        Grid::new()
-                            .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
-                            .column_spacing(20.0)
-                            .children((playback_card, danmaku_card)),
-                    )),
+                    StackPanel::new()
+                        .spacing(16.0)
+                        .children((theme::page_header("设置", qn_hint), cards_body)),
                 ),
         )
         .into()

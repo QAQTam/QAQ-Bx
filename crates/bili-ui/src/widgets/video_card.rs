@@ -86,9 +86,10 @@ pub fn home_virtual_source(
 
 /// 首页虚拟化行网格：把缓存的 `VirtualSource` 交给 `ItemsRepeater`，
 /// 仅在视口附近创建 WinUI 控件并在划出后自动回收，防止长列表 COM 对象与解码像素无限膨胀。
-pub fn virtual_video_grid(source: &VirtualSource) -> View {
+pub fn virtual_video_grid(source: &VirtualSource, compact: bool) -> View {
+    let margin_x = if compact { 12.0 } else { 36.0 };
     ItemsRepeater::new()
-        .margin(Thickness::new(36.0, 0.0, 36.0, 24.0))
+        .margin(Thickness::new(margin_x, 0.0, margin_x, 24.0))
         .virtual_source(source.clone())
         .into()
 }

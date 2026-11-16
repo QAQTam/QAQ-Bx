@@ -26,6 +26,7 @@ pub struct PlayerInput {
     pub playing: bool,
     pub position: u32,
     pub volume: u32,
+    pub compact: bool,
     /// SwapChain 挂载尝试节拍（仅在未挂载时按 250ms 递增驱动 VideoSurface::try_mount）。
     pub mount_tick: u32,
     /// 展示总长(引擎 duration 优先,占位数据兜底)。
@@ -44,6 +45,7 @@ impl PartialEq for PlayerInput {
             && self.playing == other.playing
             && self.position == other.position
             && self.volume == other.volume
+            && self.compact == other.compact
             && self.mount_tick == other.mount_tick
             && self.duration_secs == other.duration_secs
             && self.notice == other.notice
@@ -291,6 +293,23 @@ impl Component for PlayerPage {
             context.message(Message::SetCommentSort(CommentSort::Hot)),
             context.message(Message::SetCommentSort(CommentSort::Latest)),
         );
+
+        if input.compact {
+            let compact_body = StackPanel::new()
+                .spacing(12.0)
+                .margin(Thickness::new(12.0, 10.0, 12.0, 20.0))
+                .children((
+                    Border::new()
+                        .height(220.0)
+                        .corner_radius(8.0)
+                        .content(surface),
+                    View::from(transport),
+                    View::from(info_and_actions),
+                    related_panel(),
+                    comments_section,
+                ));
+            return ScrollViewer::new().content(compact_body).into();
+        }
 
         let left_scroll_content = StackPanel::new()
             .spacing(14.0)
@@ -704,6 +723,7 @@ pub struct HalfPaneInput {
     pub item: VideoItem,
     pub mount_tick: u32,
     pub width: f64,
+    pub max_width: f64,
     pub notice: Option<String>,
     pub engine: Arc<VideoEngine>,
     pub on_expand: Callback<()>,
@@ -716,6 +736,7 @@ impl PartialEq for HalfPaneInput {
         self.item == other.item
             && self.mount_tick == other.mount_tick
             && (self.width - other.width).abs() < 0.5
+            && (self.max_width - other.max_width).abs() < 0.5
             && self.notice == other.notice
             && Arc::ptr_eq(&self.engine, &other.engine)
             && self.on_expand == other.on_expand
@@ -769,7 +790,8 @@ impl Component for HalfPanePreview {
     }
 
     fn view(&self, input: &HalfPaneInput, context: &mut ViewContext<Self>) -> View {
-        let pane_width = self.live_width.unwrap_or(input.width).clamp(340.0, 820.0);
+        let max_w = input.max_width.clamp(340.0, 820.0);
+        let pane_width = self.live_width.unwrap_or(input.width).clamp(320.0, max_w);
         let video_height = ((pane_width - 40.0 - 24.0) * 9.0 / 16.0).clamp(160.0, 440.0);
 
         let surface: View = if let Some(notice) = &input.notice {

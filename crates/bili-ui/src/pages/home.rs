@@ -47,6 +47,7 @@ const FOOTER_HEIGHT: f64 = 40.0;
 pub fn home_page(
     source: &VirtualSource,
     state: &HomeState,
+    compact: bool,
     on_refresh: &Callback<()>,
     on_retry: &Callback<()>,
 ) -> View {
@@ -146,8 +147,9 @@ pub fn home_page(
         None
     };
 
+    let header_x = if compact { 12.0 } else { 36.0 };
     let header = Border::new()
-        .padding(Thickness::new(36.0, 24.0, 36.0, 12.0))
+        .padding(Thickness::new(header_x, 18.0, header_x, 12.0))
         .grid_row(0)
         .content(StackPanel::new().spacing(4.0).children((
             Grid::new()
@@ -166,7 +168,7 @@ pub fn home_page(
     let scroll_host: View = Grid::new()
         .keyed_children([keyed(
             format!("home-scroll-{}", state.stream_gen),
-            ScrollViewer::new().content(video_card::virtual_video_grid(source)),
+            ScrollViewer::new().content(video_card::virtual_video_grid(source, compact)),
         )])
         .into();
 
