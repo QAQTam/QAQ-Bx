@@ -24,12 +24,14 @@ md-5 = "0.10"
 # semver 不兼容无法用 path 覆盖,由 cargo 自行解析并保留。
 windows-sys = { path = "D:/Projects/qaq-winui-reactor/crates/libs/sys", features = ["errhandlingapi", "libloaderapi"] }
 windows = { path = "D:/Projects/qaq-winui-reactor/crates/libs/windows", features = [
+    "combaseapi",
     "d3d11",
     "d3dcommon",
     "dxgi",
     "Media",
     "Storage_Streams",
     "systemmediatransportcontrolsinterop",
+    "wincodec",
     "winuser",
     "processthreadsapi",
     "xinput",

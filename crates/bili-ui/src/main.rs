@@ -4,6 +4,7 @@
 #![cfg_attr(not(feature = "selftest"), windows_subsystem = "windows")]
 
 mod auth;
+mod codec;
 mod data;
 mod feed_pager;
 mod gamepad;

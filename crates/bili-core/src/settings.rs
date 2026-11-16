@@ -182,6 +182,8 @@ pub struct AppSettings {
     pub autoplay: bool,
     pub hardware_decode: bool,
     pub volume: u32,
+    /// WebP 解码器缺失提示是否已展示过(仅弹一次)。
+    pub webp_hint_shown: bool,
     pub window: Option<WindowBounds>,
 }
 
@@ -198,6 +200,7 @@ impl Default for AppSettings {
             autoplay: true,
             hardware_decode: true,
             volume: 80,
+            webp_hint_shown: false,
             window: None,
         }
     }
@@ -297,6 +300,7 @@ mod tests {
             autoplay: false,
             hardware_decode: false,
             volume: 45,
+            webp_hint_shown: true,
             window: Some(WindowBounds {
                 x: 100,
                 y: 80,

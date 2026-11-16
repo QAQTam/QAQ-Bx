@@ -10,6 +10,7 @@
   - 评论区关闭等非 0 错误码统一映射为 `BiliError::Api`,评论区显示错误态与重试(暂无 12002 专属文案)。
 - **UP 主真实头像**:首页推荐卡透传 `owner.mid/face`,点击进半窗/播放页后异步拉取并圆形裁剪显示;登录态评论输入栏展示当前用户头像;头像缓存容量扩至 256,80ms 批刷合并重绘。
 - **视频元数据补全**:点击时若缺 `aid`/头像,后台单飞补拉 `video_meta`。
+- **图片格式探测与 WebP 接入**(`bili-ui` 新增 `codec.rs`):启动时经 WIC `CreateDecoder(GUID_ContainerFormatWebP)` 探测一次系统 WebP 解码能力,进程内缓存;有 → 封面/头像 URL 后缀切 `.webp`(同尺寸实测省 ~60% 流量:1280w 档 20KB vs 53KB),无 → 回退 JPG 并弹一次提示建议安装「Web 图像扩展」(`webp_hint_shown` 落盘防重复)。GUID 正确性由 selftest `codec` 场景用真实 WebP 文件交叉验证(文件可解码而 GUID 探测失败即断言红灯)。
 - **综合搜索接入**(`bili-core` 新增 `search.rs`):`/x/web-interface/wbi/search/all/v2`(WBI 签名,实测 code=0);标题栏/搜索页输入 → 结果卡片网格,标题高亮标记与 HTML 实体剥除、`H:MM:SS` 时长解析、封面经 ImageCache 异步填充;搜索结果可直点播放(`open_video` 增加 search_index 回退链)。
 
 ## 变更
@@ -21,7 +22,7 @@
 
 - `cargo test --workspace` 全量通过(`bili-core` 40+5 fixture、`bili-plugin-login` 7、`bili-video` 1);评论区真实接口冒烟(`live_reply_smoke`)已对 BV1GJ411x7h7 实网验证。
 - 真机自动化点击(`just demo`,8 场景):首页 → 悬停 → 滚动 → 进播放页 → 评论区排序切换 → 滚动评论区+PiP → 返回保活 → 设置页,全部通过,全程无 panic。
-- **内部状态自测**（`just selftest`，新增 `--selftest` 模式）：基于 reactor `test` 模块(RecordingAdapter + ComponentHost),不开窗口、不模拟鼠标、不读用户凭据(隔离数据目录),直接挂载 AppShell 派发 Message 断言状态。六个场景:boot(挂载+feed)、nav(路由/历史栈)、comments(真实评论解析 + 排序切换 + 双桶缓存)、rapid-switch(快速连切,播放代次取消路径)、stress(240 条消息风暴追查 try_wake panic 类问题)、search(真实搜索 → 点开首条结果),全套 <8s,可重复、可进 CI。
+- **内部状态自测**（`just selftest`，新增 `--selftest` 模式）：基于 reactor `test` 模块(RecordingAdapter + ComponentHost),不开窗口、不模拟鼠标、不读用户凭据(隔离数据目录),直接挂载 AppShell 派发 Message 断言状态。七个场景:boot(挂载+feed)、nav(路由/历史栈)、comments(真实评论解析 + 排序切换 + 双桶缓存)、rapid-switch(快速连切,播放代次取消路径)、stress(240 条消息风暴追查 try_wake panic 类问题)、search(真实搜索 → 点开首条结果)、codec(WebP 探测一致性 + GUID 真实文件交叉验证),全套 <9s,可重复、可进 CI。
 - 极端场景(`scripts/ui-edge.ps1` 新增):访客态(无凭据)可正常浏览并读取公开评论;快速连续切视频(播放代次取消路径)无 panic。
 - `scripts/ui-demo.ps1` 修复:`Add-Type` 缺少 `System.Drawing` 程序集引用导致脚本首次运行即编译失败;设置页导航点击坐标修正(收起态导航为 44px 窄条,原坐标落入迷你播放条)。
 

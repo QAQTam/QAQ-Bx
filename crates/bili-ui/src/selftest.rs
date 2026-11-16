@@ -248,6 +248,33 @@ fn search(s: &mut Scenario) -> Result<(), String> {
     Ok(())
 }
 
+/// 场景 7:图像编解码探测(WebP WIC 探测器一致性 + 后缀与探测结果一致)。
+fn codec(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    let first = crate::codec::webp_supported();
+    let again = crate::codec::webp_supported();
+    assert_eq!(first, again, "探测结果应进程内缓存一致");
+    assert!(
+        first == (crate::codec::raster_suffix() == "webp"),
+        "URL 后缀应与探测结果一致"
+    );
+    println!(
+        "[codec] webp_supported={first} raster_suffix={}",
+        crate::codec::raster_suffix()
+    );
+    // GUID 交叉验证:本机若有真实 WebP 样本(target/bg-probe/),文件可解码
+    // 而 GUID 探测失败 ⇒ GUID 写错,必须修正而不是让 WebP 静默失效。
+    let probe = std::path::Path::new("../bg-probe/b1280.webp");
+    if probe.exists() {
+        let by_file = crate::codec::probe_webp_file(probe);
+        println!("[codec] probe-file={by_file}");
+        if by_file {
+            assert!(first, "真实 WebP 可解码但 GUID 探测失败——GUID 写错了");
+        }
+    }
+    Ok(())
+}
+
 const SCENARIOS: &[(&str, fn(&mut Scenario) -> Result<(), String>)] = &[
     ("boot", boot),
     ("nav", nav),
@@ -255,6 +282,7 @@ const SCENARIOS: &[(&str, fn(&mut Scenario) -> Result<(), String>)] = &[
     ("rapid-switch", rapid_switch),
     ("stress", stress),
     ("search", search),
+    ("codec", codec),
 ];
 
 /// 解析 `--selftest [scenario]`;非 selftest 调用返回 `None` 走正常启动。

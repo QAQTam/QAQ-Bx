@@ -61,8 +61,13 @@ pub struct UserInfo {
     pub avatar: Option<EncodedImage>,
 }
 
-/// 把 hdslb 头像 URL 裁成 `@96w_96h_1c.jpg` 轻量缩略图。
+/// 把 hdslb 头像 URL 裁成 `@96w_96h_1c.{webp|jpg}` 轻量缩略图
+/// (格式由系统 WebP 解码能力探测决定,见 `codec` 模块)。
 pub fn avatar_thumbnail_url(raw: &str) -> String {
+    avatar_thumbnail_url_with(raw, crate::codec::raster_suffix())
+}
+
+fn avatar_thumbnail_url_with(raw: &str, suffix: &str) -> String {
     let trimmed = raw.trim();
     let url = if let Some(rest) = trimmed.strip_prefix("//") {
         format!("https://{rest}")
@@ -76,7 +81,7 @@ pub fn avatar_thumbnail_url(raw: &str) -> String {
             || lower.ends_with(".png")
             || lower.ends_with(".webp")
         {
-            return format!("{url}@96w_96h_1c.jpg");
+            return format!("{url}@96w_96h_1c.{suffix}");
         }
     }
     url
@@ -332,5 +337,37 @@ impl Auth {
             .await
             .ok()?;
         Some(EncodedImage::new(bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avatar_thumbnail_url_matches_codec_suffix() {
+        // 双格式分支由参数化版本锁定(webp/jpg 由运行时探测决定)。
+        assert_eq!(
+            avatar_thumbnail_url_with("//i2.hdslb.com/bfs/face/u1.jpg", "webp"),
+            "https://i2.hdslb.com/bfs/face/u1.jpg@96w_96h_1c.webp"
+        );
+        assert_eq!(
+            avatar_thumbnail_url_with("http://i2.hdslb.com/bfs/face/u1.jpg", "jpg"),
+            "https://i2.hdslb.com/bfs/face/u1.jpg@96w_96h_1c.jpg"
+        );
+        // 运行时版本与参数化版本一致(探测结果只影响后缀)。
+        assert_eq!(
+            avatar_thumbnail_url("https://i2.hdslb.com/bfs/face/u1.jpg"),
+            avatar_thumbnail_url_with("https://i2.hdslb.com/bfs/face/u1.jpg", crate::codec::raster_suffix())
+        );
+        // 已有参数 → 不二次拼接;非图床保持不动。
+        assert_eq!(
+            avatar_thumbnail_url_with("https://i2.hdslb.com/bfs/face/u1.jpg@50w.jpg", "webp"),
+            "https://i2.hdslb.com/bfs/face/u1.jpg@50w.jpg"
+        );
+        assert_eq!(
+            avatar_thumbnail_url_with("https://example.com/a.jpg", "webp"),
+            "https://example.com/a.jpg"
+        );
     }
 }

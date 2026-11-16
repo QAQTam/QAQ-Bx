@@ -67,9 +67,14 @@ const PLAYBACK_TICK: Duration = Duration::from_millis(250);
 /// 设置滑块（音量/透明度）去抖落盘窗口。
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// 升级 https 并对 B 站图床追加 `@480w_270h_1c.jpg` 缩略图后缀，
+/// 升级 https 并对 B 站图床追加 `@480w_270h_1c.{webp|jpg}` 缩略图后缀,
 /// 把单张封面流量与 WinUI 解码像素面积压缩到原图的 ~1/16–1/46。
+/// 格式由系统 WebP 解码能力探测决定(见 `codec` 模块)。
 pub fn thumbnail_url(raw: &str) -> String {
+    thumbnail_url_with(raw, crate::codec::raster_suffix())
+}
+
+fn thumbnail_url_with(raw: &str, suffix: &str) -> String {
     let url = raw.replacen("http://", "https://", 1);
     if url.contains(".hdslb.com/") && !url.contains('@') && !url.contains('?') {
         let lower = url.to_ascii_lowercase();
@@ -78,7 +83,7 @@ pub fn thumbnail_url(raw: &str) -> String {
             || lower.ends_with(".png")
             || lower.ends_with(".webp")
         {
-            return format!("{url}@480w_270h_1c.jpg");
+            return format!("{url}@480w_270h_1c.{suffix}");
         }
     }
     url
@@ -1906,6 +1911,22 @@ impl Component for AppShell {
             auth_service.data_dir().join(SETTINGS_FILE),
         ));
         let (settings, settings_notice) = settings_store.load_or_default();
+
+        // WebP 解码能力探测(进程内一次):无解码器时封面/头像回退 JPG,
+        // 并提示一次安装「Web 图像扩展」(webp_hint_shown 落盘防重复弹窗)。
+        let webp_hint_pending = !crate::codec::webp_supported() && !settings.webp_hint_shown;
+        let settings = if webp_hint_pending {
+            let mut settings = settings;
+            settings.webp_hint_shown = true;
+            if let Err(err) = settings_store.save(&settings) {
+                eprintln!("webp_hint_shown 落盘失败:{err:?}");
+            }
+            #[cfg(not(feature = "selftest"))]
+            crate::codec::show_webp_hint_dialog();
+            settings
+        } else {
+            settings
+        };
 
         let playback_gen = 1u64;
         let playback_epoch = Arc::new(AtomicU64::new(playback_gen));
@@ -4122,14 +4143,28 @@ mod tests {
 
     #[test]
     fn thumbnail_url_appends_cdn_resize_for_hdslb_images() {
+        // 双格式分支由参数化版本锁定(webp/jpg 由运行时探测决定)。
         assert_eq!(
-            thumbnail_url("http://i2.hdslb.com/bfs/archive/abc.jpg"),
+            thumbnail_url_with("http://i2.hdslb.com/bfs/archive/abc.jpg", "webp"),
+            "https://i2.hdslb.com/bfs/archive/abc.jpg@480w_270h_1c.webp"
+        );
+        assert_eq!(
+            thumbnail_url_with("http://i2.hdslb.com/bfs/archive/abc.jpg", "jpg"),
             "https://i2.hdslb.com/bfs/archive/abc.jpg@480w_270h_1c.jpg"
+        );
+        // 运行时版本与参数化版本一致(探测结果只影响后缀)。
+        assert_eq!(
+            thumbnail_url("https://i0.hdslb.com/bfs/archive/abc.jpg"),
+            thumbnail_url_with("https://i0.hdslb.com/bfs/archive/abc.jpg", crate::codec::raster_suffix())
         );
         // 已有参数/非图床保持不二次拼接。
         assert_eq!(
             thumbnail_url("https://i0.hdslb.com/bfs/archive/abc.jpg@100w.webp"),
             "https://i0.hdslb.com/bfs/archive/abc.jpg@100w.webp"
+        );
+        assert_eq!(
+            thumbnail_url("https://example.com/pic.jpg"),
+            "https://example.com/pic.jpg"
         );
     }
 
