@@ -345,10 +345,12 @@ impl AppShell {
 
     fn rebuild_home_source(&mut self) {
         let rev = self.current_row_revision();
+        let focused = self.gamepad_active.then_some(self.home_focus_idx);
         self.home_source = video_card::home_virtual_source(
             &self.home_slots,
             self.home_state.grid_cols.max(1),
             rev,
+            focused,
             &self.home_on_open,
             &self.home_on_hover,
             &self.home_on_row_active,
@@ -679,7 +681,11 @@ impl AppShell {
                     let target = f64::from(self.position.saturating_sub(10));
                     self.update(Message::Seek(target), context);
                 } else if self.route == Route::Home {
-                    self.home_focus_idx = self.home_focus_idx.saturating_sub(1);
+                    let next = self.home_focus_idx.saturating_sub(1);
+                    if next != self.home_focus_idx {
+                        self.home_focus_idx = next;
+                        self.rebuild_home_source();
+                    }
                 }
             }
             GamepadAction::Right => {
@@ -693,7 +699,11 @@ impl AppShell {
                         .filter(|s| matches!(s, HomeSlot::Video { .. }))
                         .count();
                     if count > 0 {
-                        self.home_focus_idx = (self.home_focus_idx + 1).min(count - 1);
+                        let next = (self.home_focus_idx + 1).min(count - 1);
+                        if next != self.home_focus_idx {
+                            self.home_focus_idx = next;
+                            self.rebuild_home_source();
+                        }
                     }
                 }
             }
@@ -703,7 +713,12 @@ impl AppShell {
                     self.update(Message::SetVolume(vol), context);
                 } else if self.route == Route::Home {
                     let cols = self.home_state.grid_cols.max(1);
-                    self.home_focus_idx = self.home_focus_idx.saturating_sub(cols);
+                    let next = self.home_focus_idx.saturating_sub(cols);
+                    if next != self.home_focus_idx {
+                        self.home_focus_idx = next;
+                        self.rebuild_home_source();
+                        gamepad::inject_mouse_wheel(240);
+                    }
                 }
             }
             GamepadAction::Down => {
@@ -718,7 +733,12 @@ impl AppShell {
                         .filter(|s| matches!(s, HomeSlot::Video { .. }))
                         .count();
                     if count > 0 {
-                        self.home_focus_idx = (self.home_focus_idx + cols).min(count - 1);
+                        let next = (self.home_focus_idx + cols).min(count - 1);
+                        if next != self.home_focus_idx {
+                            self.home_focus_idx = next;
+                            self.rebuild_home_source();
+                            gamepad::inject_mouse_wheel(-240);
+                        }
                     }
                 }
             }
@@ -1005,6 +1025,7 @@ impl Component for AppShell {
             &home_slots,
             initial_cols,
             initial_rev,
+            None,
             &home_on_open,
             &home_on_hover,
             &home_on_row_active,
@@ -1271,10 +1292,16 @@ impl Component for AppShell {
             Message::GamepadInput(Some(ev)) => {
                 match ev {
                     GamepadEvent::Connected(connected) => {
-                        self.gamepad_active = connected;
+                        if self.gamepad_active != connected {
+                            self.gamepad_active = connected;
+                            self.rebuild_home_source();
+                        }
                     }
                     GamepadEvent::Action(action) => {
-                        self.gamepad_active = true;
+                        if !self.gamepad_active {
+                            self.gamepad_active = true;
+                            self.rebuild_home_source();
+                        }
                         self.handle_gamepad_action(action, context);
                     }
                 }

@@ -8,13 +8,16 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use windows::Win32::processthreadsapi::GetCurrentProcessId;
-use windows::Win32::winuser::{GetForegroundWindow, GetWindowThreadProcessId};
+use windows::Win32::winuser::{
+    GetForegroundWindow, GetWindowThreadProcessId, INPUT, INPUT_0, INPUT_MOUSE,
+    MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
+};
 use windows::Win32::xinput::{
     XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT,
     XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_LEFT_SHOULDER,
     XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, XINPUT_GAMEPAD_RIGHT_SHOULDER,
-    XINPUT_GAMEPAD_TRIGGER_THRESHOLD, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y, XINPUT_STATE,
-    XInputGetState,
+    XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, XINPUT_GAMEPAD_TRIGGER_THRESHOLD, XINPUT_GAMEPAD_X,
+    XINPUT_GAMEPAD_Y, XINPUT_STATE, XInputGetState,
 };
 use windows_reactor::*;
 
@@ -133,6 +136,15 @@ fn poll_loop(tx: Sender<GamepadEvent>) {
             return;
         }
 
+        // 右摇杆 Y 轴平滑滚轮滚动（支持首页/热门/设置等任意滚动视图）。
+        let ry = apply_deadzone(pad.Gamepad.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE as i16);
+        if ry != 0 {
+            let delta = ((f32::from(ry) / 32767.0) * 96.0).round() as i32;
+            if delta != 0 {
+                inject_mouse_wheel(delta);
+            }
+        }
+
         std::thread::sleep(ACTIVE_POLL);
     }
 }
@@ -146,6 +158,26 @@ fn read_first_connected_pad() -> Option<XINPUT_STATE> {
         }
     }
     None
+}
+
+/// 向前台本进程窗口注入垂直滚轮事件（正值向上、负值向下，120 为标准一格）。
+pub fn inject_mouse_wheel(delta: i32) {
+    if delta == 0 || !is_app_foreground() {
+        return;
+    }
+    let mut input = INPUT {
+        r#type: INPUT_MOUSE as u32,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                mouseData: delta as u32,
+                dwFlags: MOUSEEVENTF_WHEEL as u32,
+                ..Default::default()
+            },
+        },
+    };
+    unsafe {
+        let _ = SendInput(1, &mut input, std::mem::size_of::<INPUT>() as i32);
+    }
 }
 
 fn is_app_foreground() -> bool {
@@ -215,6 +247,7 @@ pub fn gamepad_hint_bar(route: Route, focus_title: Option<&str>) -> View {
             abxy_chip("X", Color::rgb(0, 120, 212), Color::rgb(255, 255, 255), "换一换"),
             abxy_chip("Y", Color::rgb(255, 185, 0), Color::rgb(20, 20, 20), "暂停/续播"),
             abxy_chip("B", Color::rgb(232, 17, 35), Color::rgb(255, 255, 255), "返回"),
+            key_chip("RS", "滚动"),
             key_chip("LB/RB", "切页"),
         ],
         _ => vec![

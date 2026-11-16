@@ -44,6 +44,7 @@ pub fn home_virtual_source(
     slots: &[HomeSlot],
     cols: usize,
     row_revision: u64,
+    focused_idx: Option<usize>,
     on_open: &Callback<String>,
     on_hover_preresolve: &Callback<String>,
     on_row_active: &Callback<(u64, usize, bool)>,
@@ -65,10 +66,16 @@ pub fn home_virtual_source(
         move |row_idx| (row_revision << 24) ^ (row_idx as u64),
         move |row_idx| {
             let row_slots = Rc::clone(&rows[row_idx]);
+            let focused_col = focused_idx.and_then(|idx| {
+                let start = row_idx * cols;
+                let end = start + row_slots.len();
+                (idx >= start && idx < end).then_some(idx - start)
+            });
             View::component::<FeedRow>(FeedRowInput {
                 row_revision,
                 row_idx,
                 slots: row_slots,
+                focused_col,
                 on_open: on_open.clone(),
                 on_hover_preresolve: on_hover.clone(),
                 on_row_active: on_row.clone(),
@@ -101,6 +108,7 @@ pub fn video_grid(items: &[VideoItem], on_open: &Callback<String>) -> View {
             slot.slot_key().to_string(),
             View::component::<VideoCard>(VideoCardInput {
                 slot: slot.clone(),
+                is_focused: false,
                 on_open: on_open.clone(),
                 on_hover_preresolve: None,
             }),
@@ -119,6 +127,7 @@ pub struct FeedRowInput {
     pub row_revision: u64,
     pub row_idx: usize,
     pub slots: Rc<Vec<HomeSlot>>,
+    pub focused_col: Option<usize>,
     pub on_open: Callback<String>,
     pub on_hover_preresolve: Callback<String>,
     pub on_row_active: Callback<(u64, usize, bool)>,
@@ -150,11 +159,12 @@ impl Component for FeedRow {
             let on_recycle = on_active;
             Some(Box::new(move || on_recycle.call((rev, row_idx, false))))
         });
-        let cells = input.slots.iter().map(|slot| {
+        let cells = input.slots.iter().enumerate().map(|(col_idx, slot)| {
             KeyedView::new(
                 slot.slot_key().to_string(),
                 View::component::<VideoCard>(VideoCardInput {
                     slot: slot.clone(),
+                    is_focused: input.focused_col == Some(col_idx),
                     on_open: input.on_open.clone(),
                     on_hover_preresolve: Some(input.on_hover_preresolve.clone()),
                 }),
@@ -173,6 +183,7 @@ impl Component for FeedRow {
 #[derive(Clone, PartialEq)]
 pub struct VideoCardInput {
     pub slot: HomeSlot,
+    pub is_focused: bool,
     pub on_open: Callback<String>,
     pub on_hover_preresolve: Option<Callback<String>>,
 }
@@ -336,7 +347,7 @@ impl Component for VideoCard {
     fn view(&self, input: &Self::Input, context: &mut ViewContext<Self>) -> View {
         let content: View = match &input.slot {
             HomeSlot::Skeleton { .. } => skeleton_card_view(),
-            HomeSlot::Video { item, .. } => populated_card_view(item, &input.on_open),
+            HomeSlot::Video { item, .. } => populated_card_view(item, input.is_focused, &input.on_open),
         };
 
         let mut animated_box = Border::new()
@@ -394,7 +405,7 @@ fn skeleton_card_view() -> View {
         .into()
 }
 
-fn populated_card_view(item: &VideoItem, on_open: &Callback<String>) -> View {
+fn populated_card_view(item: &VideoItem, is_focused: bool, on_open: &Callback<String>) -> View {
     let bvid = item.bvid.clone();
     let on_click = on_open.clone();
     let cover_inner: View = match &item.cover {
@@ -443,8 +454,12 @@ fn populated_card_view(item: &VideoItem, on_open: &Callback<String>) -> View {
         .content(
             Border::new()
                 .background(ThemeBrush::CardBackground)
-                .border_brush(ThemeBrush::CardStroke)
-                .border_thickness(1.0)
+                .border_brush(if is_focused {
+                    ThemeBrush::Accent
+                } else {
+                    ThemeBrush::CardStroke
+                })
+                .border_thickness(if is_focused { 2.5 } else { 1.0 })
                 .corner_radius(8.0)
                 .content(
                     StackPanel::new().children((
