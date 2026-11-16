@@ -2,7 +2,7 @@
 //! AppShell 组件树并派发 Message,断言壳层状态。覆盖「鼠标模拟测不到」
 //! 的路径:快速切视频的播放代次取消、评论双桶缓存、导航历史栈。
 //!
-//! 用法:`bili-ui.exe --selftest [all|boot|nav|comments|rapid-switch]`
+//! 用法:`bili-ui.exe --selftest [all|boot|nav|comments|rapid-switch|stress|search]`
 //! 前置:`cargo build -p bili-ui --features selftest`;需要真实网络与
 //! 本地凭据(nav 探测 / feed / 评论均走真实接口)。
 
@@ -188,11 +188,73 @@ fn rapid_switch(s: &mut Scenario) -> Result<(), String> {
     Ok(())
 }
 
+/// 场景 5:消息风暴——追查 2026-11-16 22:43 的 try_wake panic 类问题。
+/// 在解析/评论/头像请求在飞时高频注入交互消息(排序翻转/翻页/导航/引擎控制),
+/// 多轮叠加,制造消息乱序抵达 update 的工况;headless 下 panic 会被捕获为 FAIL
+/// 而非进程 abort,原始 panic 消息可留存。
+fn stress(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    let gen0 = s.probe.borrow().playback_gen;
+    for _ in 0..3 {
+        s.send(Message::OpenVideo(TEST_BV.into()))?;
+        for _ in 0..8 {
+            s.send(Message::SetCommentSort(CommentSort::Latest))?;
+            s.send(Message::SetCommentSort(CommentSort::Hot))?;
+            s.send(Message::LoadMoreComments)?;
+            s.send(Message::Seek(12.0))?;
+            s.send(Message::TogglePlay)?;
+            s.send(Message::Back)?;
+            s.send(Message::OpenVideo(TEST_BV.into()))?;
+            s.send(Message::NavTagSelected(Some("settings".into())))?;
+            s.send(Message::NavTagSelected(Some("home".into())))?;
+            s.send(Message::Back)?;
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        s.host.drain(usize::MAX);
+    }
+    s.sync()?;
+    let gen_after = s.probe.borrow().playback_gen;
+    assert!(
+        gen_after > gen0,
+        "消息风暴后代次应推进(gen {gen0} → {gen_after})"
+    );
+    Ok(())
+}
+
+/// 场景 6:搜索(真实 WBI 签名搜索 → 结果网格 → 点开首个结果,验证
+/// open_video 的 search_index 回退链)。
+fn search(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    s.send(Message::SearchDraftChanged("rust".into()))?;
+    s.send(Message::SearchSubmitted)?;
+    s.wait_for(Duration::from_secs(45), |p| {
+        p.route_tag == "search" && p.search_videos > 0
+    })
+    .map_err(|err| format!("搜索结果未就绪:{err}"))?;
+    let first = s
+        .probe
+        .borrow()
+        .search_first_bvid
+        .clone()
+        .ok_or("搜索结果缺少首条 bvid")?;
+    s.send(Message::OpenVideo(first.clone()))?;
+    s.wait_for(Duration::from_secs(60), |p| {
+        p.now_playing_bvid.as_deref() == Some(first.as_str())
+    })
+    .map_err(|err| format!("搜索结果打开失败:{err}"))?;
+    s.send(Message::Back)?;
+    s.sync()?;
+    assert_eq!(s.probe.borrow().route_tag, "search", "Back 应回到搜索页");
+    Ok(())
+}
+
 const SCENARIOS: &[(&str, fn(&mut Scenario) -> Result<(), String>)] = &[
     ("boot", boot),
     ("nav", nav),
     ("comments", comments),
     ("rapid-switch", rapid_switch),
+    ("stress", stress),
+    ("search", search),
 ];
 
 /// 解析 `--selftest [scenario]`;非 selftest 调用返回 `None` 走正常启动。

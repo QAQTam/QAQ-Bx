@@ -17,6 +17,7 @@ use bili_core::notify::{
 };
 use bili_core::player::{PlayerClient, StreamChoice, VideoMeta};
 use bili_core::reply::{ReplyClient, ReplyCursor, ReplyItem, ReplyPage, ReplySort, SubReplyPage};
+use bili_core::search::{SearchClient, SearchVideo};
 use bili_core::settings::{AppSettings, FileSettingsStore, SETTINGS_FILE};
 use bili_video::engine::{OverlayDanmaku, VideoConfig, VideoEngine};
 use windows_reactor::*;
@@ -300,6 +301,12 @@ pub struct ShellProbe {
     pub hot_total: Option<u64>,
     pub latest_loaded: bool,
     pub latest_replies: usize,
+    /// 已提交的搜索词(空串 = 尚未搜索)。
+    pub search_query: String,
+    /// 当前搜索结果条数。
+    pub search_videos: usize,
+    /// 首条搜索结果 bvid(用于验证 open_video 的 search_index 回退)。
+    pub search_first_bvid: Option<String>,
 }
 
 pub struct AppShell {
@@ -400,6 +407,14 @@ pub struct AppShell {
     now_playing: Option<VideoItem>,
     now_playing_desc: Option<String>,
     meta_fetch_inflight_seq: Option<u64>,
+    /// 综合搜索客户端(WBI 签名,复用共享 nav)。
+    search_client: Arc<SearchClient>,
+    /// 搜索页展示状态。
+    search_state: pages::search::SearchUiState,
+    /// 搜索结果索引(open_video 回退查找)。
+    search_index: HashMap<String, VideoItem>,
+    /// 搜索请求代次(新提交递增,旧结果丢弃)。
+    search_seq: u64,
     comments_session: CommentsSessionState,
     /// selftest 探针句柄(正常路径恒为 `None`)。
     probe: Option<std::rc::Rc<std::cell::RefCell<ShellProbe>>>,
@@ -449,6 +464,19 @@ pub enum Message {
     /// selftest 空转消息:驱动探针在队列尾部刷新状态(生产路径零开销)。
     #[cfg(feature = "selftest")]
     SelfTestSync,
+    /// 搜索框草稿变更(标题栏/搜索页输入)。
+    SearchDraftChanged(String),
+    /// 提交当前草稿发起搜索(新提交递增 seq,旧在飞结果丢弃)。
+    SearchSubmitted,
+    /// 搜索结果就绪(后台线程派发;封面缓存命中已挂,未命中的由 UI 线程补拉)。
+    SearchResults {
+        seq: u64,
+        query: String,
+        items: Vec<VideoItem>,
+        total: Option<u64>,
+    },
+    /// 搜索失败(seq 失配即丢弃)。
+    SearchFailed { seq: u64, error: String },
     NavTagSelected(Option<String>),
     PaneOpenChanged(bool),
     TogglePane,
@@ -627,6 +655,24 @@ pub enum Message {
     },
 }
 
+/// 搜索结果卡 → 展示模型(封面占位,由 ImageCache/CoverReady 异步填充)。
+fn search_video_item(video: &SearchVideo) -> VideoItem {
+    VideoItem {
+        bvid: video.bvid.clone(),
+        aid: video.aid,
+        cid: video.cid,
+        title: video.title.clone(),
+        author: video.author.clone(),
+        author_mid: video.author_mid,
+        author_face_url: None,
+        duration_secs: video.duration_secs,
+        play_count: video.play_count,
+        danmaku_count: video.danmaku_count,
+        cover: None,
+        pic_url: video.pic_url.clone(),
+    }
+}
+
 impl AppShell {
     /// selftest:将断言所需最小状态刷入共享探针(update 入口统一调用,
     /// 探针句柄为 `None` 时零开销直返)。
@@ -646,14 +692,18 @@ impl AppShell {
         out.hot_total = hot.total_count;
         out.latest_loaded = latest.loaded_once;
         out.latest_replies = latest.replies.len();
+        out.search_query = self.search_state.query.clone();
+        out.search_videos = self.search_state.videos.len();
+        out.search_first_bvid = self.search_state.videos.first().map(|item| item.bvid.clone());
     }
 
     fn open_video(&mut self, bvid: &str, context: &ComponentContext<Self>) {
-        // 数据源：首页已加载卡 → 占位数据回退（冒烟路由 BILIPLAY_VIDEO 用）。
+        // 数据源：首页已加载卡 → 搜索结果索引 → 占位数据回退（冒烟路由 BILIPLAY_VIDEO 用）。
         let mut item = match self
             .home_index
             .get(bvid)
             .cloned()
+            .or_else(|| self.search_index.get(bvid).cloned())
             .or_else(|| data::find(bvid))
         {
             Some(item) => item,
@@ -1867,6 +1917,11 @@ impl Component for AppShell {
             auth_service.credential_provider(),
             nav.clone(),
         ));
+        let search_client = Arc::new(SearchClient::with_nav(
+            auth_service.http(),
+            auth_service.credential_provider(),
+            nav.clone(),
+        ));
 
         // 启动即探测登录态（含自动 Cookie 续期 + `bili_ticket` 预热；后台单飞不重跑）。
         context.spawn_background({
@@ -2057,6 +2112,10 @@ impl Component for AppShell {
             now_playing,
             now_playing_desc: None,
             meta_fetch_inflight_seq: None,
+            search_client,
+            search_state: pages::search::SearchUiState::default(),
+            search_index: HashMap::new(),
+            search_seq: 0,
             comments_session: CommentsSessionState::default(),
             probe: input.probe.clone(),
             comments_snapshot: CommentsSnapshot::default(),
@@ -2114,6 +2173,79 @@ impl Component for AppShell {
             Message::TogglePane => self.pane_open = !self.pane_open,
             #[cfg(feature = "selftest")]
             Message::SelfTestSync => {}
+            Message::SearchDraftChanged(text) => {
+                self.search_state.draft = text;
+            }
+            Message::SearchSubmitted => {
+                let query = self.search_state.draft.trim().to_string();
+                if query.is_empty() {
+                    return;
+                }
+                self.search_seq += 1;
+                let seq = self.search_seq;
+                if self.route != Route::Search {
+                    self.history.push(self.route);
+                    self.route = Route::Search;
+                }
+                self.search_state.query = query.clone();
+                self.search_state.loading = true;
+                self.search_state.error = None;
+                let client = self.search_client.clone();
+                let cache = self.image_cache.clone();
+                context.spawn_background(move |_| {
+                    match block_on(client.all_v2(&query, 1, 20)) {
+                        Ok(page) => {
+                            let items: Vec<VideoItem> = page
+                                .videos
+                                .iter()
+                                .map(|video| {
+                                    let mut item = search_video_item(video);
+                                    if item.cover.is_none()
+                                        && let Some(url) = &item.pic_url
+                                    {
+                                        item.cover = cache.get(url);
+                                    }
+                                    item
+                                })
+                                .collect();
+                            Message::SearchResults {
+                                seq,
+                                query: page.query,
+                                items,
+                                total: page.total,
+                            }
+                        }
+                        Err(err) => Message::SearchFailed { seq, error: err.to_string() },
+                    }
+                });
+            }
+            Message::SearchResults { seq, query, items, total } => {
+                if seq != self.search_seq {
+                    return;
+                }
+                let mut owned = Vec::with_capacity(items.len());
+                for item in items {
+                    if item.cover.is_none()
+                        && let Some(url) = &item.pic_url
+                    {
+                        // 复用首页封面补拉(缓存命中由后台线程已挂;feed_epoch 未变即生效)。
+                        self.spawn_cover_fetch(item.bvid.clone(), url.clone(), self.feed_gen, context);
+                    }
+                    self.search_index.insert(item.bvid.clone(), item.clone());
+                    owned.push(item);
+                }
+                self.search_state.videos = owned;
+                self.search_state.total = total;
+                self.search_state.query = query;
+                self.search_state.loading = false;
+            }
+            Message::SearchFailed { seq, error } => {
+                if seq != self.search_seq {
+                    return;
+                }
+                self.search_state.loading = false;
+                self.search_state.error = Some(error);
+            }
             Message::OpenVideo(bvid) => {
                 self.open_video(&bvid, context);
                 self.sync_smtc(context);
@@ -2787,13 +2919,23 @@ impl Component for AppShell {
                 let batch = std::mem::take(&mut self.pending_covers);
                 let mut changed = false;
                 for (bvid, image) in batch {
+                    let mut applied = false;
                     if let Some(&idx) = self.home_slot_by_bvid.get(&bvid)
                         && keep.contains(&idx)
                         && let Some(HomeSlot::Video { item, .. }) = self.home_slots.get_mut(idx)
                         && item.cover.is_none()
                     {
-                        item.cover = Some(image);
+                        item.cover = Some(image.clone());
                         changed = true;
+                        applied = true;
+                    }
+                    // 搜索结果封面兜底回填(首页未消费的封面落到搜索卡)。
+                    if !applied
+                        && let Some(item) =
+                            self.search_state.videos.iter_mut().find(|v| v.bvid == bvid)
+                        && item.cover.is_none()
+                    {
+                        item.cover = Some(image);
                     }
                 }
                 if changed {
@@ -3454,6 +3596,11 @@ impl Component for AppShell {
                 self.settings_notice.as_deref(),
                 &on_change,
             )
+        } else if self.route == Route::Search {
+            let on_draft =
+                context.callback(|text: Rc<str>| Message::SearchDraftChanged(text.to_string()));
+            let on_submit = context.message(Message::SearchSubmitted);
+            pages::search::search_page(&self.search_state, &on_draft, &on_submit, &on_open, compact)
         } else if self.route == Route::Home {
             self.home_view(context)
         } else {
@@ -3535,7 +3682,24 @@ impl Component for AppShell {
             .on_back_requested(context.message(Message::Back))
             .on_pane_toggle_requested(context.message(Message::TogglePane))
             .grid_row(0)
-            .content(TextBox::new().placeholder_text("搜索"));
+            .content(
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        TextBox::new()
+                            .placeholder_text("搜索视频、UP 主")
+                            .width(360.0)
+                            .text(self.search_state.draft.clone())
+                            .on_text_changed(context.callback(|text: Rc<str>| {
+                                Message::SearchDraftChanged(text.to_string())
+                            })),
+                        Button::new()
+                            .style(ButtonStyle::Subtle)
+                            .on_click(context.message(Message::SearchSubmitted))
+                            .content(SymbolIcon::new().symbol(Symbol::Find)),
+                    )),
+            );
 
         if matches!(self.auth, AuthState::LoggedIn(_)) {
             let total_unread = self.unread_summary.total();

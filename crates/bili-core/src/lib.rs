@@ -15,6 +15,7 @@ pub mod notify;
 pub mod player;
 pub mod plugin;
 pub mod reply;
+pub mod search;
 pub mod settings;
 pub mod storage;
 pub mod ticket;
@@ -42,6 +43,7 @@ pub mod prelude {
     pub use crate::reply::{
         ReplyClient, ReplyCursor, ReplyItem, ReplyPage, ReplySort, SubReplyPage,
     };
+    pub use crate::search::{SearchClient, SearchPage, SearchVideo};
     pub use crate::settings::{AppSettings, CodecPref, FileSettingsStore, QualityPref, SETTINGS_FILE};
     pub use crate::storage::{is_packaged_app, resolve_data_dir};
     pub use crate::ticket::{FileTicketStore, TicketData, TicketManager, TICKET_FILE};

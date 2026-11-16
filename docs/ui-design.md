@@ -147,7 +147,7 @@ Border(顶部 1px 分隔线, 高 64)
 
 - 队列：Flyout 或右侧滑出 SplitView（骨架期不做，仅留 Message 槽位）。
 - 设置页：`RadioButtons`（清晰度偏好：360P/480P/720P/1080P/1080P+/4K）、`ToggleSwitch`（自动播放、弹幕、硬解）、`NumberBox`（弹幕密度）——数据落 `data/settings.json`。
-- 搜索页：页头 AutoSuggestBox + 结果卡片网格（复用视频卡片），建议词 API 后续接入。
+- 搜索页（**已接入**）：标题栏/页内 `TextBox` + 搜索按钮 → `/x/web-interface/wbi/search/all/v2`（WBI 签名）→ 结果卡片网格（复用视频卡片，封面经 ImageCache 异步填充）；建议词 API（`search/default`）后续接入。
 
 ## 7. 组件骨架结构（本轮落地）
 
