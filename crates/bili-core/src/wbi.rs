@@ -91,7 +91,7 @@ fn filter_chars(s: &str) -> String {
 
 /// 与 JS `encodeURIComponent` 一致的编码（unreserved: A-Za-z0-9-_.!~*'()；
 /// !'()* 已在过滤步移除，~ 保留）。
-fn encode_component(s: &str) -> String {
+pub(crate) fn encode_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {

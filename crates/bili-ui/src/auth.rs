@@ -63,7 +63,12 @@ pub struct UserInfo {
 
 /// 把 hdslb 头像 URL 裁成 `@96w_96h_1c.jpg` 轻量缩略图。
 pub fn avatar_thumbnail_url(raw: &str) -> String {
-    let url = raw.replacen("http://", "https://", 1);
+    let trimmed = raw.trim();
+    let url = if let Some(rest) = trimmed.strip_prefix("//") {
+        format!("https://{rest}")
+    } else {
+        trimmed.replacen("http://", "https://", 1)
+    };
     if url.contains(".hdslb.com/") && !url.contains('@') && !url.contains('?') {
         let lower = url.to_ascii_lowercase();
         if lower.ends_with(".jpg")

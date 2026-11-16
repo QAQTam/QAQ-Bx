@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::account::NavClient;
 use crate::credentials::CredentialProvider;
 use crate::error::Result;
+use crate::feed::{CardStat, Owner};
 use crate::httpx::get_json_with_ticket;
-use crate::loose::{f64_any, i32_any, i64_any};
+use crate::loose::{f64_any, i32_any, i64_any, i64_any_or_zero};
 use crate::ticket::TicketManager;
 use crate::wbi::WbiSigner;
 
@@ -35,12 +36,20 @@ pub struct VideoMeta {
     pub aid: u64,
     #[serde(default)]
     pub title: String,
+    #[serde(default)]
+    pub desc: Option<String>,
+    #[serde(default, deserialize_with = "i64_any_or_zero")]
+    pub pubdate: i64,
     /// 默认分 P 的 cid（playurl/弹幕都靠它）。
     #[serde(default)]
     pub cid: u64,
     /// 总时长（秒;弹幕分段数计算用）。
     #[serde(default, deserialize_with = "i64_any")]
     pub duration: i64,
+    #[serde(default)]
+    pub owner: Option<Owner>,
+    #[serde(default)]
+    pub stat: Option<CardStat>,
     #[serde(default)]
     pub pages: Vec<VideoPage>,
 }
@@ -214,8 +223,12 @@ impl PlayerClient {
             bvid: bvid.to_string(),
             aid,
             title: title.to_string(),
+            desc: None,
+            pubdate: 0,
             cid,
             duration,
+            owner: None,
+            stat: None,
             pages: Vec::new(),
         };
         self.resolve_for_meta(meta, max_qn, codec_priority).await
@@ -340,5 +353,42 @@ mod tests {
         assert!(select_stream(&d, 80, &["avc1"]).is_none()); // 只剩超上限档
         let empty = dash(vec![], vec![]);
         assert!(select_stream(&empty, 116, &["avc1"]).is_none());
+    }
+
+    #[test]
+    fn video_meta_parses_owner_desc_stat_and_minimal_shape() {
+        let full = serde_json::json!({
+            "bvid": "BV1GJ411x7h7",
+            "aid": 80433022,
+            "title": "Never Gonna Give You Up",
+            "desc": "Official MV",
+            "pubdate": 1577835803,
+            "cid": 137649199,
+            "duration": 213,
+            "owner": {
+                "mid": 486906719,
+                "name": "索尼音乐中国",
+                "face": "https://i2.hdslb.com/bfs/face/test.jpg"
+            },
+            "stat": {
+                "view": 1000,
+                "danmaku": 50,
+                "reply": 200
+            },
+            "pages": [{ "cid": 137649199, "page": 1, "part": "P1" }]
+        });
+        let meta: VideoMeta = serde_json::from_value(full).unwrap();
+        assert_eq!(meta.aid, 80433022);
+        assert_eq!(meta.desc.as_deref(), Some("Official MV"));
+        let owner = meta.owner.expect("owner 应存在");
+        assert_eq!(owner.mid, 486906719);
+        assert_eq!(owner.name, "索尼音乐中国");
+        assert_eq!(owner.face.as_deref(), Some("https://i2.hdslb.com/bfs/face/test.jpg"));
+
+        let minimal = serde_json::json!({ "bvid": "BV1x", "desc": null, "pubdate": null });
+        let min_meta: VideoMeta = serde_json::from_value(minimal).unwrap();
+        assert_eq!(min_meta.bvid, "BV1x");
+        assert!(min_meta.owner.is_none());
+        assert_eq!(min_meta.pubdate, 0);
     }
 }

@@ -196,7 +196,7 @@ fn profile_section(data: &AccountViewData<'_>, cb: &AccountCallbacks) -> View {
             header_actions.grid_column(1),
         ));
 
-    let avatar = avatar_view(user.avatar.as_ref(), &user.uname, 64.0, 8.0);
+    let avatar = theme::avatar_view(user.avatar.as_ref(), &user.uname, 64.0, 8.0);
 
     let mut badges: Vec<View> = vec![
         TextBlock::new()
@@ -586,7 +586,7 @@ fn interaction_card(
     let cached_img = (!sender_avatar.is_empty())
         .then(|| avatar_cache.get(&avatar_thumbnail_url(sender_avatar)))
         .flatten();
-    let avatar = avatar_view(cached_img.as_ref(), sender_name, 36.0, 6.0);
+    let avatar = theme::avatar_view(cached_img.as_ref(), sender_name, 36.0, 6.0);
 
     let top_row = Grid::new()
         .columns([GridLength::Star(1.0), GridLength::Auto])
@@ -811,7 +811,7 @@ fn session_row_view(
     let cached = (!sess.talker_avatar.is_empty())
         .then(|| avatar_cache.get(&avatar_thumbnail_url(&sess.talker_avatar)))
         .flatten();
-    let avatar = avatar_view(cached.as_ref(), &sess.talker_name, 36.0, 6.0);
+    let avatar = theme::avatar_view(cached.as_ref(), &sess.talker_name, 36.0, 6.0);
 
     let top = Grid::new()
         .columns([GridLength::Star(1.0), GridLength::Auto])
@@ -1041,28 +1041,6 @@ fn whisper_msg_bubble(
 
 // ---------- 公共视觉辅助件 ----------
 
-fn avatar_view(img: Option<&EncodedImage>, name: &str, size: f64, radius: f64) -> Border {
-    let inner: View = match img {
-        Some(encoded) => Image::new()
-            .source_data(encoded.clone())
-            .width(size)
-            .height(size)
-            .stretch(Stretch::UniformToFill)
-            .into(),
-        None => PersonPicture::new()
-            .display_name(name)
-            .width(size)
-            .height(size)
-            .into(),
-    };
-    Border::new()
-        .width(size)
-        .height(size)
-        .corner_radius(radius)
-        .background(ThemeBrush::SolidBackground)
-        .content(inner)
-}
-
 fn chip_badge(text: &str, accent: bool) -> View {
     let mut border = Border::new()
         .corner_radius(4.0)
@@ -1225,7 +1203,7 @@ fn relation_user_row(user: &RelationUser, avatar_cache: &ImageCache) -> View {
     let cached_img = (!user.face.is_empty())
         .then(|| avatar_cache.get(&avatar_thumbnail_url(&user.face)))
         .flatten();
-    let avatar = avatar_view(cached_img.as_ref(), &user.uname, 34.0, 6.0);
+    let avatar = theme::avatar_view(cached_img.as_ref(), &user.uname, 34.0, 6.0);
 
     let mut name_row: Vec<View> = vec![
         TextBlock::new()

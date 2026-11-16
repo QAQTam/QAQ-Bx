@@ -13,6 +13,10 @@ pub struct VideoItem {
     pub cid: u64,
     pub title: String,
     pub author: String,
+    /// UP 主 mid（用于标识评论区 UP 主及后续空间跳转）。
+    pub author_mid: u64,
+    /// UP 主头像 URL（点击进半屏预览/播放页后再异步下载）。
+    pub author_face_url: Option<String>,
     pub duration_secs: u32,
     pub play_count: u64,
     pub danmaku_count: u64,
@@ -46,6 +50,8 @@ fn video(bvid: &str, title: &str, author: &str, duration_secs: u32, play_count: 
         cid: 0,
         title: title.to_string(),
         author: author.to_string(),
+        author_mid: 0,
+        author_face_url: None,
         duration_secs,
         play_count,
         danmaku_count,

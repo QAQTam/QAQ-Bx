@@ -24,6 +24,11 @@ reqwest.workspace = true
 tokio.workspace = true
 serde = { workspace = true, features = ["derive"] }
 
+# 内部状态自测:启用 reactor test 模块(RecordingAdapter + ComponentHost,
+# 不开窗口、直接派发 Message)。生产构建不带此 feature。
+[features]
+selftest = ["windows-reactor/test"]
+
 [build-dependencies]
 windows-bindgen = { path = "D:/Projects/qaq-winui-reactor/crates/libs/bindgen" }
 windows-reactor-setup = { path = "D:/Projects/qaq-winui-reactor/crates/libs/reactor-setup" }

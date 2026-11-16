@@ -42,6 +42,31 @@ pub fn page_header(title: &str, subtitle: &str) -> View {
         .into()
 }
 
+/// 头像渲染：已解码位图走 `Image::source_data`，未就绪/空 URL 回退 `PersonPicture` 姓名首字。
+pub fn avatar_view(img: Option<&EncodedImage>, name: &str, size: f64, radius: f64) -> Border {
+    let inner: View = match img {
+        Some(encoded) => Image::new()
+            .source_data(encoded.clone())
+            .width(size)
+            .height(size)
+            .stretch(Stretch::UniformToFill)
+            .into(),
+        None => {
+            let mut pic = PersonPicture::new().width(size).height(size);
+            if !name.is_empty() {
+                pic = pic.display_name(name);
+            }
+            pic.into()
+        }
+    };
+    Border::new()
+        .width(size)
+        .height(size)
+        .corner_radius(radius)
+        .background(ThemeBrush::SolidBackground)
+        .content(inner)
+}
+
 /// `12:34` / `1:02:03`。
 pub fn fmt_duration(secs: u32) -> String {
     let h = secs / 3600;

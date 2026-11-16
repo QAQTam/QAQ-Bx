@@ -16,6 +16,7 @@ use bili_core::notify::{
     WhisperSession,
 };
 use bili_core::player::{PlayerClient, StreamChoice, VideoMeta};
+use bili_core::reply::{ReplyClient, ReplyCursor, ReplyItem, ReplyPage, ReplySort, SubReplyPage};
 use bili_core::settings::{AppSettings, FileSettingsStore, SETTINGS_FILE};
 use bili_video::engine::{OverlayDanmaku, VideoConfig, VideoEngine};
 use windows_reactor::*;
@@ -30,6 +31,9 @@ use crate::image_cache::ImageCache;
 use crate::pages;
 use crate::pages::account::{
     AccountCallbacks, AccountViewData, ListSliceState, NotifyTab, OpenTarget, WhisperThreadState,
+};
+use crate::pages::player::{
+    CommentCallbacks, CommentSort, CommentsData, CommentsSnapshot, SubReplyState,
 };
 use crate::router::{self, Route, NAV_ROUTES};
 use crate::runtime::{block_on, cover_semaphore};
@@ -87,11 +91,144 @@ fn video_item(card: &FeedCard) -> VideoItem {
         cid: card.cid.unwrap_or(0),
         title: card.title.clone().unwrap_or_default(),
         author: card.owner.as_ref().map_or_else(String::new, |owner| owner.name.clone()),
+        author_mid: card.owner.as_ref().map_or(0, |owner| owner.mid),
+        author_face_url: card
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.face.as_deref())
+            .and_then(normalize_face_url),
         duration_secs: card.duration.unwrap_or_default().clamp(0, i64::from(u32::MAX)) as u32,
         play_count: card.stat.as_ref().map_or(0, |stat| stat.view.unsigned_abs()),
         danmaku_count: card.stat.as_ref().map_or(0, |stat| stat.danmaku.unsigned_abs()),
         cover: None,
         pic_url: card.pic.as_deref().map(thumbnail_url),
+    }
+}
+
+fn normalize_face_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(if let Some(rest) = trimmed.strip_prefix("//") {
+        format!("https://{rest}")
+    } else {
+        trimmed.replacen("http://", "https://", 1)
+    })
+}
+
+const SUB_REPLY_PAGE_SIZE: u32 = 10;
+
+#[derive(Default)]
+struct ReplyBucket {
+    loading: bool,
+    loaded_once: bool,
+    has_more: bool,
+    error: Option<String>,
+    cursor: Option<ReplyCursor>,
+    total_count: Option<u64>,
+    top_replies: Vec<ReplyItem>,
+    replies: Vec<ReplyItem>,
+    seen_rpids: HashSet<u64>,
+}
+
+#[derive(Default)]
+struct CommentsSessionState {
+    aid: u64,
+    sort: CommentSort,
+    upper_mid: u64,
+    hot: ReplyBucket,
+    latest: ReplyBucket,
+    sub_replies: HashMap<u64, SubReplyState>,
+}
+
+impl CommentsSessionState {
+    fn reset(&mut self, aid: u64, upper_mid: u64) {
+        self.aid = aid;
+        self.sort = CommentSort::Hot;
+        self.upper_mid = upper_mid;
+        self.hot = ReplyBucket::default();
+        self.latest = ReplyBucket::default();
+        self.sub_replies.clear();
+    }
+
+    fn bucket(&self, sort: CommentSort) -> &ReplyBucket {
+        match sort {
+            CommentSort::Hot => &self.hot,
+            CommentSort::Latest => &self.latest,
+        }
+    }
+
+    fn bucket_mut(&mut self, sort: CommentSort) -> &mut ReplyBucket {
+        match sort {
+            CommentSort::Hot => &mut self.hot,
+            CommentSort::Latest => &mut self.latest,
+        }
+    }
+
+    fn references_avatar(&self, thumb_url: &str) -> bool {
+        let bucket = self.bucket(self.sort);
+        let in_main = bucket
+            .top_replies
+            .iter()
+            .chain(bucket.replies.iter())
+            .any(|item| !item.avatar.is_empty() && avatar_thumbnail_url(&item.avatar) == thumb_url);
+        if in_main {
+            return true;
+        }
+        self.sub_replies.values().any(|sub| {
+            sub.expanded
+                && sub
+                    .items
+                    .iter()
+                    .any(|item| !item.avatar.is_empty() && avatar_thumbnail_url(&item.avatar) == thumb_url)
+        })
+    }
+
+    fn to_snapshot(&self, rev: u64, avatar_cache: &ImageCache) -> CommentsSnapshot {
+        let bucket = self.bucket(self.sort);
+        let mut avatars = HashMap::new();
+        let collect_avatar = |raw: &str, out: &mut HashMap<String, EncodedImage>| {
+            if raw.is_empty() {
+                return;
+            }
+            let thumb = avatar_thumbnail_url(raw);
+            if !out.contains_key(&thumb)
+                && let Some(img) = avatar_cache.get(&thumb)
+            {
+                out.insert(thumb, img);
+            }
+        };
+        for item in bucket.top_replies.iter().chain(bucket.replies.iter()) {
+            collect_avatar(&item.avatar, &mut avatars);
+        }
+        for sub in self.sub_replies.values() {
+            if sub.expanded {
+                for item in &sub.items {
+                    collect_avatar(&item.avatar, &mut avatars);
+                }
+            }
+        }
+        let loading = bucket.loading && bucket.top_replies.is_empty() && bucket.replies.is_empty();
+        let loading_more = bucket.loading && (!bucket.top_replies.is_empty() || !bucket.replies.is_empty());
+        CommentsSnapshot {
+            rev,
+            data: Arc::new(CommentsData {
+                aid: self.aid,
+                sort: self.sort,
+                upper_mid: self.upper_mid,
+                total_count: bucket.total_count,
+                loading,
+                loading_more,
+                loaded_once: bucket.loaded_once,
+                has_more: bucket.has_more,
+                error: bucket.error.clone(),
+                top_replies: bucket.top_replies.clone(),
+                replies: bucket.replies.clone(),
+                sub_replies: self.sub_replies.clone(),
+                avatars,
+            }),
+        }
     }
 }
 
@@ -141,6 +278,30 @@ fn video_config_from(settings: &AppSettings) -> VideoConfig {
     }
 }
 
+/// AppShell 输入:正常运行恒为默认值;selftest 下携带共享探针句柄,
+/// 状态经 reactor `test` 模块的 Input 句柄流出(reactor 测试同款模式)。
+#[derive(Clone, Default, PartialEq)]
+pub struct ShellInput {
+    /// selftest 共享探针句柄(正常路径恒为 `None`,零开销)。
+    pub probe: Option<std::rc::Rc<std::cell::RefCell<ShellProbe>>>,
+}
+
+/// selftest 探针:AppShell 断言所需的最小状态快照。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShellProbe {
+    pub route_tag: String,
+    pub history_len: usize,
+    pub playback_gen: u64,
+    pub now_playing_bvid: Option<String>,
+    pub comments_aid: u64,
+    pub comments_sort_latest: bool,
+    pub hot_loaded: bool,
+    pub hot_replies: usize,
+    pub hot_total: Option<u64>,
+    pub latest_loaded: bool,
+    pub latest_replies: usize,
+}
+
 pub struct AppShell {
     auth_service: Arc<Auth>,
     /// 设置持久化存储（`data/settings.json`）+ 运行时唯一配置源。
@@ -150,9 +311,12 @@ pub struct AppShell {
     settings_save_timer: Option<ComponentTimer>,
     /// 后台任务代次（切视频/换一换/重探登录态时递增，拦截在飞旧结果串台）。
     playback_gen: u64,
+    playback_epoch: Arc<AtomicU64>,
     feed_gen: u64,
     feed_epoch: Arc<AtomicU64>,
     auth_gen: u64,
+    /// 视频评论区客户端（复用共享凭据与票据）。
+    reply_client: Arc<ReplyClient>,
     /// 首页推荐流客户端（WBI 签名，凭据复用登录态）。
     feed_client: Arc<FeedClient>,
     /// 首页流会话状态机（与后台请求任务共享）。
@@ -227,12 +391,22 @@ pub struct AppShell {
     notify_sessions_end_ts: Option<u64>,
     selected_whisper: Option<(u64, i32)>,
     whisper_threads: HashMap<(u64, i32), WhisperThreadState>,
+    avatar_gen: u64,
     avatar_cache: Arc<ImageCache>,
-    avatar_inflight: HashSet<String>,
+    avatar_inflight: HashMap<String, u64>,
     route: Route,
     history: Vec<Route>,
     pane_open: bool,
     now_playing: Option<VideoItem>,
+    now_playing_desc: Option<String>,
+    meta_fetch_inflight_seq: Option<u64>,
+    comments_session: CommentsSessionState,
+    /// selftest 探针句柄(正常路径恒为 `None`)。
+    probe: Option<std::rc::Rc<std::cell::RefCell<ShellProbe>>>,
+    comments_snapshot: CommentsSnapshot,
+    comments_rev: u64,
+    playback_avatar_dirty: bool,
+    playback_avatar_timer: Option<ComponentTimer>,
     playing: bool,
     position: u32,
     mount_tick: u32,
@@ -272,6 +446,9 @@ pub struct AppShell {
 #[derive(Clone)]
 pub enum Message {
     Back,
+    /// selftest 空转消息:驱动探针在队列尾部刷新状态(生产路径零开销)。
+    #[cfg(feature = "selftest")]
+    SelfTestSync,
     NavTagSelected(Option<String>),
     PaneOpenChanged(bool),
     TogglePane,
@@ -411,10 +588,33 @@ pub enum Message {
         session_type: i32,
         res: Result<Vec<WhisperMessage>, String>,
     },
-    NotifyAvatarLoaded {
-        seq: u64,
+    AvatarLoaded {
+        avatar_gen: u64,
+        inflight_epoch: u64,
         url: String,
-        image: Option<EncodedImage>,
+        has_image: bool,
+    },
+    FlushPlaybackAvatars,
+    VideoMetaLoaded {
+        seq: u64,
+        res: Result<VideoMeta, String>,
+    },
+    SetCommentSort(CommentSort),
+    LoadMoreComments,
+    RetryComments,
+    CommentsLoaded {
+        seq: u64,
+        sort: CommentSort,
+        append: bool,
+        res: Result<ReplyPage, String>,
+    },
+    ToggleSubReplies(u64),
+    LoadMoreSubReplies(u64),
+    SubRepliesLoaded {
+        seq: u64,
+        root_rpid: u64,
+        append: bool,
+        res: Result<SubReplyPage, String>,
     },
     OpenRelations(RelationKind),
     RefreshRelations(RelationKind),
@@ -428,6 +628,26 @@ pub enum Message {
 }
 
 impl AppShell {
+    /// selftest:将断言所需最小状态刷入共享探针(update 入口统一调用,
+    /// 探针句柄为 `None` 时零开销直返)。
+    fn refresh_probe(&self) {
+        let Some(probe) = &self.probe else { return };
+        let hot = &self.comments_session.hot;
+        let latest = &self.comments_session.latest;
+        let mut out = probe.borrow_mut();
+        out.route_tag = self.route.tag().to_string();
+        out.history_len = self.history.len();
+        out.playback_gen = self.playback_gen;
+        out.now_playing_bvid = self.now_playing.as_ref().map(|item| item.bvid.clone());
+        out.comments_aid = self.comments_session.aid;
+        out.comments_sort_latest = self.comments_session.sort == CommentSort::Latest;
+        out.hot_loaded = hot.loaded_once;
+        out.hot_replies = hot.replies.len();
+        out.hot_total = hot.total_count;
+        out.latest_loaded = latest.loaded_once;
+        out.latest_replies = latest.replies.len();
+    }
+
     fn open_video(&mut self, bvid: &str, context: &ComponentContext<Self>) {
         // 数据源：首页已加载卡 → 占位数据回退（冒烟路由 BILIPLAY_VIDEO 用）。
         let mut item = match self
@@ -462,6 +682,8 @@ impl AppShell {
                 target.title
             },
             author: String::new(),
+            author_mid: 0,
+            author_face_url: None,
             duration_secs: 0,
             play_count: 0,
             danmaku_count: 0,
@@ -620,16 +842,23 @@ impl AppShell {
             }
             self.route = Route::Player;
         }
-        self.playback_gen = self.playback_gen.wrapping_add(1);
+        self.advance_playback_gen();
         self.pending_open_preresolve = None;
         self.current_meta = None;
+        self.now_playing_desc = None;
+        self.meta_fetch_inflight_seq = None;
+        self.playback_avatar_dirty = false;
+        self.playback_avatar_timer = None;
         self.ensure_engine().set_danmaku(Vec::new());
         self.now_playing = Some(item.clone());
         self.playing = self.settings.autoplay;
         self.position = 0;
         self.engine_duration = None;
         self.player_notice = None;
+        self.comments_session.reset(item.aid, item.author_mid);
+        self.refresh_comments_snapshot();
         self.schedule_tick(context);
+        self.kickoff_video_extras(self.playback_gen, context);
 
         let nav = self.auth_service.nav_client();
         let current_key = resolve_profile_key(&self.settings, &nav);
@@ -656,6 +885,174 @@ impl AppShell {
         );
     }
 
+    fn advance_playback_gen(&mut self) -> u64 {
+        self.playback_gen = self.playback_gen.wrapping_add(1);
+        if self.playback_gen == 0 {
+            self.playback_gen = 1;
+        }
+        self.playback_epoch.store(self.playback_gen, Ordering::SeqCst);
+        self.playback_gen
+    }
+
+    fn refresh_comments_snapshot(&mut self) {
+        self.comments_rev = self.comments_rev.wrapping_add(1);
+        self.comments_snapshot = self
+            .comments_session
+            .to_snapshot(self.comments_rev, &self.avatar_cache);
+    }
+
+    fn schedule_playback_avatar_flush(&mut self, context: &ComponentContext<Self>) {
+        if self.playback_avatar_timer.is_none() {
+            self.playback_avatar_timer = Some(
+                context.set_local_timeout(COVER_FLUSH_INTERVAL, || Message::FlushPlaybackAvatars),
+            );
+        }
+    }
+
+    fn absorb_video_meta(&mut self, meta: &VideoMeta, seq: u64, context: &ComponentContext<Self>) {
+        if seq != self.playback_gen {
+            return;
+        }
+        if let Some(desc) = &meta.desc
+            && !desc.trim().is_empty()
+        {
+            self.now_playing_desc = Some(desc.clone());
+        }
+        if let Some(cur) = self.now_playing.as_mut() {
+            if cur.aid == 0 && meta.aid > 0 {
+                cur.aid = meta.aid;
+            }
+            if cur.cid == 0 && meta.cid > 0 {
+                cur.cid = meta.cid;
+            }
+            if cur.title.is_empty() || cur.title == cur.bvid {
+                cur.title = meta.title.clone();
+            }
+            if cur.duration_secs == 0 && meta.duration > 0 {
+                cur.duration_secs = meta.duration as u32;
+            }
+            if let Some(owner) = &meta.owner {
+                if cur.author_mid == 0 && owner.mid > 0 {
+                    cur.author_mid = owner.mid;
+                }
+                if cur.author.is_empty() && !owner.name.is_empty() {
+                    cur.author = owner.name.clone();
+                }
+                if cur.author_face_url.is_none() {
+                    cur.author_face_url = owner.face.as_deref().and_then(normalize_face_url);
+                }
+            }
+        }
+        if self.comments_session.aid == 0 && meta.aid > 0 {
+            self.comments_session.aid = meta.aid;
+        }
+        if self.comments_session.upper_mid == 0
+            && let Some(owner) = &meta.owner
+            && owner.mid > 0
+        {
+            self.comments_session.upper_mid = owner.mid;
+        }
+        self.refresh_comments_snapshot();
+        self.kickoff_video_extras(seq, context);
+    }
+
+    fn kickoff_video_extras(&mut self, seq: u64, context: &ComponentContext<Self>) {
+        if seq != self.playback_gen {
+            return;
+        }
+        let Some(item) = self.now_playing.clone() else {
+            return;
+        };
+        if let Some(face) = item.author_face_url.as_deref() {
+            self.spawn_playback_avatars(std::iter::once(face), seq, context);
+        }
+        if item.aid > 0 {
+            let sort = self.comments_session.sort;
+            let bucket = self.comments_session.bucket(sort);
+            if !bucket.loaded_once && !bucket.loading && bucket.error.is_none() {
+                self.fetch_comments(sort, false, context);
+            }
+        }
+        // cid 直出跳过 resolve() 内的 view，但缺 aid 或缺 UP 主头像时补拉一次 view。
+        if item.cid > 0
+            && (item.aid == 0 || item.author_face_url.is_none())
+            && self.meta_fetch_inflight_seq != Some(seq)
+        {
+            self.meta_fetch_inflight_seq = Some(seq);
+            let auth = self.auth_service.clone();
+            let nav = auth.nav_client();
+            let bvid = item.bvid;
+            context.spawn_background(move |_| {
+                let client = PlayerClient::with_nav(auth.http(), auth.credential_provider(), nav);
+                let res = block_on(client.video_meta(&bvid)).map_err(|e| e.to_string());
+                Message::VideoMetaLoaded { seq, res }
+            });
+        }
+    }
+
+    fn fetch_comments(&mut self, sort: CommentSort, append: bool, context: &ComponentContext<Self>) {
+        let aid = self.comments_session.aid;
+        if aid == 0 {
+            return;
+        }
+        let cursor = {
+            let bucket = self.comments_session.bucket_mut(sort);
+            if bucket.loading {
+                return;
+            }
+            bucket.loading = true;
+            bucket.error = None;
+            if append { bucket.cursor.clone() } else { None }
+        };
+        self.refresh_comments_snapshot();
+
+        let seq = self.playback_gen;
+        let client = self.reply_client.clone();
+        context.spawn_background(move |_| Message::CommentsLoaded {
+            seq,
+            sort,
+            append,
+            res: block_on(client.fetch_main(aid, ReplySort::from(sort), cursor.as_ref()))
+                .map_err(|e| e.to_string()),
+        });
+    }
+
+    fn fetch_sub_replies(&mut self, root_rpid: u64, append: bool, context: &ComponentContext<Self>) {
+        let aid = self.comments_session.aid;
+        if aid == 0 || root_rpid == 0 {
+            return;
+        }
+        let pn = {
+            let entry = self
+                .comments_session
+                .sub_replies
+                .entry(root_rpid)
+                .or_default();
+            if entry.loading {
+                return;
+            }
+            entry.expanded = true;
+            entry.loading = true;
+            entry.error = None;
+            if append && !entry.items.is_empty() {
+                entry.next_pn.max(1)
+            } else {
+                1
+            }
+        };
+        self.refresh_comments_snapshot();
+
+        let seq = self.playback_gen;
+        let client = self.reply_client.clone();
+        context.spawn_background(move |_| Message::SubRepliesLoaded {
+            seq,
+            root_rpid,
+            append: append && pn > 1,
+            res: block_on(client.fetch_sub(aid, root_rpid, pn, SUB_REPLY_PAGE_SIZE))
+                .map_err(|e| e.to_string()),
+        });
+    }
+
     fn apply_resolved_media(
         &mut self,
         video_url: String,
@@ -664,6 +1061,7 @@ impl AppShell {
         seq: u64,
         context: &ComponentContext<Self>,
     ) {
+        self.absorb_video_meta(&meta, seq, context);
         let engine = self.ensure_engine();
         engine.set_volume(f64::from(self.volume));
         engine.load_with_options(&video_url, Some(&audio_url), self.settings.autoplay);
@@ -954,6 +1352,37 @@ impl AppShell {
         }
     }
 
+    fn half_pane_layer(
+        &self,
+        author_avatar: Option<EncodedImage>,
+        my_avatar: Option<EncodedImage>,
+        comment_cb: CommentCallbacks,
+        context: &mut ViewContext<Self>,
+    ) -> Option<KeyedView> {
+        let (Some(item), Some(engine)) = (self.now_playing.as_ref(), self.engine.as_ref()) else {
+            return None;
+        };
+        Some(keyed(
+            format!("half-pane:{}", item.bvid),
+            View::component::<pages::player::HalfPanePreview>(pages::player::HalfPaneInput {
+                item: item.clone(),
+                author_avatar,
+                my_avatar,
+                desc: self.now_playing_desc.clone(),
+                mount_tick: self.mount_tick,
+                width: self.settings.half_pane_width,
+                max_width: self.window_width,
+                notice: self.player_notice.clone(),
+                engine: engine.clone(),
+                comments: self.comments_snapshot.clone(),
+                comment_cb,
+                on_expand: context.message(Message::ExpandHalfPane),
+                on_close: context.message(Message::CloseHalfPane),
+                on_resize: context.callback(Message::ResizeHalfPane),
+            }),
+        ))
+    }
+
     /// 首页视图（Home 路由与播放页无播放项时的兜底共用）。
     fn home_view(&self, context: &ViewContext<Self>) -> View {
         let compact = self.window_width < COMPACT_BREAKPOINT;
@@ -1051,6 +1480,7 @@ impl AppShell {
         self.notify_sessions_end_ts = None;
         self.selected_whisper = None;
         self.whisper_threads.clear();
+        self.avatar_gen = self.avatar_gen.wrapping_add(1);
         self.avatar_cache.clear();
         self.avatar_inflight.clear();
     }
@@ -1252,28 +1682,71 @@ impl AppShell {
         urls: impl IntoIterator<Item = &'a str>,
         context: &ComponentContext<Self>,
     ) {
-        let seq = self.notify_gen;
+        self.spawn_avatars(urls, 0, context);
+    }
+
+    fn spawn_playback_avatars<'a>(
+        &mut self,
+        urls: impl IntoIterator<Item = &'a str>,
+        playback_seq: u64,
+        context: &ComponentContext<Self>,
+    ) {
+        self.spawn_avatars(urls, playback_seq, context);
+    }
+
+    fn spawn_avatars<'a>(
+        &mut self,
+        urls: impl IntoIterator<Item = &'a str>,
+        inflight_epoch: u64,
+        context: &ComponentContext<Self>,
+    ) {
+        let avatar_gen = self.avatar_gen;
         for raw in urls {
             if raw.is_empty() {
                 continue;
             }
             let thumb = avatar_thumbnail_url(raw);
-            if self.avatar_cache.get(&thumb).is_some()
-                || !self.avatar_inflight.insert(thumb.clone())
-            {
+            if self.avatar_cache.get(&thumb).is_some() {
                 continue;
             }
+            if let Some(&existing_epoch) = self.avatar_inflight.get(&thumb) {
+                // 0 表示持久有效的通知/关系头像；同代次也不重复发起；仅在旧播放视频被切走时允许接管。
+                if existing_epoch == 0 || existing_epoch == inflight_epoch || inflight_epoch == 0 {
+                    continue;
+                }
+            }
+            self.avatar_inflight.insert(thumb.clone(), inflight_epoch);
             let auth = self.auth_service.clone();
             let cache = self.avatar_cache.clone();
+            let playback_epoch = self.playback_epoch.clone();
             let url = thumb;
             context.spawn_background(move |_| {
-                let image = block_on(async {
-                    let _permit = cover_semaphore().acquire().await.ok()?;
-                    let img = auth.fetch_image_async(&url).await?;
-                    cache.put(url.clone(), img.clone());
-                    Some(img)
+                let has_image = block_on(async {
+                    if inflight_epoch != 0
+                        && playback_epoch.load(Ordering::SeqCst) != inflight_epoch
+                    {
+                        return false;
+                    }
+                    let Ok(_permit) = cover_semaphore().acquire().await else {
+                        return false;
+                    };
+                    if inflight_epoch != 0
+                        && playback_epoch.load(Ordering::SeqCst) != inflight_epoch
+                    {
+                        return false;
+                    }
+                    let Some(img) = auth.fetch_image_async(&url).await else {
+                        return false;
+                    };
+                    cache.put(url.clone(), img);
+                    true
                 });
-                Message::NotifyAvatarLoaded { seq, url, image }
+                Message::AvatarLoaded {
+                    avatar_gen,
+                    inflight_epoch,
+                    url,
+                    has_image,
+                }
             });
         }
     }
@@ -1372,10 +1845,10 @@ fn spawn_feed_batch(
 }
 
 impl Component for AppShell {
-    type Input = ();
+    type Input = ShellInput;
     type Message = Message;
 
-    fn create(_input: &(), context: &ComponentContext<Self>) -> Self {
+    fn create(input: &ShellInput, context: &ComponentContext<Self>) -> Self {
         crate::winrt_ext::apply_global_font(crate::theme::DEFAULT_FONT_FAMILY);
         let auth_service = Arc::new(Auth::new());
         let nav = auth_service.nav_client();
@@ -1385,9 +1858,15 @@ impl Component for AppShell {
         let (settings, settings_notice) = settings_store.load_or_default();
 
         let playback_gen = 1u64;
+        let playback_epoch = Arc::new(AtomicU64::new(playback_gen));
         let feed_gen = 1u64;
         let feed_epoch = Arc::new(AtomicU64::new(feed_gen));
         let auth_gen = 1u64;
+        let reply_client = Arc::new(ReplyClient::with_nav(
+            auth_service.http(),
+            auth_service.credential_provider(),
+            nav.clone(),
+        ));
 
         // 启动即探测登录态（含自动 Cookie 续期 + `bili_ticket` 预热；后台单飞不重跑）。
         context.spawn_background({
@@ -1506,9 +1985,11 @@ impl Component for AppShell {
             settings_notice,
             settings_save_timer: None,
             playback_gen,
+            playback_epoch,
             feed_gen,
             feed_epoch,
             auth_gen,
+            reply_client,
             feed_client,
             feed_session,
             home_slots,
@@ -1567,12 +2048,21 @@ impl Component for AppShell {
             notify_sessions_end_ts: None,
             selected_whisper: None,
             whisper_threads: HashMap::new(),
-            avatar_cache: Arc::new(ImageCache::with_capacity(128)),
-            avatar_inflight: HashSet::new(),
+            avatar_gen: 1,
+            avatar_cache: Arc::new(ImageCache::with_capacity(256)),
+            avatar_inflight: HashMap::new(),
             route,
             history: Vec::new(),
             pane_open: true,
             now_playing,
+            now_playing_desc: None,
+            meta_fetch_inflight_seq: None,
+            comments_session: CommentsSessionState::default(),
+            probe: input.probe.clone(),
+            comments_snapshot: CommentsSnapshot::default(),
+            comments_rev: 0,
+            playback_avatar_dirty: false,
+            playback_avatar_timer: None,
             playing: false,
             position: 0,
             mount_tick: 0,
@@ -1600,6 +2090,7 @@ impl Component for AppShell {
     }
 
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
+        self.refresh_probe();
         match message {
             Message::Back => {
                 self.logout_confirm = false;
@@ -1621,6 +2112,8 @@ impl Component for AppShell {
             }
             Message::PaneOpenChanged(open) => self.pane_open = open,
             Message::TogglePane => self.pane_open = !self.pane_open,
+            #[cfg(feature = "selftest")]
+            Message::SelfTestSync => {}
             Message::OpenVideo(bvid) => {
                 self.open_video(&bvid, context);
                 self.sync_smtc(context);
@@ -1710,18 +2203,197 @@ impl Component for AppShell {
                 if seq != self.playback_gen {
                     return; // 过期解析结果直接丢弃，防止切视频后串台覆盖
                 }
-                if let Some(cur) = self.now_playing.as_mut() {
-                    cur.aid = meta.aid;
-                    cur.cid = meta.cid;
-                    if cur.title.is_empty() || cur.title == cur.bvid {
-                        cur.title = meta.title.clone();
-                    }
-                    if cur.duration_secs == 0 && meta.duration > 0 {
-                        cur.duration_secs = meta.duration as u32;
-                    }
-                }
                 self.pending_open_preresolve = None;
                 self.apply_resolved_media(video_url, audio_url, meta, seq, context);
+            }
+            Message::VideoMetaLoaded { seq, res } => {
+                if seq != self.playback_gen {
+                    return;
+                }
+                if self.meta_fetch_inflight_seq == Some(seq) {
+                    self.meta_fetch_inflight_seq = None;
+                }
+                match res {
+                    Ok(meta) => self.absorb_video_meta(&meta, seq, context),
+                    Err(err) => {
+                        if self.comments_session.aid == 0 {
+                            let sort = self.comments_session.sort;
+                            let bucket = self.comments_session.bucket_mut(sort);
+                            bucket.loaded_once = true;
+                            bucket.error = Some(err);
+                            self.refresh_comments_snapshot();
+                        }
+                    }
+                }
+            }
+            Message::SetCommentSort(sort) => {
+                if self.comments_session.sort == sort {
+                    return;
+                }
+                self.comments_session.sort = sort;
+                self.refresh_comments_snapshot();
+                let bucket = self.comments_session.bucket(sort);
+                if !bucket.loaded_once && !bucket.loading {
+                    self.fetch_comments(sort, false, context);
+                }
+            }
+            Message::LoadMoreComments => {
+                let sort = self.comments_session.sort;
+                if self.comments_session.bucket(sort).has_more {
+                    self.fetch_comments(sort, true, context);
+                }
+            }
+            Message::RetryComments => {
+                if self.comments_session.aid == 0 {
+                    let seq = self.playback_gen;
+                    self.meta_fetch_inflight_seq = None;
+                    self.kickoff_video_extras(seq, context);
+                } else {
+                    let sort = self.comments_session.sort;
+                    let bucket = self.comments_session.bucket(sort);
+                    let append = !bucket.replies.is_empty() || !bucket.top_replies.is_empty();
+                    self.fetch_comments(sort, append, context);
+                }
+            }
+            Message::CommentsLoaded {
+                seq,
+                sort,
+                append,
+                res,
+            } => {
+                if seq != self.playback_gen {
+                    return;
+                }
+                let (loaded_upper, avatar_urls): (u64, Vec<String>) = {
+                    let bucket = self.comments_session.bucket_mut(sort);
+                    bucket.loading = false;
+                    bucket.loaded_once = true;
+                    match res {
+                        Ok(page) => {
+                            let page_has_more = page.has_more();
+                            let upper = page.upper_mid;
+                            if !append {
+                                bucket.top_replies.clear();
+                                bucket.replies.clear();
+                                bucket.seen_rpids.clear();
+                            }
+                            let mut urls = Vec::new();
+                            if !append {
+                                for item in page.top_replies {
+                                    if bucket.seen_rpids.insert(item.rpid) {
+                                        if !item.avatar.is_empty() {
+                                            urls.push(item.avatar.clone());
+                                        }
+                                        bucket.top_replies.push(item);
+                                    }
+                                }
+                            }
+                            let mut added = 0usize;
+                            for item in page.replies {
+                                if bucket.seen_rpids.insert(item.rpid) {
+                                    if !item.avatar.is_empty() {
+                                        urls.push(item.avatar.clone());
+                                    }
+                                    bucket.replies.push(item);
+                                    added += 1;
+                                }
+                            }
+                            if page.cursor.all_count > 0 || bucket.total_count.is_none() {
+                                bucket.total_count = Some(page.cursor.all_count);
+                            }
+                            let has_more = if append {
+                                page_has_more && added > 0
+                            } else {
+                                page_has_more
+                                    && (!bucket.replies.is_empty()
+                                        || !bucket.top_replies.is_empty())
+                            };
+                            bucket.cursor = Some(page.cursor);
+                            bucket.has_more = has_more;
+                            bucket.error = None;
+                            (upper, urls)
+                        }
+                        Err(err) => {
+                            bucket.error = Some(err);
+                            (0, Vec::new())
+                        }
+                    }
+                };
+                if self.comments_session.upper_mid == 0 && loaded_upper > 0 {
+                    self.comments_session.upper_mid = loaded_upper;
+                }
+                self.refresh_comments_snapshot();
+                self.spawn_playback_avatars(avatar_urls.iter().map(String::as_str), seq, context);
+            }
+            Message::ToggleSubReplies(rpid) => {
+                let need_fetch = if let Some(entry) = self.comments_session.sub_replies.get_mut(&rpid)
+                {
+                    entry.expanded = !entry.expanded;
+                    entry.expanded && entry.items.is_empty() && !entry.loading
+                } else {
+                    true
+                };
+                if need_fetch {
+                    self.fetch_sub_replies(rpid, false, context);
+                } else {
+                    self.refresh_comments_snapshot();
+                }
+            }
+            Message::LoadMoreSubReplies(rpid) => {
+                self.fetch_sub_replies(rpid, true, context);
+            }
+            Message::SubRepliesLoaded {
+                seq,
+                root_rpid,
+                append,
+                res,
+            } => {
+                if seq != self.playback_gen {
+                    return;
+                }
+                let avatar_urls: Vec<String> = {
+                    let upper_mid = &mut self.comments_session.upper_mid;
+                    let entry = self
+                        .comments_session
+                        .sub_replies
+                        .entry(root_rpid)
+                        .or_default();
+                    entry.loading = false;
+                    match res {
+                        Ok(page) => {
+                            if *upper_mid == 0 && page.upper_mid > 0 {
+                                *upper_mid = page.upper_mid;
+                            }
+                            if !append {
+                                entry.items.clear();
+                            }
+                            let mut seen: HashSet<u64> =
+                                entry.items.iter().map(|i| i.rpid).collect();
+                            let mut urls = Vec::new();
+                            let mut added = 0usize;
+                            for item in page.replies {
+                                if seen.insert(item.rpid) {
+                                    if !item.avatar.is_empty() {
+                                        urls.push(item.avatar.clone());
+                                    }
+                                    entry.items.push(item);
+                                    added += 1;
+                                }
+                            }
+                            entry.total_count = page.total_count;
+                            entry.next_pn = page.page_num.saturating_add(1);
+                            entry.has_more = page.has_more && (!append || added > 0);
+                            entry.error = None;
+                            urls
+                        }
+                        Err(err) => {
+                            entry.error = Some(err);
+                            Vec::new()
+                        }
+                    }
+                };
+                self.refresh_comments_snapshot();
+                self.spawn_playback_avatars(avatar_urls.iter().map(String::as_str), seq, context);
             }
             Message::DanmakuLoaded { seq, elems } => {
                 if seq != self.playback_gen {
@@ -1758,15 +2430,21 @@ impl Component for AppShell {
             }
             Message::MiniNext => {}
             Message::ClosePlayer => {
-                self.playback_gen = self.playback_gen.wrapping_add(1);
+                self.advance_playback_gen();
                 self.pending_open_preresolve = None;
                 self.now_playing = None;
+                self.now_playing_desc = None;
+                self.meta_fetch_inflight_seq = None;
+                self.playback_avatar_dirty = false;
+                self.playback_avatar_timer = None;
                 self.playing = false;
                 self.position = 0;
                 self.engine_duration = None;
                 self.player_notice = None;
                 self.current_meta = None;
                 self.timer = None;
+                self.comments_session.reset(0, 0);
+                self.refresh_comments_snapshot();
                 if let Some(engine) = self.engine.take() {
                     engine.stop();
                     drop(engine);
@@ -2564,12 +3242,32 @@ impl Component for AppShell {
                     Err(err) => entry.error = Some(err),
                 }
             }
-            Message::NotifyAvatarLoaded { seq, url, image } => {
-                if seq != self.notify_gen {
+            Message::AvatarLoaded {
+                avatar_gen,
+                inflight_epoch,
+                url,
+                has_image,
+            } => {
+                if avatar_gen != self.avatar_gen {
                     return;
                 }
-                self.avatar_inflight.remove(&url);
-                let _ = image;
+                if self.avatar_inflight.get(&url) == Some(&inflight_epoch) {
+                    self.avatar_inflight.remove(&url);
+                }
+                if has_image
+                    && self.now_playing.is_some()
+                    && self.comments_session.references_avatar(&url)
+                {
+                    self.playback_avatar_dirty = true;
+                    self.schedule_playback_avatar_flush(context);
+                }
+            }
+            Message::FlushPlaybackAvatars => {
+                self.playback_avatar_timer = None;
+                if self.playback_avatar_dirty && self.now_playing.is_some() {
+                    self.playback_avatar_dirty = false;
+                    self.refresh_comments_snapshot();
+                }
             }
             Message::OpenRelations(kind) => {
                 let (slice, _) = self.relation_slot(kind);
@@ -2636,7 +3334,7 @@ impl Component for AppShell {
         }
     }
 
-    fn view(&self, _input: &(), context: &mut ViewContext<Self>) -> View {
+    fn view(&self, _input: &ShellInput, context: &mut ViewContext<Self>) -> View {
         context.window_title(crate::notifications::APP_DISPLAY_NAME);
         let mut visuals = WindowVisuals::new()
             .backdrop(WindowBackdrop::Mica)
@@ -2656,12 +3354,32 @@ impl Component for AppShell {
         let compact = self.window_width < COMPACT_BREAKPOINT;
         let on_open = context.callback(Message::OpenVideo);
         let is_vip = matches!(&self.auth, AuthState::LoggedIn(user) if user.vip.is_vip());
+        let my_avatar = match &self.auth {
+            AuthState::LoggedIn(user) => user.avatar.clone(),
+            _ => None,
+        };
+        let comment_cb = CommentCallbacks {
+            on_sort: context.callback(Message::SetCommentSort),
+            on_load_more: context.message(Message::LoadMoreComments),
+            on_retry: context.message(Message::RetryComments),
+            on_toggle_sub: context.callback(Message::ToggleSubReplies),
+            on_load_more_sub: context.callback(Message::LoadMoreSubReplies),
+        };
+        let author_avatar = self
+            .now_playing
+            .as_ref()
+            .and_then(|item| item.author_face_url.as_deref())
+            .map(avatar_thumbnail_url)
+            .and_then(|url| self.avatar_cache.get(&url));
 
         let content: View = if self.route == Route::Player {
             match (self.now_playing.as_ref(), self.engine.as_ref()) {
                 (Some(item), Some(engine)) => {
                     View::component::<pages::player::PlayerPage>(pages::player::PlayerInput {
                         item: item.clone(),
+                        author_avatar: author_avatar.clone(),
+                        my_avatar: my_avatar.clone(),
+                        desc: self.now_playing_desc.clone(),
                         playing: self.playing,
                         position: self.position,
                         volume: self.volume,
@@ -2670,6 +3388,8 @@ impl Component for AppShell {
                         duration_secs: self.display_duration(item),
                         notice: self.player_notice.clone(),
                         engine: engine.clone(),
+                        comments: self.comments_snapshot.clone(),
+                        comment_cb: comment_cb.clone(),
                         on_toggle: context.message(Message::TogglePlay),
                         on_seek: context.callback(|value: f64| Message::Seek(value)),
                         on_volume: context.callback(|value: f64| Message::SetVolume(value)),
@@ -2875,23 +3595,13 @@ impl Component for AppShell {
                     ]
                 } else if self.route == Route::Home && self.home_half_pane {
                     let mut list = vec![keyed(key, content)];
-                    if let (Some(item), Some(engine)) = (self.now_playing.as_ref(), self.engine.as_ref()) {
-                        list.push(keyed(
-                            format!("half-pane:{}", item.bvid),
-                            View::component::<pages::player::HalfPanePreview>(
-                                pages::player::HalfPaneInput {
-                                    item: item.clone(),
-                                    mount_tick: self.mount_tick,
-                                    width: self.settings.half_pane_width,
-                                    max_width: self.window_width,
-                                    notice: self.player_notice.clone(),
-                                    engine: engine.clone(),
-                                    on_expand: context.message(Message::ExpandHalfPane),
-                                    on_close: context.message(Message::CloseHalfPane),
-                                    on_resize: context.callback(Message::ResizeHalfPane),
-                                },
-                            ),
-                        ));
+                    if let Some(layer) = self.half_pane_layer(
+                        author_avatar.clone(),
+                        my_avatar.clone(),
+                        comment_cb.clone(),
+                        context,
+                    ) {
+                        list.push(layer);
                     }
                     list
                 } else {
@@ -2972,23 +3682,13 @@ impl Component for AppShell {
                     ]
                 } else if self.route == Route::Home && self.home_half_pane {
                     let mut list = vec![keyed(key, content)];
-                    if let (Some(item), Some(engine)) = (self.now_playing.as_ref(), self.engine.as_ref()) {
-                        list.push(keyed(
-                            format!("half-pane:{}", item.bvid),
-                            View::component::<pages::player::HalfPanePreview>(
-                                pages::player::HalfPaneInput {
-                                    item: item.clone(),
-                                    mount_tick: self.mount_tick,
-                                    width: self.settings.half_pane_width,
-                                    max_width: self.window_width,
-                                    notice: self.player_notice.clone(),
-                                    engine: engine.clone(),
-                                    on_expand: context.message(Message::ExpandHalfPane),
-                                    on_close: context.message(Message::CloseHalfPane),
-                                    on_resize: context.callback(Message::ResizeHalfPane),
-                                },
-                            ),
-                        ));
+                    if let Some(layer) = self.half_pane_layer(
+                        author_avatar.clone(),
+                        my_avatar.clone(),
+                        comment_cb.clone(),
+                        context,
+                    ) {
+                        list.push(layer);
                     }
                     list
                 } else {
@@ -3267,5 +3967,66 @@ mod tests {
             thumbnail_url("https://i0.hdslb.com/bfs/archive/abc.jpg@100w.webp"),
             "https://i0.hdslb.com/bfs/archive/abc.jpg@100w.webp"
         );
+    }
+
+    #[test]
+    fn video_item_carries_owner_mid_and_normalized_face_url() {
+        let card = FeedCard {
+            id: 80433022,
+            goto: Some("av".into()),
+            bvid: Some("BV1GJ411x7h7".into()),
+            cid: Some(137649199),
+            title: Some("MV".into()),
+            owner: Some(bili_core::feed::Owner {
+                mid: 486906719,
+                name: "索尼音乐中国".into(),
+                face: Some("http://i2.hdslb.com/bfs/face/up.jpg".into()),
+            }),
+            ..FeedCard::default()
+        };
+        let item = video_item(&card);
+        assert_eq!(item.aid, 80433022);
+        assert_eq!(item.author_mid, 486906719);
+        assert_eq!(
+            item.author_face_url.as_deref(),
+            Some("https://i2.hdslb.com/bfs/face/up.jpg")
+        );
+    }
+
+    #[test]
+    fn comments_session_tracks_avatar_refs_and_builds_snapshot() {
+        let mut session = CommentsSessionState::default();
+        session.reset(80433022, 486906719);
+        session.hot.replies.push(ReplyItem {
+            rpid: 101,
+            oid: 80433022,
+            root: 0,
+            parent: 0,
+            mid: 12,
+            uname: "评论用户".into(),
+            avatar: "https://i0.hdslb.com/bfs/face/u1.jpg".into(),
+            level: 6,
+            message: "nice".into(),
+            ctime: 1700000000,
+            like: 5,
+            rcount: 0,
+            time_desc: "1小时前".into(),
+            location: "上海".into(),
+            is_up_top: false,
+            up_liked: false,
+            up_replied: false,
+            replies: Vec::new(),
+        });
+
+        let thumb = avatar_thumbnail_url("https://i0.hdslb.com/bfs/face/u1.jpg");
+        assert!(session.references_avatar(&thumb));
+        assert!(!session.references_avatar("https://i0.hdslb.com/bfs/face/other.jpg@96w_96h_1c.jpg"));
+
+        let cache = ImageCache::with_capacity(8);
+        cache.put(thumb.clone(), EncodedImage::new(vec![1, 2, 3]));
+        let snap = session.to_snapshot(7, &cache);
+        assert_eq!(snap.rev, 7);
+        assert_eq!(snap.data.replies.len(), 1);
+        assert!(snap.data.avatars.contains_key(&thumb));
     }
 }

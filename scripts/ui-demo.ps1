@@ -24,7 +24,7 @@ $FramesDir = Join-Path $OutRoot "frames"
 New-Item -ItemType Directory -Force -Path $FramesDir | Out-Null
 
 Add-Type -AssemblyName System.Drawing
-Add-Type @"
+Add-Type -ReferencedAssemblies System.Drawing @"
 using System;
 using System.Runtime.InteropServices;
 
@@ -206,6 +206,11 @@ try {
     Start-Sleep -Milliseconds 2200
     Capture-WindowFrame -Hwnd $hwnd -FileName "04-player.png"
 
+    # 场景 3.5：点击评论区头部「按时间」排序按钮（右栏左缘对齐，标题栏 48 + 视频面 436 + 信息头 ≈ y640-690）
+    Click-Smooth -X ($winX + [int]($winW * 0.68)) -Y ($winY + 665) -MoveMs 450
+    Start-Sleep -Milliseconds 1800
+    Capture-WindowFrame -Hwnd $hwnd -FileName "04b-sort-latest.png"
+
     # 场景 4：在播放页向下滚动进入评论区，触发右下角小窗
     Move-CursorSmooth -TargetX ($winX + [int]($winW * 0.35)) -TargetY ($winY + [int]($winH * 0.55)) -DurationMs 350
     Scroll-Smooth -TotalDelta -780 -Steps 22 -StepMs 24
@@ -221,8 +226,8 @@ try {
     Start-Sleep -Milliseconds 800
     Capture-WindowFrame -Hwnd $hwnd -FileName "06-back-home-preserved.png"
 
-    # 场景 6：切换左侧导航到“设置页”（展示全局 Noto Sans SC 与新开关）
-    Click-Smooth -X ($winX + 24) -Y ($winY + $winH - 42) -MoveMs 500
+    # 场景 6：切换左侧导航到“设置页”（窄条 footer 设置图标实测中心 (32, 658)，见 .qaqh/probe-icons.ps1）
+    Click-Smooth -X ($winX + 32) -Y ($winY + 658) -MoveMs 500
     Start-Sleep -Milliseconds 800
     Capture-WindowFrame -Hwnd $hwnd -FileName "07-settings.png"
 

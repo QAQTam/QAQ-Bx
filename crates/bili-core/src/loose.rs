@@ -76,3 +76,14 @@ pub fn f64_any_or_zero<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<f
         Some(V::Text(s)) => Ok(s.trim().parse::<f64>().unwrap_or(0.0)),
     }
 }
+
+/// 宽松无符号整数：`null` 或非法值兜底为 `0`。
+pub fn u64_any_or_zero<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<u64, D::Error> {
+    Ok(opt_u64_any(d)?.unwrap_or(0))
+}
+
+/// 宽松有符号整数：`null` 或非法值兜底为 `0`。
+pub fn i64_any_or_zero<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<i64, D::Error> {
+    let f = f64_any_or_zero(d)?;
+    Ok(if f.is_finite() { f.round() as i64 } else { 0 })
+}

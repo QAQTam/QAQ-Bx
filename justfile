@@ -28,6 +28,13 @@ test:
 demo:
     .\scripts\ui-demo.ps1
 
+# 内部状态自测：不开窗口、直接派发 Message 断言（AGENTS.md #4 集成测试）
+# 固定从 target/debug 启动:与打包应用共用同一 data 目录(settings 无 home_open_mode
+# → 默认 FullPlayer),断言覆盖完整路由路径,且不触碰仓库根 data/ 的用户设置。
+selftest scenario="all":
+    cargo build -p bili-ui --features selftest
+    cd .\target\debug; .\bili-ui.exe --selftest {{scenario}}
+
 # 录制 60fps 宣传片 MP4（target/ui-demo/promo.mp4）
 demo-record:
     .\scripts\ui-demo.ps1 -Record
