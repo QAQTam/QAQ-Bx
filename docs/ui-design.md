@@ -118,15 +118,16 @@ Border(corner_radius 8, background ThemeBrush::CardBackground, border ThemeBrush
 ## 4. 播放页（PlayerPage，未来视频通道落点）
 
 ```
-Grid columns: [视频区(Star, MaxWidth 960)] [信息区(380px)]
-视频区 Grid rows: [视频面(Star)] [传输控制(Auto)]
+Grid columns: [左滚动列(Star)] [右栏(Pixel 360)]
+左滚动列 StackPanel: 视频槽(高 420, margin 16) → 标题(20px Bold) → UP 行(36px 圆形头像 + 名字 + 播放/弹幕/时长) → 数据行(action pills) → 简介(可折叠 Expander) → 评论区
+视频面为浮动挂载(margin 16/16/372/0):顶部主位 ↔ 右下角小窗(PiP)通过尺寸切换过渡,SwapChainPanel 不销毁
 ```
 
 | 区 | 内容 |
 |---|---|
-| 视频面 | **骨架期**：黑底 `Border` + 居中 `ProgressRing`/提示文字"视频通道待接入(mpv↔SwapChainPanel)"。正式期：`SwapChainPanel`（mpv render API D3D11 interop）+ 弹幕覆盖层（windows-canvas）。 |
-| 传输控制 | 对照 MediaTransportControls：左（音量 Slider+按钮）；中（上一部/播放暂停/下一部 + 进度 Slider + 时间 TextBlock ×2）；右（倍速/全屏/弹幕开关）。骨架期控件齐全但只绑定占位状态。 |
-| 信息区 | StackPanel: 标题(20px Bold) → UP 行（PersonPicture + 名字 + 粉丝数）→ 数据行（播放/弹幕/发布时间）→ 简介（可折叠 Expander）→ 分 P 列表 → 评论区（占位：老接口 `/x/v2/reply/main` 数据后续接入）。 |
+| 视频面 | **已接入**：`SwapChainPanel`（mpv render API D3D11 interop，见 `docs/video-channel.md`）+ 弹幕覆盖层；滚动超 300px 过渡为右下角小窗（PiP）。 |
+| 传输控制 | 对照 MediaTransportControls：左（音量 Slider+按钮）；中（上一部/播放暂停/下一部 + 进度 Slider + 时间 TextBlock ×2）；右（倍速/全屏/弹幕开关）。 |
+| 信息区/评论区 | **评论区已接入真实数据**（`/x/v2/reply/main` 主楼 + `/x/v2/reply/reply` 楼中楼）：总评论数、按热度/按时间排序切换、置顶/UP主/LV/IP属地/UP主觉得很赞徽标、楼中楼预览与展开/加载更多/收起、空态/错误重试；写接口（发评/点赞）未接入。右栏 360px 为「接下来播放 · 相关推荐」（占位样本数据，待接入相关视频 API）。 |
 
 返回：TitleBar 返回键（`is_back_button_visible(true)` + history pop），或面包屑。
 
