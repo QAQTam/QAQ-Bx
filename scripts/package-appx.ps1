@@ -173,7 +173,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "makeappx 打包失败 (exit=$LASTEXITCODE)"
 }
 
-# 5. 可选：自签名
+# 5. 可选：自签名（并将公钥证书 .cer 同步复制到输出目录与 .appx 放在一起）
 if ($Sign) {
     $certDir = Join-Path $RepoRoot "packaging\certs"
     $certFiles = Ensure-SelfSignedCert -CertDir $certDir -Subject $Publisher -Password $CertPassword
@@ -182,6 +182,9 @@ if ($Sign) {
     if ($LASTEXITCODE -ne 0) {
         throw "signtool 签名失败 (exit=$LASTEXITCODE)"
     }
+    $outCer = Join-Path $outDir "${packageName}_${version4}_x64.cer"
+    Copy-Item -Force $certFiles.Cer $outCer
+    Write-Host "[cert] 同步输出公钥证书: $outCer" -ForegroundColor Green
 }
 
 Write-Host "[done] 输出包: $outAppx" -ForegroundColor Green
