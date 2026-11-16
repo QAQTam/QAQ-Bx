@@ -698,35 +698,44 @@ fn related_card(title: &str, author: &str, views: &str, duration: &str) -> View 
         .into()
 }
 
-/// 首页右侧半窗预览输入（复用同一 `VideoEngine`，无播放控制条，最左侧带展开按钮）。
+/// 首页右侧半窗预览输入（复用同一 `VideoEngine`，无播放控制条，最左侧带拖动柄与展开图标）。
 #[derive(Clone)]
 pub struct HalfPaneInput {
     pub item: VideoItem,
     pub mount_tick: u32,
+    pub width: f64,
     pub notice: Option<String>,
     pub engine: Arc<VideoEngine>,
     pub on_expand: Callback<()>,
     pub on_close: Callback<()>,
+    pub on_resize: Callback<f64>,
 }
 
 impl PartialEq for HalfPaneInput {
     fn eq(&self, other: &Self) -> bool {
         self.item == other.item
             && self.mount_tick == other.mount_tick
+            && (self.width - other.width).abs() < 0.5
             && self.notice == other.notice
             && Arc::ptr_eq(&self.engine, &other.engine)
             && self.on_expand == other.on_expand
             && self.on_close == other.on_close
+            && self.on_resize == other.on_resize
     }
 }
 
 pub struct HalfPanePreview {
     comment_sort: CommentSort,
+    drag_origin: Option<(f64, f64)>,
+    live_width: Option<f64>,
 }
 
 #[derive(Clone, PartialEq)]
 pub enum HalfPaneMessage {
     SetSort(CommentSort),
+    DragStart(f64, f64),
+    DragMove(f64),
+    DragEnd,
 }
 
 impl Component for HalfPanePreview {
@@ -736,16 +745,33 @@ impl Component for HalfPanePreview {
     fn create(_input: &HalfPaneInput, _context: &ComponentContext<Self>) -> Self {
         Self {
             comment_sort: CommentSort::Hot,
+            drag_origin: None,
+            live_width: None,
         }
     }
 
     fn update(&mut self, message: HalfPaneMessage, _context: &ComponentContext<Self>) {
         match message {
             HalfPaneMessage::SetSort(sort) => self.comment_sort = sort,
+            HalfPaneMessage::DragStart(window_x, current_w) => {
+                self.drag_origin = Some((window_x, current_w));
+            }
+            HalfPaneMessage::DragMove(window_x) => {
+                if let Some((start_x, start_w)) = self.drag_origin {
+                    let next_w = (start_w + (start_x - window_x)).clamp(340.0, 820.0);
+                    self.live_width = Some(next_w);
+                }
+            }
+            HalfPaneMessage::DragEnd => {
+                self.drag_origin = None;
+            }
         }
     }
 
     fn view(&self, input: &HalfPaneInput, context: &mut ViewContext<Self>) -> View {
+        let pane_width = self.live_width.unwrap_or(input.width).clamp(340.0, 820.0);
+        let video_height = ((pane_width - 40.0 - 24.0) * 9.0 / 16.0).clamp(160.0, 440.0);
+
         let surface: View = if let Some(notice) = &input.notice {
             Border::new()
                 .corner_radius(8.0)
@@ -767,7 +793,37 @@ impl Component for HalfPanePreview {
             })
         };
 
-        // 最左侧展开控制条：顶部关闭，居中大展开按钮进入完整播放页。
+        let cur_w = pane_width;
+        let drag_handle = Border::new()
+            .grid_row(1)
+            .width(40.0)
+            .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
+            .on_pointer_pressed(context.callback(move |ev: PointerEventInfo| {
+                HalfPaneMessage::DragStart(ev.window_x, cur_w)
+            }))
+            .content(
+                StackPanel::new()
+                    .spacing(6.0)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .children((
+                        FontIcon::new()
+                            .glyph("\u{E76F}")
+                            .font_size(14.0)
+                            .opacity(if self.drag_origin.is_some() { 1.0 } else { 0.55 }),
+                        Border::new()
+                            .width(3.0)
+                            .height(28.0)
+                            .corner_radius(1.5)
+                            .background(if self.drag_origin.is_some() {
+                                ThemeBrush::Accent
+                            } else {
+                                ThemeBrush::CardStroke
+                            }),
+                    )),
+            );
+
+        // 最左侧纯图标条：顶部关闭 + 中间拖动柄 + 底部展开图标（无多余文字）。
         let left_strip = Border::new()
             .grid_column(0)
             .background(ThemeBrush::CardBackground)
@@ -775,34 +831,21 @@ impl Component for HalfPanePreview {
             .border_thickness(Thickness::new(0.0, 0.0, 1.0, 0.0))
             .content(
                 Grid::new()
-                    .rows([GridLength::Auto, GridLength::Star(1.0)])
+                    .rows([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
                     .children((
                         Button::new()
                             .style(ButtonStyle::Subtle)
                             .width(40.0)
                             .height(40.0)
-                            .content("✕")
+                            .content(FontIcon::new().glyph("\u{E711}").font_size(12.0))
                             .on_click(input.on_close.clone()),
+                        View::from(drag_handle),
                         Button::new()
-                            .grid_row(1)
+                            .grid_row(2)
                             .style(ButtonStyle::Subtle)
                             .width(40.0)
-                            .vertical_alignment(VerticalAlignment::Stretch)
-                            .horizontal_content_alignment(HorizontalAlignment::Center)
-                            .vertical_content_alignment(VerticalAlignment::Center)
-                            .content(
-                                StackPanel::new().spacing(6.0).children((
-                                    FontIcon::new()
-                                        .glyph("\u{E740}")
-                                        .font_size(14.0)
-                                        .horizontal_alignment(HorizontalAlignment::Center),
-                                    TextBlock::new()
-                                        .text("展开")
-                                        .font_size(11.0)
-                                        .opacity(0.8)
-                                        .horizontal_alignment(HorizontalAlignment::Center),
-                                )),
-                            )
+                            .height(44.0)
+                            .content(FontIcon::new().glyph("\u{E740}").font_size(14.0))
                             .on_click(input.on_expand.clone()),
                     )),
             );
@@ -863,7 +906,7 @@ impl Component for HalfPanePreview {
 
         let main_pane = Grid::new()
             .grid_column(1)
-            .rows([GridLength::Pixel(248.0), GridLength::Star(1.0)])
+            .rows([GridLength::Pixel(video_height), GridLength::Star(1.0)])
             .children((
                 Border::new()
                     .margin(Thickness::new(12.0, 12.0, 12.0, 0.0))
@@ -874,8 +917,8 @@ impl Component for HalfPanePreview {
                     .content(info_and_comments),
             ));
 
-        Border::new()
-            .width(480.0)
+        let drawer = Border::new()
+            .width(pane_width)
             .horizontal_alignment(HorizontalAlignment::Right)
             .vertical_alignment(VerticalAlignment::Stretch)
             .background(ThemeBrush::SolidBackground)
@@ -885,7 +928,24 @@ impl Component for HalfPanePreview {
                 Grid::new()
                     .columns([GridLength::Pixel(40.0), GridLength::Star(1.0)])
                     .children((View::from(left_strip), View::from(main_pane))),
-            )
-            .into()
+            );
+
+        if self.drag_origin.is_some() {
+            let on_resize = input.on_resize.clone();
+            let final_w = pane_width;
+            Border::new()
+                .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
+                .on_pointer_moved(context.callback(|ev: PointerEventInfo| {
+                    HalfPaneMessage::DragMove(ev.window_x)
+                }))
+                .on_pointer_released(context.callback(move |_: PointerEventInfo| {
+                    on_resize.call(final_w);
+                    HalfPaneMessage::DragEnd
+                }))
+                .content(drawer)
+                .into()
+        } else {
+            drawer.into()
+        }
     }
 }

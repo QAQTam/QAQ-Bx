@@ -175,6 +175,7 @@ pub struct AppSettings {
     pub quality: QualityPref,
     pub codec: CodecPref,
     pub home_open_mode: HomeOpenMode,
+    pub half_pane_width: f64,
     pub danmaku_enabled: bool,
     pub danmaku_opacity: f32,
     pub danmaku_max_lanes: usize,
@@ -190,6 +191,7 @@ impl Default for AppSettings {
             quality: QualityPref::default(),
             codec: CodecPref::default(),
             home_open_mode: HomeOpenMode::default(),
+            half_pane_width: 480.0,
             danmaku_enabled: true,
             danmaku_opacity: 0.92,
             danmaku_max_lanes: 10,
@@ -211,6 +213,11 @@ impl AppSettings {
         };
         self.danmaku_max_lanes = self.danmaku_max_lanes.clamp(1, 20);
         self.volume = self.volume.min(100);
+        self.half_pane_width = if self.half_pane_width.is_finite() {
+            self.half_pane_width.clamp(340.0, 820.0)
+        } else {
+            480.0
+        };
         self
     }
 }
@@ -283,6 +290,7 @@ mod tests {
             quality: QualityPref::Q1080P60,
             codec: CodecPref::HevcFirst,
             home_open_mode: HomeOpenMode::HalfPane,
+            half_pane_width: 520.0,
             danmaku_enabled: false,
             danmaku_opacity: 0.75,
             danmaku_max_lanes: 8,

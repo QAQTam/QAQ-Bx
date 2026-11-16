@@ -292,9 +292,10 @@ pub enum Message {
     MiniNext,
     /// 关闭迷你播放条：停止并销毁惰性 VideoEngine，归还播放底座与 D3D11 内存。
     ClosePlayer,
-    /// 首页右侧半窗预览：展开进入完整播放页 / 关闭半窗。
+    /// 首页右侧半窗预览：展开进入完整播放页 / 关闭半窗 / 记忆宽度。
     ExpandHalfPane,
     CloseHalfPane,
+    ResizeHalfPane(f64),
     /// Windows 控制中心媒体按钮回调（None 表示通道已关闭）。
     SmtcAction(Option<SmtcCommand>),
     /// Xbox 手柄事件回调（None 表示通道已关闭）。
@@ -1770,6 +1771,13 @@ impl Component for AppShell {
             Message::CloseHalfPane => {
                 self.home_half_pane = false;
             }
+            Message::ResizeHalfPane(width) => {
+                let clamped = width.clamp(340.0, 820.0);
+                if (self.settings.half_pane_width - clamped).abs() >= 1.0 {
+                    self.settings.half_pane_width = clamped;
+                    self.schedule_settings_save(context);
+                }
+            }
             Message::SmtcAction(Some(cmd)) => {
                 if let Some(engine) = &self.engine {
                     let status = engine.status();
@@ -2780,10 +2788,12 @@ impl Component for AppShell {
                                 pages::player::HalfPaneInput {
                                     item: item.clone(),
                                     mount_tick: self.mount_tick,
+                                    width: self.settings.half_pane_width,
                                     notice: self.player_notice.clone(),
                                     engine: engine.clone(),
                                     on_expand: context.message(Message::ExpandHalfPane),
                                     on_close: context.message(Message::CloseHalfPane),
+                                    on_resize: context.callback(Message::ResizeHalfPane),
                                 },
                             ),
                         ));
