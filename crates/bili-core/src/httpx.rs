@@ -41,11 +41,15 @@ async fn send_get(
     creds: &Arc<dyn CredentialProvider>,
     ticket: Option<&TicketManager>,
     url: &str,
+    referer: &str,
 ) -> Result<reqwest::Response> {
     let mut builder = http
         .get(url)
         .header(reqwest::header::USER_AGENT, BROWSER_UA)
-        .header(reqwest::header::REFERER, "https://www.bilibili.com/");
+        .header(reqwest::header::REFERER, referer);
+    if let Some(origin) = origin_of(referer) {
+        builder = builder.header(reqwest::header::ORIGIN, origin);
+    }
     if let Some(cookie) = build_cookie_header(creds, ticket).await {
         builder = builder.header(reqwest::header::COOKIE, cookie);
     }
@@ -63,7 +67,18 @@ pub(crate) async fn get_json_with_ticket<T: DeserializeOwned>(
     ticket: Option<&TicketManager>,
     url: &str,
 ) -> Result<T> {
-    let resp = send_get(http, creds, ticket, url).await?;
+    get_json_with_referer(http, creds, ticket, url, "https://www.bilibili.com/").await
+}
+
+/// 同 [`get_json_with_ticket`]，可指定业务站 `Referer`（如 `https://message.bilibili.com/`）。
+pub(crate) async fn get_json_with_referer<T: DeserializeOwned>(
+    http: &reqwest::Client,
+    creds: &Arc<dyn CredentialProvider>,
+    ticket: Option<&TicketManager>,
+    url: &str,
+    referer: &str,
+) -> Result<T> {
+    let resp = send_get(http, creds, ticket, url, referer).await?;
     let env: Envelope<T> = resp.json().await?;
     match (env.code, env.data) {
         (0, Some(data)) => Ok(data),
@@ -79,6 +94,34 @@ pub(crate) async fn get_bytes_with_ticket(
     ticket: Option<&TicketManager>,
     url: &str,
 ) -> Result<Vec<u8>> {
-    let resp = send_get(http, creds, ticket, url).await?;
+    let resp = send_get(http, creds, ticket, url, "https://www.bilibili.com/").await?;
     Ok(resp.bytes().await?.to_vec())
+}
+
+fn origin_of(url: &str) -> Option<&str> {
+    let scheme_end = url.find("://")?;
+    let after_scheme = &url[scheme_end + 3..];
+    match after_scheme.find('/') {
+        Some(slash) => Some(&url[..scheme_end + 3 + slash]),
+        None => Some(url),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::origin_of;
+
+    #[test]
+    fn extracts_origin_from_root_and_subpath_referers() {
+        assert_eq!(
+            origin_of("https://www.bilibili.com/"),
+            Some("https://www.bilibili.com")
+        );
+        assert_eq!(
+            origin_of("https://space.bilibili.com/12345/fans/follow"),
+            Some("https://space.bilibili.com")
+        );
+        assert_eq!(origin_of("https://message.bilibili.com"), Some("https://message.bilibili.com"));
+        assert_eq!(origin_of("not-a-url"), None);
+    }
 }

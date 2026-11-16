@@ -21,7 +21,7 @@ Grid rows: [TitleBar(Auto)] [NavigationView(Star)] [MiniPlayer(Auto)]
 
 | 层 | 控件 | 设计要点 |
 |---|---|---|
-| 标题栏 | `TitleBar` | 左：应用图标 + "biliplay"；中：搜索框（占位，路由到搜索页）；右：主题无开关（跟随系统）。高度 Tall。 |
+| 标题栏 | `TitleBar` | 左：应用图标 + "QAQ-Bx"；中：搜索框（占位，路由到搜索页）；右：通知按钮（登录态）。高度 Tall。 |
 | 导航 | `NavigationView` | `PaneDisplayMode::LeftCompact`（窄图标栏，悬停展开，对照媒体播放器左侧栏）。 |
 | 迷你播放条 | 自组（StackPanel+Slider） | 见 §5。播放页打开时隐藏（播放页自带全量传输控制）。 |
 
@@ -38,9 +38,12 @@ Grid rows: [TitleBar(Auto)] [NavigationView(Star)] [MiniPlayer(Auto)]
 | 稍后再看 | `watch-later` | `TwoPage`/`Video` | 稍后再看（需登录） |
 
 ### footer_menu_items
-- 账号（登录态动态化：`AuthState::LoggedIn` 显示真实头像（nav face → EncodedImage）+ 昵称；
-  Guest 显示"登录"；Unknown 显示"检查登录态…"。点击 → 登录页）
+- 账号（登录态动态化：`AuthState::LoggedIn` 显示真实头像 + 昵称；
+  Guest 显示"登录"；Unknown 显示"账号"。点击 → 登录页 / 个人中心）
 - 设置（`Setting`）
+
+### 标题栏右侧（`TitleBar::right_header`）
+- 登录态下展示通知入口按钮（`Mail` 图标 + 未读数 `InfoBadge`，无未读时不显示角标），点击直达个人中心的通知区（有未读时自动定位到首个未读分类）。
 
 ### 窗口
 - `WindowVisuals::new().backdrop(WindowBackdrop::Mica).client_size(1280.0, 800.0)`，theme 跟随 System。
@@ -49,47 +52,41 @@ Grid rows: [TitleBar(Auto)] [NavigationView(Star)] [MiniPlayer(Auto)]
 ### 登录（已接入，2026-11-15）
 
 - 桥接层 `crates/bili-ui/src/auth.rs`：`Auth` 服务装配 FileCredentialStore + QrAuthPlugin
-  （同 CLI 组装），每个阻塞入口内建 current_thread tokio runtime `block_on`；
+  （同 CLI 组装），共享 `crate::runtime::shared_runtime()` `block_on`；
   `LoginFlow`（`trait LoginFlow: Send`）放 `Arc<Mutex<Option<Box<dyn LoginFlow>>>>`
   与 shell 的 2s 轮询 tick 共享。
 - 状态机：`AuthState{Unknown/Guest/LoggedIn(UserInfo)}` + `LoginFlowState{Idle/Starting/
   AwaitingScan/Scanned/Expired/Failed}`；Message：AuthProbed/AuthStartLogin/LoginQrReady/
-  LoginPollTick/LoginPolled/AuthCancelLogin/AuthLogout(二次确认)/AuthLoggedOut。
+  LoginPollTick/LoginPolled/AuthCancelLogin/AuthLogout(二次确认)/AuthCancelLogout/AuthLoggedOut。
 - 数据目录：`BILIPLAY_DATA_DIR` 或 `<cwd>/data/credentials.json`（与 CLI 一致）。
 - QR 展示直接用插件 `qr_png()` → `EncodedImage` → `Image::source_data`（UI 无 qrcode 依赖）。
 - 冒烟辅助环境变量：`BILIPLAY_ROUTE`（初始页）、`BILIPLAY_VIDEO`（初始播放项）、
   `BILIPLAY_SMOKE_LOGIN=1`（自动发起扫码流程，generate 只读）。
-- 登出按钮双击确认（服务端作废不可逆）；失败以 InfoBar(Error) 显示。
+- 登出按钮二次确认（确认退出 / 取消）；失败以 InfoBar(Warning) 显示。
 
-### 个人中心 / 消息中心空位（骨架）
+### 个人中心与通知中心（已接入，2026-11-16）
 
-- 页脚账号入口（`Route::Login`）登录态下即**个人中心**：账号卡片（头像 / 昵称 /
-  mid·Lv / 登出）+ **消息中心空位**，二者在同一页内自上而下渲染。
-- **消息中心不设独立导航项**（§1 导航项表格与 `Route` 枚举都不加）：消息中心是个人中心
-  内部的一个区块，不是顶层页面。Guest 态（二维码登录流程）不渲染该区。
-- 空位内容：`回复我的 / @我的 / 收到的赞 / 系统通知 / 私信` 五行占位 +
-  InfoBar「数据源待接入」，纯展示、无回调；落地在 `pages/login.rs` 的
-  `message_center_stub()`。
-- 接入落点：`bili-core` 新增 `MessageClient`（Cookie，注入 `CredentialProvider`），
-  端点线索见 `docs/bilibili-api-inventory.md` §8（`dynamic/entrance` 红点、
-  `api.vc.bilibili.com` 私信未读）；消息中心 API 尚未逆向，骨架期不实现。
-- 与账号资料的关系：本页即 `UserProfile` 契约的展示落点（见下节）。
+- 页脚账号入口（`Route::Login`）登录态下即**个人中心**（`pages/account.rs`）：
+  顶部资料卡（头像 / 昵称 / 等级与经验进度条 / 大会员状态与到期日 / UID / 关注·粉丝·动态·硬币计数 / 主页·刷新·退出，其中`关注`与`粉丝`挂载按钮下拉 `Flyout` 分页列表而非外部跳转）+
+  下方**通知中心**（`回复` / `@我` / `赞` / `系统` / `私信` 五个分段标签，带未读 `InfoBadge`）。
+- **通知中心不设独立导航项**（§1 导航项表格与 `Route` 枚举都不加）：标题栏右侧通知入口与页脚账号入口共用该工作区；Guest 态仅渲染简洁扫码登录。
+- 数据来源：`bili-core/src/account.rs`（`NavClient` + `/x/web-interface/nav/stat` + `/x/relation/{followings,followers}`）与
+  `bili-core/src/notify.rs`（`NotifyClient`：`msgfeed/unread`、`single_unread`、`link_setting/get`、
+  `msgfeed/{reply,at,like}`、`sys-msg/{query_unified_notify,query_user_notify,query_notify_list}`、
+  `session_svr/get_sessions` + `user/cards` + WBI 签名 `fetch_session_msgs`）。
+- 交互联动：通知与私信中的视频链接（含 `BV...`）直接拉起应用内播放；私信采用左侧会话列表 + 右侧对话历史分栏。
 
 ### 账号资料契约 / nav 统一拉取（已接入）
 
-- `bili-core/src/account.rs`：`UserProfile`（`is_login/mid/uname/face/level/vip/vip_due_date`）、
+- `bili-core/src/account.rs`：`UserProfile`（`is_login/mid/uname/face/level/current_exp/next_exp/coins/vip/vip_label/vip_due_date/official_title`）、
   `VipStatus`（`None/Monthly/Annual/Other`，由 nav 的 `vipStatus`+`vipType` 推导）、
-  `space_url()`（mid 派生，无需 API）、`NavClient`（nav 24h 缓存 + 失败降级复用旧快照）。
-- **nav 只拉一次**：改造前 `bili-core/wbi.rs`（取 `wbi_img`）与 `bili-ui/auth.rs`
-  （取昵称头像）各拉一次、各自定义私有 struct；现在 WBI 签名器、feed/播放/弹幕客户端
-  与 UI 账号展示共用同一个 `Arc<NavClient>`（`with_nav` 构造，`Auth::nav_client()` 装配）。
+  `AccountStat`（`following/follower/dynamic_count`）、`space_url()`（mid 派生）、
+  `NavClient`（nav 24h 缓存 + 失败降级复用旧快照）。
+- **nav 只拉一次**：WBI 签名器、feed/播放/弹幕/通知客户端与 UI 账号展示共用同一个
+  `Arc<NavClient>`（`with_nav` 构造，`Auth::nav_client()` 装配）。
   登录成功 / 登出后 `invalidate()` 作废缓存，下次探测用新凭据重拉。
-- 个人中心账号卡片展示：昵称、`mid`·等级、**会员状态**（`VipStatus::label()`）、
-  **空间主页**（`HyperlinkButton` 的 `NavigateUri`）；头像位图仍走 `Auth::fetch_image`。
 - **大会员影响清晰度**（`inventory §2`：未登录/非大会员时 `dash.video` 不含高档）：
-  `shell.rs::max_qn_for()` 读共享 nav 缓存 → 大会员 116（1080P60）/ 其余 80（1080P），
-  取代原硬编码 `MAX_QN=116`。缓存未就绪时保守取 80（服务端本就不下发高档）。
-- 消息中心空位保持纯占位，未引入任何插件；所有能力仍是 `bili-core` 契约 + 具体客户端。
+  `shell.rs::resolve_params_for()` 读共享 nav 缓存与用户画质偏好，未登录/非大会员保守上限 80（1080P）。
 
 ## 2. 通用页模式（对照 PageHeader / LibraryPageHeader）
 

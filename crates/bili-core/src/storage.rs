@@ -14,7 +14,8 @@ use crate::error::{BiliError, Result};
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 数据目录：优先 `BILIPLAY_DATA_DIR`（非空）；
-/// 若运行在 AppX/MSIX 容器内（`WindowsApps` 目录只读），自动切至 `%LOCALAPPDATA%\biliplay\data`；
+/// 若运行在 AppX/MSIX 容器内（`WindowsApps` 目录只读），自动切至 `%LOCALAPPDATA%\QAQ-Bx\data`
+/// （若旧版 `%LOCALAPPDATA%\biliplay\data` 已存在且新目录尚未创建则兼容沿用）；
 /// 否则回退到 `<cwd>/data`（CLI 与 UI 同源）。
 pub fn resolve_data_dir() -> PathBuf {
     if let Some(dir) = std::env::var("BILIPLAY_DATA_DIR")
@@ -29,14 +30,24 @@ pub fn resolve_data_dir() -> PathBuf {
     if is_packaged_app()
         && let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty())
     {
-        return PathBuf::from(local).join("biliplay").join("data");
+        let root = PathBuf::from(local);
+        let current = root.join("QAQ-Bx").join("data");
+        if current.exists() {
+            return current;
+        }
+        let legacy = root.join("biliplay").join("data");
+        if legacy.exists() {
+            return legacy;
+        }
+        return current;
     }
 
     std::env::current_dir().unwrap_or_default().join("data")
 }
 
+/// 判断当前进程是否运行在 MSIX / AppX 打包身份下。
 #[cfg(windows)]
-fn is_packaged_app() -> bool {
+pub fn is_packaged_app() -> bool {
     const APPMODEL_ERROR_NO_PACKAGE: i32 = 15700;
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -48,7 +59,7 @@ fn is_packaged_app() -> bool {
 }
 
 #[cfg(not(windows))]
-fn is_packaged_app() -> bool {
+pub fn is_packaged_app() -> bool {
     false
 }
 

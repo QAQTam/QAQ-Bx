@@ -33,3 +33,46 @@ pub fn u64_any<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<u64, D::E
 pub fn u32_any<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<u32, D::Error> {
     Ok(u64_any(d)? as u32)
 }
+
+/// 宽松可选无符号整数：`null` 或非数字占位（如 Lv6 的 `next_exp: "--"`）回退 `None`。
+pub fn opt_u64_any<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        Null,
+        Num(f64),
+        Text(String),
+    }
+    match Option::<V>::deserialize(d)? {
+        None | Some(V::Null) => Ok(None),
+        Some(V::Num(f)) if f.is_finite() && f >= 0.0 => Ok(Some(f.round() as u64)),
+        Some(V::Num(_)) => Ok(None),
+        Some(V::Text(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            match trimmed.parse::<f64>() {
+                Ok(f) if f.is_finite() && f >= 0.0 => Ok(Some(f.round() as u64)),
+                _ => Ok(None),
+            }
+        }
+    }
+}
+
+/// 宽松浮点：`null` 兜底为 `0.0`。
+pub fn f64_any_or_zero<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<f64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        Null,
+        Num(f64),
+        Text(String),
+    }
+    match Option::<V>::deserialize(d)? {
+        None | Some(V::Null) => Ok(0.0),
+        Some(V::Num(f)) if f.is_finite() => Ok(f),
+        Some(V::Num(_)) => Ok(0.0),
+        Some(V::Text(s)) => Ok(s.trim().parse::<f64>().unwrap_or(0.0)),
+    }
+}

@@ -15,7 +15,7 @@ pub fn popular_page(on_open: Callback<String>) -> View {
                     StackPanel::new().spacing(24.0).children((
                         theme::page_header(
                             "热门",
-                            &format!("{} 个视频 · 按播放量排序（占位数据）", videos.len()),
+                            &format!("{} 个视频", videos.len()),
                         ),
                         video_card::video_grid(&videos, &on_open),
                     )),

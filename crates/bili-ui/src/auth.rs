@@ -11,6 +11,7 @@ use std::time::Duration;
 use bili_core::account::{NavClient, VipStatus};
 use bili_core::auth::{AuthPlugin as _, LoginEvent, LoginFlow};
 use bili_core::credentials::{CredentialProvider, FileCredentialStore};
+use bili_core::notify::NotifyClient;
 use bili_core::plugin::{PluginContext, PluginRegistry};
 use bili_core::resolve_data_dir;
 use bili_core::ticket::{FileTicketStore, TicketManager, TICKET_FILE};
@@ -48,10 +49,32 @@ pub struct UserInfo {
     pub uname: String,
     pub mid: u64,
     pub level: u8,
+    pub current_exp: u64,
+    pub next_exp: Option<u64>,
+    pub coins: f64,
     pub vip: VipStatus,
+    pub vip_label: String,
+    pub vip_due_date: u64,
+    pub official_title: String,
     /// 用户空间主页（由 mid 派生）。
     pub space_url: String,
     pub avatar: Option<EncodedImage>,
+}
+
+/// 把 hdslb 头像 URL 裁成 `@96w_96h_1c.jpg` 轻量缩略图。
+pub fn avatar_thumbnail_url(raw: &str) -> String {
+    let url = raw.replacen("http://", "https://", 1);
+    if url.contains(".hdslb.com/") && !url.contains('@') && !url.contains('?') {
+        let lower = url.to_ascii_lowercase();
+        if lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".png")
+            || lower.ends_with(".webp")
+        {
+            return format!("{url}@96w_96h_1c.jpg");
+        }
+    }
+    url
 }
 
 /// 轮询事件投给 UI 的视图（不携带凭据本体）。
@@ -75,7 +98,7 @@ pub enum LoginFlowState {
     Failed(String),
 }
 
-/// 桥接服务：装配凭据存储 + 扫码插件 + `bili_ticket` 管理器 + 共享 `NavClient`。
+/// 桥接服务：装配凭据存储 + 扫码插件 + `bili_ticket` 管理器 + 共享 `NavClient` / `NotifyClient`。
 pub struct Auth {
     data_dir: PathBuf,
     plugin: Arc<QrAuthPlugin>,
@@ -83,6 +106,8 @@ pub struct Auth {
     ticket: Arc<TicketManager>,
     /// nav 统一客户端：用户资料/WBI 密钥共用（登录成功或登出后作废缓存）。
     nav: Arc<NavClient>,
+    /// 通知中心客户端（跨刷新复用设置缓存）。
+    notify: Arc<NotifyClient>,
 }
 
 impl Auth {
@@ -136,18 +161,29 @@ impl Auth {
             plugin.credentials(),
             ticket.clone(),
         ));
+        let notify = Arc::new(NotifyClient::with_nav(
+            http.clone(),
+            plugin.credentials(),
+            nav.clone(),
+        ));
         Self {
             data_dir,
             plugin,
             http,
             ticket,
             nav,
+            notify,
         }
     }
 
     /// nav 客户端（供 shell 装配 feed/播放/弹幕客户端，共用一份 nav 与 ticket 缓存）。
     pub fn nav_client(&self) -> Arc<NavClient> {
         self.nav.clone()
+    }
+
+    /// 通知中心客户端（复用同一份凭证、HTTP 客户端与共享 nav）。
+    pub fn notify_client(&self) -> Arc<NotifyClient> {
+        self.notify.clone()
     }
 
     /// 探测登录态 + 启动自动续期 + `bili_ticket` 预热。
@@ -173,6 +209,7 @@ impl Auth {
                     eprintln!("[auth] Cookie 已自动续期（mid={}）", refreshed.dede_user_id);
                     self.nav.invalidate();
                     self.ticket.invalidate();
+                    self.notify.invalidate();
                 }
                 Err(err) => {
                     let msg = format!("Cookie 自动续期失败（将沿用现有凭据）：{err}");
@@ -208,14 +245,21 @@ impl Auth {
                 notice,
             };
         }
-        let avatar = self.fetch_image_async(&profile.face).await;
+        let avatar_url = avatar_thumbnail_url(&profile.face);
+        let avatar = self.fetch_image_async(&avatar_url).await;
         let space_url = profile.space_url();
         ProbeReport {
             state: AuthState::LoggedIn(UserInfo {
                 uname: profile.uname,
                 mid: profile.mid,
                 level: profile.level,
+                current_exp: profile.current_exp,
+                next_exp: profile.next_exp,
+                coins: profile.coins,
                 vip: profile.vip,
+                vip_label: profile.vip_label,
+                vip_due_date: profile.vip_due_date,
+                official_title: profile.official_title,
                 space_url,
                 avatar,
             }),
@@ -253,6 +297,7 @@ impl Auth {
             // 新凭据已落盘 → 清空旧 nav 与 ticket 缓存，让 probe 用新会话重拉。
             self.nav.invalidate();
             self.ticket.invalidate();
+            self.notify.invalidate();
         }
         outcome
     }
@@ -262,6 +307,7 @@ impl Auth {
         block_on(self.plugin.logout()).map_err(|e| e.to_string())?;
         self.nav.invalidate();
         self.ticket.invalidate();
+        self.notify.invalidate();
         Ok(())
     }
 

@@ -11,6 +11,7 @@ pub mod error;
 pub mod feed;
 pub mod httpx;
 pub mod loose;
+pub mod notify;
 pub mod player;
 pub mod plugin;
 pub mod settings;
@@ -18,10 +19,13 @@ pub mod storage;
 pub mod ticket;
 pub mod wbi;
 
-pub use crate::storage::resolve_data_dir;
+pub use crate::storage::{is_packaged_app, resolve_data_dir};
 
 pub mod prelude {
-    pub use crate::account::{NavClient, NavSnapshot, UserProfile, VipStatus};
+    pub use crate::account::{
+        AccountStat, NavClient, NavSnapshot, RelationKind, RelationPage, RelationUser, UserProfile,
+        VipStatus,
+    };
     pub use crate::auth::{AuthPlugin, LoginEvent, LoginFlow};
     pub use crate::credentials::{
         CredentialProvider, CredentialStore, Credentials, DefaultCredentialProvider,
@@ -29,9 +33,13 @@ pub mod prelude {
     };
     pub use crate::error::{BiliError, Result};
     pub use crate::feed::{ArchiveCard, FeedCard, FeedClient, OgvCard, RcmdQuery};
+    pub use crate::notify::{
+        AtNotice, FeedCursor, FeedPage, LikeNotice, NoticeLink, NotifyClient, ReplyNotice,
+        SessionPage, SystemNotice, SystemPage, UnreadSummary, WhisperMessage, WhisperSession,
+    };
     pub use crate::plugin::{Plugin, PluginContext, PluginMeta, PluginRegistry};
     pub use crate::settings::{AppSettings, CodecPref, FileSettingsStore, QualityPref, SETTINGS_FILE};
-    pub use crate::storage::resolve_data_dir;
+    pub use crate::storage::{is_packaged_app, resolve_data_dir};
     pub use crate::ticket::{FileTicketStore, TicketData, TicketManager, TICKET_FILE};
     pub use crate::wbi::WbiSigner;
 }

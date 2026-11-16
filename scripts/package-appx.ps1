@@ -1,15 +1,15 @@
 ﻿<#
 .SYNOPSIS
-    构建并打包 biliplay AppX 安装包（支持 debug+自签名 / release+自签名 / release 无签名）。
+    构建并打包 QAQ-Bx AppX/MSIX 安装包（支持 debug+自签名 / release+自签名 / release 商店提交包）。
 .EXAMPLE
-    # 1. debug + 自签名 -> package/debug/biliplayRS-dev_0.0.0.0_x64.appx
-    .\scripts\package-appx.ps1 -Profile debug -Sign
+    # 1. debug + 自签名 -> package/debug/QAQ-Bx-Dev_0.0.0.X_x64.appx
+    .\scripts\package-appx.ps1 -Profile debug -Sign -AutoBumpRevision
 
-    # 2. release + 自签名 -> package/release/biliplayRS_0.0.0.0_x64.appx
+    # 2. release + 自签名 -> package/release/QAQ-Bx_0.0.0.0_x64.appx
     .\scripts\package-appx.ps1 -Profile release -Sign
 
-    # 3. release（无签名）-> package/release/biliplayRS_0.0.0.0_x64.appx
-    .\scripts\package-appx.ps1 -Profile release
+    # 3. release（微软商店提交包，传入 Partner Center 产品标识，无签名）
+    .\scripts\package-appx.ps1 -Profile release -Version 0.1.0 -PackageName "YourPartnerName.QAQ-Bx" -Publisher "CN=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX" -PublisherDisplayName "YourPublisher"
 #>
 [CmdletBinding()]
 param(
@@ -23,9 +23,21 @@ param(
 
     [switch]$AutoBumpRevision,
 
-    [string]$Publisher = "CN=BiliplayDev",
+    [string]$PackageName = "",
 
-    [string]$CertPassword = "biliplay-dev"
+    [string]$DisplayName = "",
+
+    [string]$ShortName = "QAQ-Bx",
+
+    [string]$Description = "QAQ-Bx",
+
+    [string]$Publisher = "CN=QAQ",
+
+    [string]$PublisherDisplayName = "QAQ",
+
+    [string]$ToastClsid = "",
+
+    [string]$CertPassword = "qaq-bx-dev"
 )
 
 Set-StrictMode -Version Latest
@@ -138,10 +150,17 @@ function Ensure-SelfSignedCert {
         [string]$Password
     )
     New-Item -ItemType Directory -Force -Path $CertDir | Out-Null
-    $pfxPath = Join-Path $CertDir "biliplay-dev.pfx"
-    $cerPath = Join-Path $CertDir "biliplay-dev.cer"
+    $pfxPath = Join-Path $CertDir "qaq-bx-dev.pfx"
+    $cerPath = Join-Path $CertDir "qaq-bx-dev.cer"
     if ((Test-Path $pfxPath) -and (Test-Path $cerPath)) {
-        return @{ Pfx = $pfxPath; Cer = $cerPath }
+        try {
+            $existing = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($cerPath)
+            if ($existing.Subject -eq $Subject) {
+                return @{ Pfx = $pfxPath; Cer = $cerPath }
+            }
+        } catch {
+            # Re-generate below when existing cert cannot be inspected.
+        }
     }
 
     Write-Host "[cert] 生成自签名开发证书 ($Subject)..." -ForegroundColor Cyan
@@ -149,7 +168,7 @@ function Ensure-SelfSignedCert {
         -Type Custom `
         -Subject $Subject `
         -KeyUsage DigitalSignature `
-        -FriendlyName "biliplayRS Dev Self-Signed" `
+        -FriendlyName "QAQ-Bx Dev Self-Signed" `
         -CertStoreLocation "Cert:\CurrentUser\My" `
         -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
 
@@ -160,22 +179,50 @@ function Ensure-SelfSignedCert {
     return @{ Pfx = $pfxPath; Cer = $cerPath }
 }
 
+function Resolve-ToastClsid {
+    param([string]$Requested)
+    if (-not [string]::IsNullOrWhiteSpace($Requested)) {
+        return $Requested.Trim().Trim('{', '}').ToLowerInvariant()
+    }
+    $notifRs = Join-Path $RepoRoot "crates\bili-ui\src\notifications.rs"
+    if (Test-Path $notifRs) {
+        $src = Get-Content $notifRs -Raw
+        if ($src -match 'TOAST_ACTIVATOR_CLSID:\s*&str\s*=\s*"([0-9a-fA-F-]+)"') {
+            return $Matches[1].ToLowerInvariant()
+        }
+    }
+    throw "未能解析 TOAST_ACTIVATOR_CLSID，请在 notifications.rs 中定义或显式传入 -ToastClsid。"
+}
+
 $isRelease = ($Profile -eq "release")
-$packageName = if ($isRelease) { "biliplayRS" } else { "biliplayRS-dev" }
-$displayName = if ($isRelease) { "biliplayRS" } else { "biliplayRS (Dev)" }
+$resolvedPackageName = if (-not [string]::IsNullOrWhiteSpace($PackageName)) {
+    $PackageName.Trim()
+} elseif ($isRelease) {
+    "QAQ-Bx"
+} else {
+    "QAQ-Bx-Dev"
+}
+$resolvedDisplayName = if (-not [string]::IsNullOrWhiteSpace($DisplayName)) {
+    $DisplayName.Trim()
+} elseif ($isRelease) {
+    "QAQ-Bx"
+} else {
+    "QAQ-Bx (Dev)"
+}
+$resolvedToastClsid = Resolve-ToastClsid -Requested $ToastClsid
 $outDir = Join-Path $RepoRoot "package\$Profile"
 $version4 = Resolve-PackageVersion4Part `
     -RequestedVersion $Version `
     -BumpRevision:$AutoBumpRevision `
     -OutDir $outDir `
-    -PackageName $packageName
+    -PackageName $resolvedPackageName
 
 $makeAppx = Find-SdkTool "makeappx.exe"
 if ($Sign) {
     $signTool = Find-SdkTool "signtool.exe"
 }
 
-Write-Host "[build] cargo build $(if ($isRelease) { '--release ' })-p bili-ui (v$version4 / $packageName)" -ForegroundColor Cyan
+Write-Host "[build] cargo build $(if ($isRelease) { '--release ' })-p bili-ui (v$version4 / $resolvedPackageName / CLSID=$resolvedToastClsid)" -ForegroundColor Cyan
 Push-Location $RepoRoot
 try {
     if ($isRelease) {
@@ -193,7 +240,7 @@ try {
 $targetProfileDir = Join-Path $RepoRoot "target\$Profile"
 $stagingDir = Join-Path $RepoRoot "target\appx-staging\$Profile"
 $outDir = Join-Path $RepoRoot "package\$Profile"
-$outAppx = Join-Path $outDir "${packageName}_${version4}_x64.appx"
+$outAppx = Join-Path $outDir "${resolvedPackageName}_${version4}_x64.appx"
 
 if (Test-Path $stagingDir) {
     Remove-Item -Recurse -Force $stagingDir
@@ -243,10 +290,14 @@ Copy-Item -Recurse -Force $assetsSrc (Join-Path $stagingDir "Assets")
 
 $manifestTpl = Get-Content (Join-Path $RepoRoot "packaging\appx\AppxManifest.template.xml") -Raw
 $manifestXml = $manifestTpl `
-    -replace '\{\{PACKAGE_NAME\}\}', $packageName `
-    -replace '\{\{DISPLAY_NAME\}\}', $displayName `
+    -replace '\{\{PACKAGE_NAME\}\}', $resolvedPackageName `
+    -replace '\{\{DISPLAY_NAME\}\}', $resolvedDisplayName `
+    -replace '\{\{SHORT_NAME\}\}', $ShortName `
+    -replace '\{\{DESCRIPTION\}\}', $Description `
     -replace '\{\{PUBLISHER\}\}', $Publisher `
-    -replace '\{\{VERSION\}\}', $version4
+    -replace '\{\{PUBLISHER_DISPLAY_NAME\}\}', $PublisherDisplayName `
+    -replace '\{\{VERSION\}\}', $version4 `
+    -replace '\{\{TOAST_CLSID\}\}', $resolvedToastClsid
 Set-Content -Path (Join-Path $stagingDir "AppxManifest.xml") -Value $manifestXml -Encoding UTF8
 
 # 4. MakeAppx 打包到 /package/<profile>/
@@ -265,7 +316,7 @@ if ($Sign) {
     if ($LASTEXITCODE -ne 0) {
         throw "signtool 签名失败 (exit=$LASTEXITCODE)"
     }
-    $outCer = Join-Path $outDir "${packageName}_${version4}_x64.cer"
+    $outCer = Join-Path $outDir "${resolvedPackageName}_${version4}_x64.cer"
     Copy-Item -Force $certFiles.Cer $outCer
     Write-Host "[cert] 同步输出公钥证书: $outCer" -ForegroundColor Green
 }

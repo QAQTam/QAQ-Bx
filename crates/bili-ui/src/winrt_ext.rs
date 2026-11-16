@@ -55,3 +55,34 @@ pub fn scroll_focused_viewer_by(delta_y: f64) -> bool {
     }
     false
 }
+
+/// 持有已向 Windows App SDK `AppNotificationManager` 注册的通知激活会话。
+pub struct AppNotificationGuard {
+    manager: AppNotificationManager,
+    _revoker: windows_core::EventRevoker,
+}
+
+impl Drop for AppNotificationGuard {
+    fn drop(&mut self) {
+        let _ = self.manager.Unregister();
+    }
+}
+
+/// 注册当前进程的 Windows 应用通知激活器（仅建议在 MSIX 打包运行态调用）。
+pub fn register_app_notifications(
+    on_invoked: std::sync::Arc<dyn Fn() + Send + Sync>,
+) -> Option<AppNotificationGuard> {
+    let manager = AppNotificationManager::Default().ok()?;
+    let revoker = manager
+        .NotificationInvoked(move |_, _| {
+            on_invoked();
+        })
+        .ok()?;
+    if manager.Register().is_err() {
+        return None;
+    }
+    Some(AppNotificationGuard {
+        manager,
+        _revoker: revoker,
+    })
+}

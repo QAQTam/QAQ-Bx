@@ -107,11 +107,17 @@
 | `GET /x/web-interface/history/continuation` | 续播（上次看到哪） | Cookie |
 | `POST /x/click-interface/web/heartbeat?w_*&w_rid&wts` | 播放心跳上报（`w_*` 参数也参与 WBI 签名） | WBI + Cookie |
 | `POST /x/click-interface/click/web/h5` | 播放开始上报 | WBI + Cookie |
+| `GET /x/web-interface/nav/stat` | 个人关注 / 粉丝 / 动态数 | Cookie |
+| `GET /x/relation/{followings,followers}?vmid&pn&ps` | 个人关注 / 粉丝分页列表（含互粉/特别关注/签名） | Cookie |
 | `GET /x/web-interface/dynamic/entrance` | 动态入口红点 | Cookie |
 | `GET /x/relation/relations?fids=` | 关注状态 | Cookie |
 | `GET /x/v2/subtitle/…`、`/x/note/*`（笔记）、`/x/sunflower/*` | 低优先 | — |
 | `GET /x/kv-frontend/namespace/data?appKey=333.1339&…` | 页面配置下发（与播放无关） | 无 |
-| `api.live.bilibili.com/xlive/…`、`api.vc.bilibili.com/…`（私信未读） | 直播/私信 | Cookie |
+| `api.vc.bilibili.com/x/im/web/msgfeed/unread`、`session_svr/single_unread`、`link_setting/get` | 消息中心未读数（回复/@/赞/系统/私信） | Cookie |
+| `GET /x/msgfeed/{reply,at,like}` | 回复 / @我的 / 收到的赞列表 | Cookie |
+| `GET message.bilibili.com/x/sys-msg/{query_unified_notify,query_user_notify,query_notify_list}` | 系统通知列表（含 `{"web":...}` 与 `#{text}{url}`） | Cookie |
+| `GET api.vc.bilibili.com/session_svr/v1/session_svr/get_sessions`、`svr_sync/fetch_session_msgs`、`/x/polymer/pc-electron/v1/user/cards` | 私信会话列表 / 消息记录（WBI）/ 用户名片补全 | Cookie (+ WBI) |
+| `api.live.bilibili.com/xlive/…` | 直播 | Cookie |
 
 风控上报类（可忽略或后续研究）：`/x/internal/gaia-gateway/ExClimbWuzhi|ExClimbCongLing|ExGetAxe`（设备指纹上报，POST）。
 

@@ -91,44 +91,19 @@ impl Route {
     }
 }
 
-/// 非播放页分发（Home / Player / Login 由 AppShell 直接组装，分支仅为穷尽兜底）。
+/// 非播放页分发（Home / Player / Login / Settings 由 AppShell 直接组装，分支仅为穷尽兜底）。
 pub fn route(route: Route, on_open: Callback<String>) -> View {
     match route {
         Route::Popular => pages::popular::popular_page(on_open),
-        Route::Following => pages::stub::stub_page(
-            "关注",
-            "登录后查看关注 UP 的最新动态",
-            "数据源待接入",
-            "动态 feed API 未实现；登录凭据已在本地（bili-plugin-login），接入后此页自动启用。",
-        ),
-        Route::Live => pages::stub::stub_page(
-            "直播",
-            "正在直播的推荐与关注",
-            "数据源待接入",
-            "直播 feed API 未实现，骨架阶段保留空态。",
-        ),
-        Route::Favorites => pages::stub::stub_page(
-            "收藏",
-            "登录账号的收藏夹",
-            "数据源待接入",
-            "收藏夹列表 API 未实现；凭据就绪后接入。",
-        ),
-        Route::History => pages::stub::stub_page(
-            "历史",
-            "观看历史与断点续播",
-            "数据源待接入",
-            "历史记录 API 未实现；断点续播依赖播放进度上报，随视频通道一并接入。",
-        ),
-        Route::WatchLater => pages::stub::stub_page(
-            "稍后再看",
-            "稍后再看列表",
-            "数据源待接入",
-            "稍后再看 API 未实现，骨架阶段保留空态。",
-        ),
+        Route::Following => pages::stub::stub_page("关注", "暂无动态"),
+        Route::Live => pages::stub::stub_page("直播", "暂无直播"),
+        Route::Favorites => pages::stub::stub_page("收藏", "暂无收藏"),
+        Route::History => pages::stub::stub_page("历史", "暂无历史记录"),
+        Route::WatchLater => pages::stub::stub_page("稍后再看", "暂无内容"),
         Route::Search => pages::search::search_page(),
         // Home / Player / Login / Settings 由 shell 直接组装（共享壳层状态与回调）。
         Route::Home | Route::Player | Route::Login | Route::Settings => {
-            pages::stub::stub_page("推荐", "推荐流加载中…", "", "")
+            pages::stub::stub_page("推荐", "加载中…")
         }
     }
 }

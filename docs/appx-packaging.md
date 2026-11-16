@@ -1,6 +1,7 @@
-# biliplay AppX / MSIX 打包设计（v0.0.0.0）
+# QAQ-Bx AppX / MSIX 打包与商店上架准备
 
-> 版本约定：Cargo workspace 版本 `0.0.0`（`Cargo.toml` `[workspace.package].version`），对应 `AppxManifest.xml` 四段式版本号 `0.0.0.0`。
+> 应用正式名：`QAQ-Bx`；开发代号 `biliplay`（可执行文件 `bili-ui.exe`）。
+> 版本约定：Cargo workspace 版本默认 `0.0.0`，正式上架微软商店前须使用非零四段式版本号（例如 `0.1.0.0`）。
 
 ## 1. `windows-reactor-setup` 与打包模式选型
 
@@ -30,93 +31,43 @@
 
 ---
 
-## 2. `AppxManifest.xml` 模板（v0.0.0.0）
+## 2. `AppxManifest` 模板与微软商店 / 通知标识
 
-以**模式 A（自包含）**为例，放置在打包暂存目录根目录（若采用模式 B，则取消注释 `PackageDependency`）：
+完整模板见 `packaging/appx/AppxManifest.template.xml`，核心占位符由 `scripts/package-appx.ps1` 注入：
 
-```xml
-<?xml version="1.0" encoding="utf-8"?>
-<Package
-  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
-  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
-  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap rescap">
-  <Identity
-    Name="Biliplay.Desktop"
-    Publisher="CN=BiliplayDev"
-    Version="0.0.0.0"
-    ProcessorArchitecture="x64" />
-  <Properties>
-    <DisplayName>biliplay</DisplayName>
-    <PublisherDisplayName>BiliplayDev</PublisherDisplayName>
-    <Logo>Assets\StoreLogo.png</Logo>
-  </Properties>
-  <Dependencies>
-    <TargetDeviceFamily
-      Name="Windows.Desktop"
-      MinVersion="10.0.17763.0"
-      MaxVersionTested="10.0.26100.0" />
-    <!-- 模式 B（非自包含）时启用：
-    <PackageDependency
-      Name="Microsoft.WindowsAppRuntime.2"
-      MinVersion="2.0.1.0"
-      Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
-    -->
-  </Dependencies>
-  <Resources>
-    <Resource Language="zh-cn" />
-  </Resources>
-  <Applications>
-    <Application
-      Id="App"
-      Executable="bili-ui.exe"
-      EntryPoint="Windows.FullTrustApplication">
-      <uap:VisualElements
-        DisplayName="biliplay"
-        Description="biliplay Desktop Client"
-        BackgroundColor="transparent"
-        Square150x150Logo="Assets\Square150x150Logo.png"
-        Square44x44Logo="Assets\Square44x44Logo.png" />
-    </Application>
-  </Applications>
-  <Capabilities>
-    <Capability Name="internetClient" />
-    <rescap:Capability Name="runFullTrust" />
-  </Capabilities>
-</Package>
-```
+1. **Microsoft Store 产品标识（Partner Center → 产品管理 → 产品标识，上架前填入）**：
+   - `{{PACKAGE_NAME}}`：Store 分配的包系列名，如 `YourPartnerName.QAQ-Bx`（本地默认 `QAQ-Bx` / `QAQ-Bx-Dev`）
+   - `{{PUBLISHER}}`：Store 分配的 Publisher ID，如 `CN=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX`（本地默认 `CN=QAQ`）
+   - `{{PUBLISHER_DISPLAY_NAME}}`：Partner Center 账户发布者显示名（本地默认 `QAQ`）
+   - `{{DISPLAY_NAME}}` / `{{SHORT_NAME}}` / `{{DESCRIPTION}}`：`QAQ-Bx`
+2. **Windows Toast / App Notifications 标识**：
+   - `ToastActivatorCLSID`：`133f6e22-a3f9-483c-9839-0be521534e66`（与 `crates/bili-ui/src/notifications.rs` 中的 `TOAST_ACTIVATOR_CLSID` 单源同步）。
+   - 在清单中声明 `<desktop:Extension Category="windows.toastNotificationActivation">` 与 `<com:Extension Category="windows.comServer">`（`Arguments="----AppNotificationActivated:"`）；打包态 AUMID 由系统自动派生为 `<PackageFamilyName>!App`，非打包态通过 `SetCurrentProcessExplicitAppUserModelID("QAQ.QAQ-Bx")` 绑定。
 
 ---
 
-## 3. biliplay 专项适配要点
+## 3. QAQ-Bx 专项适配要点
 
 1. **`libmpv-2.dll` 随包分发**：
    - `bili-video` 通过 `LoadLibraryW("libmpv-2.dll")` 动态加载播放器引擎（优先搜索 exe 同级目录）。
    - 打包暂存时需将 `libmpv-2.dll` 复制到 `bili-ui.exe` 同级目录。
-2. **可写数据目录重定向（关键）**：
-   - 当前 `bili_core::resolve_data_dir()` 默认回退到 `<cwd>/data`（用于存放登录凭据、ticket 与设置）。
-   - 在 MSIX/AppX 容器内，安装目录（`WindowsApps\...`）为**只读**。正式出包前需在 `resolve_data_dir()`（或 `bili-ui` 启动入口）检测打包运行态（如 `GetCurrentPackageFullName`），将默认数据目录切至 `%LOCALAPPDATA%\biliplay\data`（或 `ApplicationData.Current.LocalFolder`）。
-3. **图标资源（`Assets\`）**：
-   - 需准备 `StoreLogo.png`（50×50）、`Square44x44Logo.png`（44×44）、`Square150x150Logo.png`（150×150）。
+2. **可写数据目录重定向**：
+   - MSIX/AppX 容器内安装目录只读，`bili_core::resolve_data_dir()` 通过 `GetCurrentPackageFullName` 检测到打包运行态时，自动切至 `%LOCALAPPDATA%\QAQ-Bx\data`（若历史 `%LOCALAPPDATA%\biliplay\data` 已存在则兼容沿用）。
+3. **图标资源（`Assets\` + `store\` + EXEs）**：
+   - AppX 清单磁贴与图标：`packaging/appx/Assets/` 包含 `StoreLogo.png`（50×50）、`Square44x44Logo.png`（44×44）、`Square71x71Logo.png`（71×71）、`Square150x150Logo.png`（150×150）、`Wide310x150Logo.png`（310×150）及多分辨率 `QAQ-Bx.ico`（同时通过 `build.rs` 内嵌进 `bili-ui.exe` 资源 ID 1，标题栏另嵌入 48×48 PNG）。
+   - 微软商店列表素材：`packaging/store/QAQ-Bx-1024.png`（1024×1024）与 `packaging/store/QAQ-Bx-300.png`（300×300）。
 
 ---
 
 ## 4. 打包与签名流程
 
 ```powershell
-# 1. Release 编译（启用 windows-reactor-setup 时会自动部署 WinAppSDK 运行时）
-cargo build --release -p bili-ui
+# 1. 本地调试包（debug + 自签名，自动递增 revision）
+just dev
 
-# 2. 组装暂存目录 target\appx-staging\
-#    - target\release\bili-ui.exe
-#    - target\release\*.dll 及运行时子目录（由 windows-reactor-setup 生成）
-#    - libmpv-2.dll
-#    - AppxManifest.xml（Version="0.0.0.0"）
-#    - Assets\*.png
+# 2. 微软商店上架包（无签名 Release .appx，填入 Partner Center 产品标识与非零版本）
+just store pkg="YourPartnerName.QAQ-Bx" pub="CN=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX" pub_name="YourPublisher" ver="0.1.0"
 
-# 3. 使用 Windows SDK MakeAppx 打包
-makeappx.exe pack /o /d target\appx-staging /p target\biliplay_0.0.0.0_x64.msix
-
-# 4. 自签名测试证书签名（Publisher 需与 AppxManifest.xml <Identity Publisher="..." /> 一致）
-signtool.exe sign /fd SHA256 /a /f biliplay-dev.pfx /p <password> target\biliplay_0.0.0.0_x64.msix
+# 3. 本地 Release 自签名侧载包
+just release-sign 0.1.0
 ```

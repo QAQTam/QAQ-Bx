@@ -16,12 +16,15 @@ use serde::Deserialize;
 
 use crate::credentials::{CredentialProvider, Credentials};
 use crate::error::{BiliError, Result};
-use crate::httpx::build_cookie_header;
-use crate::loose::{i64_any, u64_any};
+use crate::httpx::{build_cookie_header, get_json_with_referer, get_json_with_ticket};
+use crate::loose::{f64_any_or_zero, i64_any, opt_u64_any, u64_any};
 use crate::ticket::TicketManager;
 use crate::wbi::BROWSER_UA;
 
 const NAV_URL: &str = "https://api.bilibili.com/x/web-interface/nav";
+const NAV_STAT_URL: &str = "https://api.bilibili.com/x/web-interface/nav/stat";
+const RELATIONS_FOLLOWINGS_URL: &str = "https://api.bilibili.com/x/relation/followings";
+const RELATIONS_FOLLOWERS_URL: &str = "https://api.bilibili.com/x/relation/followers";
 /// 与 WBI 密钥轮换节奏对齐（服务器约每日轮换），到期强制重拉。
 const NAV_TTL: Duration = Duration::from_secs(24 * 3600);
 
@@ -71,9 +74,18 @@ pub struct UserProfile {
     /// 头像 URL（位图下载仍由 UI 侧 image_cache 负责，不进契约层）。
     pub face: String,
     pub level: u8,
+    pub current_exp: u64,
+    /// 升级所需总经验（Lv6 为 `None`，服务端返回 `"--"`）。
+    pub next_exp: Option<u64>,
+    /// 硬币数（nav `money`）。
+    pub coins: f64,
     pub vip: VipStatus,
+    /// 会员展示标签（优先服务端 `vip_label.text`，兜底 `vip.label()`）。
+    pub vip_label: String,
     /// 大会员到期时间（毫秒 unix；0 表示无）。
     pub vip_due_date: u64,
+    /// 认证头衔（`official.role > 0` 时非空）。
+    pub official_title: String,
 }
 
 impl UserProfile {
@@ -83,6 +95,60 @@ impl UserProfile {
     }
 }
 
+/// 账号关系与动态计数（`GET /x/web-interface/nav/stat`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct AccountStat {
+    #[serde(default, deserialize_with = "u64_any")]
+    pub following: u64,
+    #[serde(default, deserialize_with = "u64_any")]
+    pub follower: u64,
+    #[serde(default, deserialize_with = "u64_any")]
+    pub dynamic_count: u64,
+}
+
+/// 关系列表类型：关注 / 粉丝。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RelationKind {
+    Following,
+    Follower,
+}
+
+/// 关注/粉丝列表中的单个账号摘要。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationUser {
+    pub mid: u64,
+    pub uname: String,
+    pub face: String,
+    pub sign: String,
+    /// `2` = 已关注，`6` = 已互粉。
+    pub attribute: i64,
+    pub special: bool,
+    pub official_desc: String,
+    pub vip_label: String,
+    pub mtime: i64,
+}
+
+impl RelationUser {
+    /// 用户空间主页 URL（`mid` 直接拼接）。
+    pub fn space_url(&self) -> String {
+        format!("https://space.bilibili.com/{}", self.mid)
+    }
+
+    /// 是否为互相关注（`attribute == 6`）。
+    pub fn is_mutual(&self) -> bool {
+        self.attribute == 6
+    }
+}
+
+/// 单页关系列表（`GET /x/relation/{followings,followers}`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RelationPage {
+    pub items: Vec<RelationUser>,
+    pub total: u64,
+    pub next_pn: u32,
+    pub has_more: bool,
+}
+
 // ---------- nav 原始响应（私有，宽松解析） ----------
 
 #[derive(Debug, Default, Deserialize)]
@@ -90,6 +156,24 @@ struct LevelInfo {
     /// 数字或字符串均可能出现，统一宽松解析后收敛到 u8。
     #[serde(default, deserialize_with = "i64_any")]
     current_level: i64,
+    #[serde(default, deserialize_with = "opt_u64_any")]
+    current_exp: Option<u64>,
+    #[serde(default, deserialize_with = "opt_u64_any")]
+    next_exp: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OfficialInfo {
+    #[serde(default, deserialize_with = "i64_any")]
+    role: i64,
+    #[serde(default)]
+    title: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct VipLabelInfo {
+    #[serde(default)]
+    text: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -112,6 +196,10 @@ struct NavData {
     face: String,
     #[serde(default)]
     level_info: LevelInfo,
+    #[serde(default, deserialize_with = "f64_any_or_zero")]
+    money: f64,
+    #[serde(default)]
+    official: OfficialInfo,
     #[serde(default)]
     wbi_img: WbiImg,
     #[serde(default, rename = "vipStatus", deserialize_with = "i64_any")]
@@ -120,6 +208,100 @@ struct NavData {
     vip_type: i64,
     #[serde(default, rename = "vipDueDate", deserialize_with = "u64_any")]
     vip_due_date: u64,
+    #[serde(default)]
+    vip_label: VipLabelInfo,
+}
+
+fn default_official_type() -> i64 {
+    -1
+}
+
+#[derive(Debug, Deserialize)]
+struct OfficialVerifyRaw {
+    #[serde(default = "default_official_type", rename = "type", deserialize_with = "i64_any")]
+    kind: i64,
+    #[serde(default)]
+    desc: String,
+}
+
+impl Default for OfficialVerifyRaw {
+    fn default() -> Self {
+        Self { kind: -1, desc: String::new() }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RelationVipRaw {
+    #[serde(default, rename = "vipStatus", deserialize_with = "i64_any")]
+    vip_status: i64,
+    #[serde(default)]
+    label: VipLabelInfo,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RelationUserRaw {
+    #[serde(default, deserialize_with = "u64_any")]
+    mid: u64,
+    #[serde(default)]
+    uname: String,
+    #[serde(default)]
+    face: String,
+    #[serde(default)]
+    sign: String,
+    #[serde(default, deserialize_with = "i64_any")]
+    attribute: i64,
+    #[serde(default, deserialize_with = "i64_any")]
+    special: i64,
+    #[serde(default)]
+    official_verify: OfficialVerifyRaw,
+    #[serde(default)]
+    vip: RelationVipRaw,
+    #[serde(default, deserialize_with = "i64_any")]
+    mtime: i64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RelationData {
+    #[serde(default)]
+    list: Vec<RelationUserRaw>,
+    #[serde(default, deserialize_with = "u64_any")]
+    total: u64,
+}
+
+impl RelationPage {
+    fn from_raw(raw: RelationData, pn: u32, ps: u32) -> Self {
+        let items: Vec<RelationUser> = raw
+            .list
+            .into_iter()
+            .filter(|u| u.mid > 0)
+            .map(|u| RelationUser {
+                mid: u.mid,
+                uname: u.uname,
+                face: u.face.replacen("http://", "https://", 1),
+                sign: u.sign.trim().to_string(),
+                attribute: u.attribute,
+                special: u.special == 1,
+                official_desc: if u.official_verify.kind >= 0 {
+                    u.official_verify.desc.trim().to_string()
+                } else {
+                    String::new()
+                },
+                vip_label: if u.vip.vip_status == 1 {
+                    u.vip.label.text.trim().to_string()
+                } else {
+                    String::new()
+                },
+                mtime: u.mtime,
+            })
+            .collect();
+        let has_more = !items.is_empty() && (pn as u64).saturating_mul(ps as u64) < raw.total;
+        Self {
+            items,
+            total: raw.total,
+            next_pn: pn.saturating_add(1),
+            has_more,
+        }
+    }
 }
 
 // ---------- nav 快照 ----------
@@ -272,6 +454,18 @@ impl NavClient {
         } else {
             VipStatus::None
         };
+        let vip_label = if !vip.is_vip() {
+            String::new()
+        } else if !data.vip_label.text.trim().is_empty() {
+            data.vip_label.text.trim().to_string()
+        } else {
+            vip.label().to_string()
+        };
+        let official_title = if data.official.role > 0 {
+            data.official.title.trim().to_string()
+        } else {
+            String::new()
+        };
         Ok(NavSnapshot {
             wbi_img_url: data.wbi_img.img_url,
             wbi_sub_url: data.wbi_img.sub_url,
@@ -281,11 +475,48 @@ impl NavClient {
                 uname: data.uname,
                 face: data.face,
                 level: data.level_info.current_level.clamp(0, u8::MAX as i64) as u8,
+                current_exp: data.level_info.current_exp.unwrap_or(0),
+                next_exp: data.level_info.next_exp,
+                coins: data.money.max(0.0),
                 vip,
+                vip_label,
                 vip_due_date: data.vip_due_date,
+                official_title,
             },
             fetched_at: Instant::now(),
         })
+    }
+
+    /// 拉取当前登录账号的关注/粉丝/动态计数（`/x/web-interface/nav/stat`）。
+    pub async fn fetch_stat(&self) -> Result<AccountStat> {
+        get_json_with_ticket(&self.http, &self.creds, self.ticket.as_deref(), NAV_STAT_URL).await
+    }
+
+    /// 分页拉取指定账号的关注或粉丝列表（`pn` 从 1 起，按 `mtime` 降序）。
+    pub async fn fetch_relations(
+        &self,
+        mid: u64,
+        kind: RelationKind,
+        pn: u32,
+        ps: u32,
+    ) -> Result<RelationPage> {
+        let pn = pn.max(1);
+        let ps = ps.clamp(1, 50);
+        let (url, referer_tab) = match kind {
+            RelationKind::Following => (
+                format!("{RELATIONS_FOLLOWINGS_URL}?vmid={mid}&pn={pn}&ps={ps}&order=desc"),
+                "follow",
+            ),
+            RelationKind::Follower => (
+                format!("{RELATIONS_FOLLOWERS_URL}?vmid={mid}&pn={pn}&ps={ps}"),
+                "fans",
+            ),
+        };
+        let referer = format!("https://space.bilibili.com/{mid}/fans/{referer_tab}");
+        let raw: RelationData =
+            get_json_with_referer(&self.http, &self.creds, self.ticket.as_deref(), &url, &referer)
+                .await?;
+        Ok(RelationPage::from_raw(raw, pn, ps))
     }
 
     /// 仅读内存缓存的用户资料，不发 IO、不报错（UI 渲染 / 清晰度档位判断用）。
@@ -378,5 +609,149 @@ mod tests {
         assert!(!d.is_login);
         assert!(d.wbi_img.img_url.ends_with("a.png"));
         assert!(d.wbi_img.sub_url.ends_with("b.png"));
+    }
+
+    #[test]
+    fn nav_parses_lv6_dash_next_exp_coins_official_and_stat() {
+        let json = r#"{
+            "isLogin": true,
+            "mid": 100000000,
+            "uname": "测试账号",
+            "face": "https://i1.hdslb.com/bfs/face/x.jpg",
+            "level_info": { "current_level": 6, "current_exp": 45701, "next_exp": "--" },
+            "money": 125.1,
+            "official": { "role": 2, "title": "知名UP主" },
+            "vipStatus": 1,
+            "vipType": 1,
+            "vipDueDate": 1795363200000,
+            "vip_label": { "text": "大会员" }
+        }"#;
+        let d: NavData = serde_json::from_str(json).unwrap();
+        assert_eq!(d.level_info.current_exp, Some(45701));
+        assert_eq!(d.level_info.next_exp, None);
+        assert!((d.money - 125.1).abs() < f64::EPSILON);
+        assert_eq!(d.official.role, 2);
+        assert_eq!(d.official.title, "知名UP主");
+        assert_eq!(d.vip_label.text, "大会员");
+
+        let stat: AccountStat =
+            serde_json::from_str(r#"{"following":168,"follower":"7","dynamic_count":5}"#).unwrap();
+        assert_eq!(
+            stat,
+            AccountStat {
+                following: 168,
+                follower: 7,
+                dynamic_count: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn relation_list_parses_mutual_vip_official_and_pagination() {
+        let json = r#"{
+            "list": [
+                {
+                    "mid": "147546636",
+                    "attribute": 2,
+                    "special": 1,
+                    "mtime": 1794240869,
+                    "uname": "无畏契约",
+                    "face": "http://i0.hdslb.com/bfs/face/a.jpg",
+                    "sign": "  官方账号签名  ",
+                    "official_verify": { "type": 1, "desc": "官方账号" },
+                    "vip": { "vipStatus": 1, "label": { "text": "年度大会员" } }
+                },
+                {
+                    "mid": 403696152,
+                    "attribute": 6,
+                    "special": 0,
+                    "mtime": 1768872016,
+                    "uname": "千羽风笙",
+                    "face": "https://i0.hdslb.com/bfs/face/b.jpg",
+                    "sign": "",
+                    "official_verify": { "type": -1, "desc": "" },
+                    "vip": { "vipStatus": 0, "label": { "text": "旧标签" } }
+                }
+            ],
+            "total": 168
+        }"#;
+        let raw: RelationData = serde_json::from_str(json).unwrap();
+        let page = RelationPage::from_raw(raw, 1, 20);
+        assert_eq!(page.total, 168);
+        assert_eq!(page.next_pn, 2);
+        assert!(page.has_more);
+        assert_eq!(page.items.len(), 2);
+
+        assert_eq!(page.items[0].mid, 147546636);
+        assert_eq!(page.items[0].face, "https://i0.hdslb.com/bfs/face/a.jpg");
+        assert_eq!(page.items[0].sign, "官方账号签名");
+        assert!(!page.items[0].is_mutual());
+        assert!(page.items[0].special);
+        assert_eq!(page.items[0].official_desc, "官方账号");
+        assert_eq!(page.items[0].vip_label, "年度大会员");
+        assert_eq!(
+            page.items[0].space_url(),
+            "https://space.bilibili.com/147546636"
+        );
+
+        assert!(page.items[1].is_mutual());
+        assert!(!page.items[1].special);
+        assert_eq!(page.items[1].official_desc, "");
+        assert_eq!(page.items[1].vip_label, "");
+
+        let last_raw: RelationData = serde_json::from_str(
+            r#"{"list":[{"mid":1,"uname":"u"}],"total":45}"#,
+        )
+        .unwrap();
+        let last_page = RelationPage::from_raw(last_raw, 3, 20);
+        assert!(!last_page.has_more);
+    }
+
+    #[tokio::test]
+    #[ignore = "需本地已登录凭据（data/credentials.json）且访问真实 B 站接口"]
+    async fn live_relations_smoke() {
+        use crate::credentials::FileCredentialStore;
+        use crate::storage::resolve_data_dir;
+        use crate::ticket::{FileTicketStore, TICKET_FILE};
+
+        let data_dir = resolve_data_dir();
+        let store = Arc::new(FileCredentialStore::new(data_dir.join("credentials.json")));
+        let creds = Arc::new(crate::credentials::DefaultCredentialProvider::new(store));
+        let http = reqwest::Client::builder()
+            .user_agent(BROWSER_UA)
+            .build()
+            .unwrap();
+        let ticket = Arc::new(TicketManager::new(
+            http.clone(),
+            creds.clone(),
+            Some(Arc::new(FileTicketStore::new(data_dir.join(TICKET_FILE)))),
+        ));
+        let _ = ticket.ensure().await;
+        let nav = NavClient::with_ticket(http, creds, ticket);
+        let snap = nav.snapshot().await.expect("nav snapshot");
+        assert!(snap.profile.is_login);
+
+        let followings = nav
+            .fetch_relations(snap.profile.mid, RelationKind::Following, 1, 20)
+            .await
+            .expect("followings");
+        println!(
+            "followings={} total={} has_more={} first={:?}",
+            followings.items.len(),
+            followings.total,
+            followings.has_more,
+            followings.items.first().map(|u| &u.uname)
+        );
+        let followers = nav
+            .fetch_relations(snap.profile.mid, RelationKind::Follower, 1, 20)
+            .await
+            .expect("followers");
+        println!(
+            "followers={} total={} has_more={} first={:?}",
+            followers.items.len(),
+            followers.total,
+            followers.has_more,
+            followers.items.first().map(|u| (&u.uname, u.is_mutual()))
+        );
     }
 }
