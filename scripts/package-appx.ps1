@@ -19,6 +19,10 @@ param(
 
     [switch]$Sign,
 
+    [string]$Version = "",
+
+    [switch]$AutoBumpRevision,
+
     [string]$Publisher = "CN=BiliplayDev",
 
     [string]$CertPassword = "biliplay-dev"
@@ -45,12 +49,86 @@ function Find-SdkTool {
     throw "未找到 Windows SDK 工具: $ToolName，请安装 Windows 10/11 SDK。"
 }
 
-function Get-WorkspaceVersion4Part {
+function Get-WorkspaceVersion3Part {
     $cargoToml = Get-Content (Join-Path $RepoRoot "Cargo.toml") -Raw
     if ($cargoToml -match '(?ms)\[workspace\.package\].*?version\s*=\s*"(\d+\.\d+\.\d+)"') {
-        return "$($Matches[1]).0"
+        return $Matches[1]
     }
     throw "无法从 Cargo.toml 解析 [workspace.package].version"
+}
+
+function Set-WorkspaceVersion3Part {
+    param([string]$NewVer3)
+    $cargoPath = Join-Path $RepoRoot "Cargo.toml"
+    $cargoToml = Get-Content $cargoPath -Raw
+    $updated = [regex]::Replace(
+        $cargoToml,
+        '(?ms)(\[workspace\.package\].*?version\s*=\s*")\d+\.\d+\.\d+(")',
+        "`${1}$NewVer3`${2}",
+        1
+    )
+    if ($updated -ne $cargoToml) {
+        Set-Content -Path $cargoPath -Value $updated -Encoding UTF8 -NoNewline
+        Write-Host "[ver] 已更新 Cargo.toml [workspace.package].version = $NewVer3" -ForegroundColor Cyan
+    }
+}
+
+function Resolve-PackageVersion4Part {
+    param(
+        [string]$RequestedVersion,
+        [switch]$BumpRevision,
+        [string]$OutDir,
+        [string]$PackageName
+    )
+    $ver3 = Get-WorkspaceVersion3Part
+    $rev = 0
+
+    if (-not [string]::IsNullOrWhiteSpace($RequestedVersion)) {
+        $trimmed = $RequestedVersion.Trim()
+        if ($trimmed -match '^(\d+\.\d+\.\d+)\.(\d+)$') {
+            $ver3 = $Matches[1]
+            $rev = [int]$Matches[2]
+            Set-WorkspaceVersion3Part -NewVer3 $ver3
+        } elseif ($trimmed -match '^(\d+\.\d+\.\d+)$') {
+            $ver3 = $Matches[1]
+            Set-WorkspaceVersion3Part -NewVer3 $ver3
+        } else {
+            throw "无效版本号 '$RequestedVersion'，请使用 X.Y.Z 或 X.Y.Z.R 格式。"
+        }
+    }
+
+    if ($BumpRevision) {
+        $pkgRoot = Join-Path $RepoRoot "package"
+        New-Item -ItemType Directory -Force -Path $pkgRoot | Out-Null
+        $seqFile = Join-Path $pkgRoot ".dev-revision"
+        $maxRev = 0
+
+        if (Test-Path $seqFile) {
+            $line = (Get-Content $seqFile -Raw).Trim()
+            if ($line -match '^(\d+\.\d+\.\d+):(\d+)$' -and $Matches[1] -eq $ver3) {
+                $maxRev = [int]$Matches[2]
+            }
+        }
+
+        if (Test-Path $OutDir) {
+            $escapedPkg = [regex]::Escape($PackageName)
+            $escapedVer3 = [regex]::Escape($ver3)
+            Get-ChildItem -Path $OutDir -Filter "*.appx" -ErrorAction SilentlyContinue | ForEach-Object {
+                if ($_.Name -match "^${escapedPkg}_${escapedVer3}\.(\d+)_") {
+                    $fileRev = [int]$Matches[1]
+                    if ($fileRev -gt $maxRev) { $maxRev = $fileRev }
+                }
+            }
+        }
+
+        $rev = $maxRev + 1
+        if ($rev -gt 65535) {
+            throw "AppX Revision 段 ($rev) 超出 Windows 限制 (0..65535)，请递增前 3 位版本号。"
+        }
+        Set-Content -Path $seqFile -Value "${ver3}:${rev}" -Encoding UTF8 -NoNewline
+    }
+
+    return "${ver3}.${rev}"
 }
 
 function Ensure-SelfSignedCert {
@@ -82,10 +160,15 @@ function Ensure-SelfSignedCert {
     return @{ Pfx = $pfxPath; Cer = $cerPath }
 }
 
-$version4 = Get-WorkspaceVersion4Part
 $isRelease = ($Profile -eq "release")
 $packageName = if ($isRelease) { "biliplayRS" } else { "biliplayRS-dev" }
 $displayName = if ($isRelease) { "biliplayRS" } else { "biliplayRS (Dev)" }
+$outDir = Join-Path $RepoRoot "package\$Profile"
+$version4 = Resolve-PackageVersion4Part `
+    -RequestedVersion $Version `
+    -BumpRevision:$AutoBumpRevision `
+    -OutDir $outDir `
+    -PackageName $packageName
 
 $makeAppx = Find-SdkTool "makeappx.exe"
 if ($Sign) {
