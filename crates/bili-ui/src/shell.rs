@@ -19,6 +19,7 @@ use windows_reactor::*;
 use crate::auth::{Auth, AuthState, FlowCell, LoginFlowState, PollOutcome, ProbeReport};
 use crate::data::{self, VideoItem};
 use crate::feed_pager;
+use crate::gamepad::{self, GamepadAction, GamepadEvent};
 use crate::image_cache::ImageCache;
 use crate::pages;
 use crate::router::{self, Route, NAV_ROUTES};
@@ -215,6 +216,10 @@ pub struct AppShell {
     smtc_rx: Option<Arc<Mutex<std::sync::mpsc::Receiver<SmtcCommand>>>>,
     smtc_bvid: Option<String>,
     smtc_playing: Option<bool>,
+    /// Xbox 手柄（XInput）连接与激活状态。
+    gamepad_active: bool,
+    gamepad_rx: Arc<Mutex<std::sync::mpsc::Receiver<GamepadEvent>>>,
+    home_focus_idx: usize,
 }
 
 #[derive(Clone)]
@@ -248,6 +253,8 @@ pub enum Message {
     ClosePlayer,
     /// Windows 控制中心媒体按钮回调（None 表示通道已关闭）。
     SmtcAction(Option<SmtcCommand>),
+    /// Xbox 手柄事件回调（None 表示通道已关闭）。
+    GamepadInput(Option<GamepadEvent>),
 
     // ---- 首页推荐流与 Hover 预解析 ----
     /// 换一换（Refresh 语义：清流 + 预分配首批骨架 + 重发）。
@@ -602,6 +609,122 @@ impl AppShell {
             .unwrap_or(item.duration_secs)
     }
 
+    fn listen_gamepad(rx: &Arc<Mutex<std::sync::mpsc::Receiver<GamepadEvent>>>, context: &ComponentContext<Self>) {
+        let rx = Arc::clone(rx);
+        context.spawn_background(move |_| {
+            let ev = rx.lock().ok().and_then(|guard| guard.recv().ok());
+            Message::GamepadInput(ev)
+        });
+    }
+
+    fn focused_home_video(&self) -> Option<&VideoItem> {
+        let mut videos = self.home_slots.iter().filter_map(|slot| match slot {
+            HomeSlot::Video { item, .. } => Some(item),
+            HomeSlot::Skeleton { .. } => None,
+        });
+        let count = self
+            .home_slots
+            .iter()
+            .filter(|slot| matches!(slot, HomeSlot::Video { .. }))
+            .count();
+        if count == 0 {
+            return None;
+        }
+        videos.nth(self.home_focus_idx.min(count - 1))
+    }
+
+    fn cycle_nav_route(&mut self, delta: isize) {
+        let current_idx = NAV_ROUTES.iter().position(|&r| r == self.route).unwrap_or(0) as isize;
+        let len = NAV_ROUTES.len() as isize;
+        let next_idx = ((current_idx + delta).rem_euclid(len)) as usize;
+        let next_route = NAV_ROUTES[next_idx];
+        if next_route != self.route {
+            self.history.push(self.route);
+            self.route = next_route;
+        }
+    }
+
+    fn handle_gamepad_action(&mut self, action: GamepadAction, context: &ComponentContext<Self>) {
+        match action {
+            GamepadAction::PrevTab => self.cycle_nav_route(-1),
+            GamepadAction::NextTab => self.cycle_nav_route(1),
+            GamepadAction::Back => {
+                if self.route == Route::Player {
+                    self.route = self.history.pop().unwrap_or(Route::Home);
+                } else if let Some(prev) = self.history.pop() {
+                    self.route = prev;
+                }
+            }
+            GamepadAction::TogglePlay => {
+                self.update(Message::TogglePlay, context);
+            }
+            GamepadAction::Refresh => {
+                if self.route == Route::Home {
+                    self.update(Message::HomeRefresh, context);
+                    self.home_focus_idx = 0;
+                }
+            }
+            GamepadAction::Confirm => {
+                if self.route == Route::Player {
+                    self.update(Message::TogglePlay, context);
+                } else if self.route == Route::Home
+                    && let Some(bvid) = self.focused_home_video().map(|v| v.bvid.clone())
+                {
+                    self.open_video(&bvid, context);
+                    self.sync_smtc(context);
+                }
+            }
+            GamepadAction::Left => {
+                if self.route == Route::Player {
+                    let target = f64::from(self.position.saturating_sub(10));
+                    self.update(Message::Seek(target), context);
+                } else if self.route == Route::Home {
+                    self.home_focus_idx = self.home_focus_idx.saturating_sub(1);
+                }
+            }
+            GamepadAction::Right => {
+                if self.route == Route::Player {
+                    let target = f64::from(self.position.saturating_add(10));
+                    self.update(Message::Seek(target), context);
+                } else if self.route == Route::Home {
+                    let count = self
+                        .home_slots
+                        .iter()
+                        .filter(|s| matches!(s, HomeSlot::Video { .. }))
+                        .count();
+                    if count > 0 {
+                        self.home_focus_idx = (self.home_focus_idx + 1).min(count - 1);
+                    }
+                }
+            }
+            GamepadAction::Up => {
+                if self.route == Route::Player {
+                    let vol = f64::from((self.volume + 5).min(100));
+                    self.update(Message::SetVolume(vol), context);
+                } else if self.route == Route::Home {
+                    let cols = self.home_state.grid_cols.max(1);
+                    self.home_focus_idx = self.home_focus_idx.saturating_sub(cols);
+                }
+            }
+            GamepadAction::Down => {
+                if self.route == Route::Player {
+                    let vol = f64::from(self.volume.saturating_sub(5));
+                    self.update(Message::SetVolume(vol), context);
+                } else if self.route == Route::Home {
+                    let cols = self.home_state.grid_cols.max(1);
+                    let count = self
+                        .home_slots
+                        .iter()
+                        .filter(|s| matches!(s, HomeSlot::Video { .. }))
+                        .count();
+                    if count > 0 {
+                        self.home_focus_idx = (self.home_focus_idx + cols).min(count - 1);
+                    }
+                }
+            }
+        }
+    }
+
     fn listen_smtc(&self, context: &ComponentContext<Self>) {
         let Some(rx) = &self.smtc_rx else {
             return;
@@ -887,6 +1010,9 @@ impl Component for AppShell {
             &home_on_row_active,
         );
 
+        let gamepad_rx = Arc::new(Mutex::new(gamepad::spawn_gamepad_poller()));
+        Self::listen_gamepad(&gamepad_rx, context);
+
         Self {
             auth_service,
             settings_store,
@@ -953,6 +1079,9 @@ impl Component for AppShell {
             smtc_rx: None,
             smtc_bvid: None,
             smtc_playing: None,
+            gamepad_active: false,
+            gamepad_rx,
+            home_focus_idx: 0,
         }
     }
 
@@ -1139,6 +1268,19 @@ impl Component for AppShell {
                 self.listen_smtc(context);
             }
             Message::SmtcAction(None) => {}
+            Message::GamepadInput(Some(ev)) => {
+                match ev {
+                    GamepadEvent::Connected(connected) => {
+                        self.gamepad_active = connected;
+                    }
+                    GamepadEvent::Action(action) => {
+                        self.gamepad_active = true;
+                        self.handle_gamepad_action(action, context);
+                    }
+                }
+                Self::listen_gamepad(&self.gamepad_rx, context);
+            }
+            Message::GamepadInput(None) => {}
 
             // ---- 首页推荐流与 Hover 预解析 ----
             Message::HomeRefresh => {
@@ -1768,7 +1910,17 @@ impl Component for AppShell {
             .grid_row(1)
             .keyed_menu_items(menu_items)
             .footer_menu_items((account, settings_item))
-            .content(Grid::new().keyed_children([keyed(key, content)]));
+            .content(Grid::new().keyed_children({
+                let mut layers = vec![keyed(key, content)];
+                if self.gamepad_active {
+                    let focus_title = self.focused_home_video().map(|v| v.title.as_str());
+                    layers.push(keyed(
+                        "gamepad-hint",
+                        gamepad::gamepad_hint_bar(self.route, focus_title),
+                    ));
+                }
+                layers
+            }));
 
         let title_bar = TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)

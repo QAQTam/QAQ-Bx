@@ -4,6 +4,7 @@
 mod auth;
 mod data;
 mod feed_pager;
+mod gamepad;
 mod image_cache;
 mod pages;
 mod router;
