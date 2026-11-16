@@ -318,9 +318,9 @@ struct DanmakuFonts {
 impl DanmakuFonts {
     fn new() -> Self {
         Self {
-            small: TextFormat::new("Microsoft YaHei", 16.0),
-            medium: TextFormat::new("Microsoft YaHei", 22.0),
-            large: TextFormat::new("Microsoft YaHei", 30.0),
+            small: TextFormat::new("Noto Sans SC", 16.0),
+            medium: TextFormat::new("Noto Sans SC", 22.0),
+            large: TextFormat::new("Noto Sans SC", 30.0),
         }
     }
 }

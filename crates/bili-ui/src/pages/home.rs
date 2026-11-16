@@ -6,6 +6,7 @@
 
 use windows_reactor::*;
 
+use crate::theme;
 use crate::widgets::video_card;
 
 /// 推荐页展示状态（`AppShell` 单源持有）。
@@ -52,23 +53,9 @@ pub fn home_page(
     let subtitle = if let Some(err) = &state.error {
         format!("加载失败：{err}")
     } else if state.loading && state.video_count == 0 {
-        "正在预热首屏推荐…".to_string()
-    } else if state.reached_end {
-        format!(
-            "{} 个视频 · 共 {} 页（已加载最后一页）",
-            state.video_count,
-            state.page_count.max(1)
-        )
-    } else if state.loading {
-        format!(
-            "{} 个视频 · 已加载 {} 页 · 正在预取下一逻辑页…",
-            state.video_count, state.page_count
-        )
+        "加载中…".to_string()
     } else {
-        format!(
-            "{} 个视频 · 已加载 {} 页（去重后）",
-            state.video_count, state.page_count
-        )
+        format!("{} 个视频", state.video_count)
     };
 
     let refresh_btn = {
@@ -94,7 +81,7 @@ pub fn home_page(
                 .margin(Thickness::new(0.0, 0.0, 0.0, 16.0))
                 .content(
                     Button::new()
-                        .content("加载失败，点击重试")
+                        .content("重试")
                         .on_click(move || on_retry.call(())),
                 )
                 .into(),
@@ -113,11 +100,7 @@ pub fn home_page(
                 .margin(Thickness::new(0.0, 0.0, 0.0, 16.0))
                 .content(
                     TextBlock::new()
-                        .text(format!(
-                            "已经到底了 · 共 {} 个视频（第 {} 页为最后一页）",
-                            state.video_count,
-                            state.page_count.max(1)
-                        ))
+                        .text("没有更多了")
                         .font_size(12.0)
                         .opacity(0.75)
                         .vertical_alignment(VerticalAlignment::Center),
@@ -151,7 +134,7 @@ pub fn home_page(
                             ),
                             View::from(
                                 TextBlock::new()
-                                    .text("正在准备更多推荐…")
+                                    .text("加载更多…")
                                     .font_size(12.0)
                                     .opacity(0.75),
                             ),
@@ -170,14 +153,13 @@ pub fn home_page(
             Grid::new()
                 .columns([GridLength::Star(1.0), GridLength::Auto])
                 .children((
-                    TextBlock::new()
-                        .text("推荐")
+                    theme::text("推荐")
                         .font_size(28.0)
                         .font_weight(FontWeight::BOLD)
                         .vertical_alignment(VerticalAlignment::Center),
                     View::from(refresh_btn.grid_column(1)),
                 )),
-            TextBlock::new().text(subtitle).opacity(0.6),
+            theme::text(subtitle).opacity(0.6),
         )));
 
     // ScrollViewer 直接承载 ItemsRepeater 且不订阅 ViewChanged，防止 WinUI 滚动队列阻塞同步虚拟化测量。

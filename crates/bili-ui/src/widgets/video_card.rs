@@ -438,8 +438,7 @@ fn populated_card_view(item: &VideoItem, is_focused: bool, on_open: &Callback<St
                 .horizontal_alignment(HorizontalAlignment::Right)
                 .vertical_alignment(VerticalAlignment::Bottom)
                 .content(
-                    TextBlock::new()
-                        .text(theme::fmt_duration(item.duration_secs))
+                    theme::text(theme::fmt_duration(item.duration_secs))
                         .foreground(ThemeBrush::PrimaryText)
                         .font_size(11.0),
                 ),
@@ -468,26 +467,22 @@ fn populated_card_view(item: &VideoItem, is_focused: bool, on_open: &Callback<St
                             .margin(Thickness::new(12.0, 10.0, 12.0, 12.0))
                             .spacing(4.0)
                             .children((
-                                TextBlock::new()
-                                    .text(item.title.clone())
+                                theme::text(item.title.clone())
                                     .font_size(14.0)
                                     .font_weight(FontWeight::SEMI_BOLD)
                                     .text_wrapping(TextWrapping::Wrap)
                                     .max_lines(2),
-                                TextBlock::new()
-                                    .text(item.author.clone())
+                                theme::text(item.author.clone())
                                     .font_size(12.0)
                                     .opacity(0.6),
                                 StackPanel::new()
                                     .orientation(Orientation::Horizontal)
                                     .spacing(10.0)
                                     .children((
-                                        TextBlock::new()
-                                            .text(format!("▶ {}", theme::fmt_count(item.play_count)))
+                                        theme::text(format!("▶ {}", theme::fmt_count(item.play_count)))
                                             .font_size(11.0)
                                             .opacity(0.6),
-                                        TextBlock::new()
-                                            .text(format!("弹幕 {}", theme::fmt_count(item.danmaku_count)))
+                                        theme::text(format!("弹幕 {}", theme::fmt_count(item.danmaku_count)))
                                             .font_size(11.0)
                                             .opacity(0.6),
                                     )),
