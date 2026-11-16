@@ -239,6 +239,16 @@ pub fn gamepad_hint_bar(route: Route, focus_title: Option<&str>) -> View {
         );
     }
 
+    items.insert(
+        0,
+        FontIcon::new()
+            .glyph("\u{E7FC}")
+            .font_size(14.0)
+            .foreground(ThemeBrush::AccentText)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into(),
+    );
+
     Border::new()
         .corner_radius(16.0)
         .padding(Thickness::xy(12.0, 6.0))
