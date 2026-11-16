@@ -1,6 +1,6 @@
 //! 设置页：由 AppShell 单源持有并实时持久化到 `data/settings.json`。
 
-use bili_core::settings::{AppSettings, CodecPref, QualityPref};
+use bili_core::settings::{AppSettings, CodecPref, HomeOpenMode, QualityPref};
 use windows_reactor::*;
 
 use crate::theme;
@@ -13,6 +13,7 @@ pub fn settings_page(
 ) -> View {
     let quality_labels: Vec<&'static str> = QualityPref::ALL.iter().map(|q| q.label()).collect();
     let codec_labels: Vec<&'static str> = CodecPref::ALL.iter().map(|c| c.label()).collect();
+    let open_mode_labels: Vec<&'static str> = HomeOpenMode::ALL.iter().map(|m| m.label()).collect();
     let opacity_pct = (settings.danmaku_opacity * 100.0).round().clamp(10.0, 100.0) as i32;
 
     let effective_qn = settings.quality.effective_max_qn(is_vip);
@@ -129,6 +130,20 @@ pub fn settings_page(
         }
     };
 
+    let on_open_mode = {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |idx: Option<usize>| {
+            if let Some(mode) = idx.and_then(HomeOpenMode::from_index)
+                && mode != base.home_open_mode
+            {
+                let mut next = base.clone();
+                next.home_open_mode = mode;
+                cb.call(next);
+            }
+        }
+    };
+
     let card = |content: StackPanel| {
         Border::new()
             .corner_radius(8.0)
@@ -151,6 +166,11 @@ pub fn settings_page(
                 .items_source(codec_labels)
                 .selected_index(settings.codec.index())
                 .on_selection_changed(on_codec),
+            ComboBox::new()
+                .header("首页播放时")
+                .items_source(open_mode_labels)
+                .selected_index(settings.home_open_mode.index())
+                .on_selection_changed(on_open_mode),
             ToggleSwitch::new()
                 .header("自动播放")
                 .on_content("开")

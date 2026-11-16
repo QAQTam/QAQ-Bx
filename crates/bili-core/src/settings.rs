@@ -106,9 +106,9 @@ impl CodecPref {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::AvcFirst => "H.264（兼容优先，软解可硬解）",
-            Self::HevcFirst => "H.265/HEVC（硬解更省）",
-            Self::Av1Experimental => "AV1（实验）",
+            Self::AvcFirst => "H.264",
+            Self::HevcFirst => "H.265 / HEVC",
+            Self::Av1Experimental => "AV1",
         }
     }
 
@@ -136,12 +136,45 @@ pub struct WindowBounds {
     pub maximized: bool,
 }
 
+/// 首页点击视频卡片时的打开方式。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HomeOpenMode {
+    /// 展开全屏（直接进入完整播放页）。
+    #[default]
+    FullPlayer,
+    /// 展开半屏（右侧半窗抽屉：视频面 + 简介 + 评论，无控条，可随时展开进完整播放页）。
+    HalfPane,
+}
+
+impl HomeOpenMode {
+    pub const ALL: [Self; 2] = [Self::FullPlayer, Self::HalfPane];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::FullPlayer => "1. 展开全屏",
+            Self::HalfPane => "2. 展开半屏",
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::FullPlayer => 0,
+            Self::HalfPane => 1,
+        }
+    }
+
+    pub fn from_index(index: usize) -> Option<Self> {
+        Self::ALL.get(index).copied()
+    }
+}
+
 /// 应用全局设置。所有字段皆可在旧配置文件缺失时按默认值补齐。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
     pub quality: QualityPref,
     pub codec: CodecPref,
+    pub home_open_mode: HomeOpenMode,
     pub danmaku_enabled: bool,
     pub danmaku_opacity: f32,
     pub danmaku_max_lanes: usize,
@@ -156,6 +189,7 @@ impl Default for AppSettings {
         Self {
             quality: QualityPref::default(),
             codec: CodecPref::default(),
+            home_open_mode: HomeOpenMode::default(),
             danmaku_enabled: true,
             danmaku_opacity: 0.92,
             danmaku_max_lanes: 10,
@@ -248,6 +282,7 @@ mod tests {
         let custom = AppSettings {
             quality: QualityPref::Q1080P60,
             codec: CodecPref::HevcFirst,
+            home_open_mode: HomeOpenMode::HalfPane,
             danmaku_enabled: false,
             danmaku_opacity: 0.75,
             danmaku_max_lanes: 8,

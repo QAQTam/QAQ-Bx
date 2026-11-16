@@ -45,6 +45,8 @@ const PRERESOLVE_TTL: Duration = Duration::from_secs(180);
 const MAX_PRERESOLVE_CACHE: usize = 16;
 /// 关注/粉丝挂件每页拉取条数。
 const RELATION_PAGE_SIZE: u32 = 20;
+/// TitleBar 应用图标（48×48 透明圆角 PNG，编译期嵌入）。
+const APP_ICON_48_PNG: &[u8] = include_bytes!("../../../packaging/store/QAQ-Bx-48.png");
 /// 同时在飞的 Hover 预解析上限（防连续快速扫过触发风控）。
 const MAX_PRERESOLVE_INFLIGHT: usize = 4;
 /// 离屏封面纹理裁剪窗口（保留当前行上下各 4 屏，更远仅保留轻量元数据）。
@@ -254,6 +256,11 @@ pub struct AppShell {
     gamepad_active: bool,
     gamepad_rx: Arc<Mutex<std::sync::mpsc::Receiver<GamepadEvent>>>,
     home_focus_idx: usize,
+    /// 首页右侧半窗预览是否展开。
+    home_half_pane: bool,
+    /// MSIX / Store 打包运行时的 Windows App Notifications 激活注册句柄。
+    _app_notifications: Option<crate::winrt_ext::AppNotificationGuard>,
+    toast_rx: Option<Arc<Mutex<std::sync::mpsc::Receiver<()>>>>,
 }
 
 #[derive(Clone)]
@@ -285,10 +292,15 @@ pub enum Message {
     MiniNext,
     /// 关闭迷你播放条：停止并销毁惰性 VideoEngine，归还播放底座与 D3D11 内存。
     ClosePlayer,
+    /// 首页右侧半窗预览：展开进入完整播放页 / 关闭半窗。
+    ExpandHalfPane,
+    CloseHalfPane,
     /// Windows 控制中心媒体按钮回调（None 表示通道已关闭）。
     SmtcAction(Option<SmtcCommand>),
     /// Xbox 手柄事件回调（None 表示通道已关闭）。
     GamepadInput(Option<GamepadEvent>),
+    /// Windows Toast 通知激活回调（false 表示通道关闭）。
+    ToastActivated(bool),
 
     // ---- 首页推荐流与 Hover 预解析 ----
     /// 换一换（Refresh 语义：清流 + 预分配首批骨架 + 重发）。
@@ -587,8 +599,17 @@ impl AppShell {
 
     /// 进入播放页:递增播放代次 + 惰性创建引擎 + 优先命中 Hover 预解析缓存 + 否则后台解析(cid 直出仅 1 跳)。
     fn start_playback(&mut self, item: VideoItem, context: &ComponentContext<Self>) {
-        self.history.push(self.route);
-        self.route = Route::Player;
+        if self.route == Route::Home
+            && self.settings.home_open_mode == bili_core::settings::HomeOpenMode::HalfPane
+        {
+            self.home_half_pane = true;
+        } else {
+            self.home_half_pane = false;
+            if self.route != Route::Player {
+                self.history.push(self.route);
+            }
+            self.route = Route::Player;
+        }
         self.playback_gen = self.playback_gen.wrapping_add(1);
         self.pending_open_preresolve = None;
         self.current_meta = None;
@@ -738,6 +759,14 @@ impl AppShell {
         context.spawn_background(move |_| {
             let ev = rx.lock().ok().and_then(|guard| guard.recv().ok());
             Message::GamepadInput(ev)
+        });
+    }
+
+    fn listen_toast(rx: &Arc<Mutex<std::sync::mpsc::Receiver<()>>>, context: &ComponentContext<Self>) {
+        let rx = Arc::clone(rx);
+        context.spawn_background(move |_| {
+            let ok = rx.lock().ok().is_some_and(|guard| guard.recv().is_ok());
+            Message::ToastActivated(ok)
         });
     }
 
@@ -1402,9 +1431,13 @@ impl Component for AppShell {
             .ok()
             .as_deref()
             .and_then(data::find);
-        let route = route
-            .or((now_playing.is_some()).then_some(Route::Player))
-            .unwrap_or(Route::Home);
+        let route = if crate::notifications::launched_from_notification() {
+            Route::Login
+        } else {
+            route
+                .or((now_playing.is_some()).then_some(Route::Player))
+                .unwrap_or(Route::Home)
+        };
 
         // 冒烟播放与点卡同构:仅在 BILIPLAY_VIDEO 指定时才提前创建 VideoEngine；日常启动 0 播放内存占用。
         let mut timer = None;
@@ -1438,6 +1471,19 @@ impl Component for AppShell {
 
         let gamepad_rx = Arc::new(Mutex::new(gamepad::spawn_gamepad_poller()));
         Self::listen_gamepad(&gamepad_rx, context);
+
+        let (notif_tx, notif_rx) = std::sync::mpsc::channel::<()>();
+        let notif_tx = Arc::new(Mutex::new(notif_tx));
+        let app_notifications = crate::notifications::register_if_packaged(Arc::new(move || {
+            if let Ok(tx) = notif_tx.lock() {
+                let _ = tx.send(());
+            }
+        }));
+        let toast_rx = app_notifications.is_some().then(|| {
+            let rx = Arc::new(Mutex::new(notif_rx));
+            Self::listen_toast(&rx, context);
+            rx
+        });
 
         Self {
             auth_service,
@@ -1530,6 +1576,9 @@ impl Component for AppShell {
             gamepad_active: false,
             gamepad_rx,
             home_focus_idx: 0,
+            home_half_pane: false,
+            _app_notifications: app_notifications,
+            toast_rx,
         }
     }
 
@@ -1708,7 +1757,18 @@ impl Component for AppShell {
                 if self.route == Route::Player {
                     self.route = self.history.pop().unwrap_or(Route::Home);
                 }
+                self.home_half_pane = false;
                 self.sync_smtc(context);
+            }
+            Message::ExpandHalfPane => {
+                self.home_half_pane = false;
+                if self.route != Route::Player {
+                    self.history.push(self.route);
+                    self.route = Route::Player;
+                }
+            }
+            Message::CloseHalfPane => {
+                self.home_half_pane = false;
             }
             Message::SmtcAction(Some(cmd)) => {
                 if let Some(engine) = &self.engine {
@@ -1733,6 +1793,13 @@ impl Component for AppShell {
                 self.listen_smtc(context);
             }
             Message::SmtcAction(None) => {}
+            Message::ToastActivated(true) => {
+                if let Some(rx) = self.toast_rx.clone() {
+                    Self::listen_toast(&rx, context);
+                }
+                self.update(Message::OpenNotifications, context);
+            }
+            Message::ToastActivated(false) => {}
             Message::GamepadInput(Some(ev)) => {
                 match ev {
                     GamepadEvent::Connected(connected) => {
@@ -2523,7 +2590,7 @@ impl Component for AppShell {
     }
 
     fn view(&self, _input: &(), context: &mut ViewContext<Self>) -> View {
-        context.window_title("biliplay");
+        context.window_title(crate::notifications::APP_DISPLAY_NAME);
         let mut visuals = WindowVisuals::new()
             .backdrop(WindowBackdrop::Mica)
             .client_size(1280.0, 800.0);
@@ -2684,7 +2751,7 @@ impl Component for AppShell {
             .is_back_button_visible(NavigationViewBackButtonVisible::Collapsed)
             .is_settings_visible(false)
             .always_show_header(false)
-            .pane_title("biliplay")
+            .pane_title(crate::notifications::APP_DISPLAY_NAME)
             .is_pane_open(self.pane_open)
             .on_is_pane_open_changed(context.callback(Message::PaneOpenChanged))
             .on_selected_tag_changed(context.callback(|tag: Option<Rc<str>>| {
@@ -2694,7 +2761,37 @@ impl Component for AppShell {
             .keyed_menu_items(menu_items)
             .footer_menu_items((account, settings_item))
             .content(Grid::new().keyed_children({
-                let mut layers = vec![keyed(key, content)];
+                let mut layers = if self.route == Route::Player {
+                    vec![
+                        keyed("home", self.home_view(context)),
+                        keyed(
+                            key,
+                            Border::new()
+                                .background(ThemeBrush::SolidBackground)
+                                .content(content),
+                        ),
+                    ]
+                } else if self.route == Route::Home && self.home_half_pane {
+                    let mut list = vec![keyed(key, content)];
+                    if let (Some(item), Some(engine)) = (self.now_playing.as_ref(), self.engine.as_ref()) {
+                        list.push(keyed(
+                            format!("half-pane:{}", item.bvid),
+                            View::component::<pages::player::HalfPanePreview>(
+                                pages::player::HalfPaneInput {
+                                    item: item.clone(),
+                                    mount_tick: self.mount_tick,
+                                    notice: self.player_notice.clone(),
+                                    engine: engine.clone(),
+                                    on_expand: context.message(Message::ExpandHalfPane),
+                                    on_close: context.message(Message::CloseHalfPane),
+                                },
+                            ),
+                        ));
+                    }
+                    list
+                } else {
+                    vec![keyed(key, content)]
+                };
                 if self.gamepad_active {
                     let focus_title = self.focused_home_video().map(|v| v.title.as_str());
                     layers.push(keyed(
@@ -2716,7 +2813,8 @@ impl Component for AppShell {
 
         let mut title_bar = TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)
-            .title("biliplay")
+            .icon(Icon::image_data(EncodedImage::from_static(APP_ICON_48_PNG)))
+            .title(crate::notifications::APP_DISPLAY_NAME)
             .subtitle(route_subtitle)
             .is_back_button_visible(true)
             .is_back_button_enabled(!self.history.is_empty())
@@ -2751,8 +2849,9 @@ impl Component for AppShell {
             );
         }
 
-        // 播放页自带全量传输控制 → 隐藏迷你条。
+        // 播放页与半窗预览自带视频画面 → 隐藏迷你条。
         let mini = if self.route != Route::Player
+            && !(self.route == Route::Home && self.home_half_pane)
             && let Some(item) = self.now_playing.as_ref()
         {
             Some(mini_player::mini_player(

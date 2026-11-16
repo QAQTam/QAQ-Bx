@@ -286,7 +286,11 @@ impl Component for PlayerPage {
                 ),
         ));
 
-        let comments_section = comments_panel(self.comment_sort, context);
+        let comments_section = comments_panel_with(
+            self.comment_sort,
+            context.message(Message::SetCommentSort(CommentSort::Hot)),
+            context.message(Message::SetCommentSort(CommentSort::Latest)),
+        );
 
         let left_scroll_content = StackPanel::new()
             .spacing(14.0)
@@ -400,7 +404,7 @@ fn action_pill(label: &str, count: &str) -> View {
         .into()
 }
 
-fn comments_panel(sort: CommentSort, context: &mut ViewContext<PlayerPage>) -> View {
+fn comments_panel_with(sort: CommentSort, on_hot: Callback<()>, on_latest: Callback<()>) -> View {
     let header = Grid::new()
         .columns([GridLength::Star(1.0), GridLength::Auto])
         .children((
@@ -431,7 +435,7 @@ fn comments_panel(sort: CommentSort, context: &mut ViewContext<PlayerPage>) -> V
                             ButtonStyle::Subtle
                         })
                         .content("按热度")
-                        .on_click(context.message(Message::SetCommentSort(CommentSort::Hot))),
+                        .on_click(on_hot),
                     Button::new()
                         .style(if sort == CommentSort::Latest {
                             ButtonStyle::Accent
@@ -439,7 +443,7 @@ fn comments_panel(sort: CommentSort, context: &mut ViewContext<PlayerPage>) -> V
                             ButtonStyle::Subtle
                         })
                         .content("按时间")
-                        .on_click(context.message(Message::SetCommentSort(CommentSort::Latest))),
+                        .on_click(on_latest),
                 )),
         ));
 
@@ -692,4 +696,196 @@ fn related_card(title: &str, author: &str, views: &str, duration: &str) -> View 
                 )),
         )
         .into()
+}
+
+/// 首页右侧半窗预览输入（复用同一 `VideoEngine`，无播放控制条，最左侧带展开按钮）。
+#[derive(Clone)]
+pub struct HalfPaneInput {
+    pub item: VideoItem,
+    pub mount_tick: u32,
+    pub notice: Option<String>,
+    pub engine: Arc<VideoEngine>,
+    pub on_expand: Callback<()>,
+    pub on_close: Callback<()>,
+}
+
+impl PartialEq for HalfPaneInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.item == other.item
+            && self.mount_tick == other.mount_tick
+            && self.notice == other.notice
+            && Arc::ptr_eq(&self.engine, &other.engine)
+            && self.on_expand == other.on_expand
+            && self.on_close == other.on_close
+    }
+}
+
+pub struct HalfPanePreview {
+    comment_sort: CommentSort,
+}
+
+#[derive(Clone, PartialEq)]
+pub enum HalfPaneMessage {
+    SetSort(CommentSort),
+}
+
+impl Component for HalfPanePreview {
+    type Input = HalfPaneInput;
+    type Message = HalfPaneMessage;
+
+    fn create(_input: &HalfPaneInput, _context: &ComponentContext<Self>) -> Self {
+        Self {
+            comment_sort: CommentSort::Hot,
+        }
+    }
+
+    fn update(&mut self, message: HalfPaneMessage, _context: &ComponentContext<Self>) {
+        match message {
+            HalfPaneMessage::SetSort(sort) => self.comment_sort = sort,
+        }
+    }
+
+    fn view(&self, input: &HalfPaneInput, context: &mut ViewContext<Self>) -> View {
+        let surface: View = if let Some(notice) = &input.notice {
+            Border::new()
+                .corner_radius(8.0)
+                .background(Brush::Solid(Color::rgb(16, 16, 16)))
+                .content(
+                    TextBlock::new()
+                        .text(notice.clone())
+                        .font_size(12.0)
+                        .opacity(0.75)
+                        .horizontal_alignment(HorizontalAlignment::Center)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .text_wrapping(TextWrapping::Wrap),
+                )
+                .into()
+        } else {
+            View::component::<VideoSurface>(VideoSurfaceInput {
+                engine: input.engine.clone(),
+                tick: input.mount_tick,
+            })
+        };
+
+        // 最左侧展开控制条：顶部关闭，居中大展开按钮进入完整播放页。
+        let left_strip = Border::new()
+            .grid_column(0)
+            .background(ThemeBrush::CardBackground)
+            .border_brush(ThemeBrush::CardStroke)
+            .border_thickness(Thickness::new(0.0, 0.0, 1.0, 0.0))
+            .content(
+                Grid::new()
+                    .rows([GridLength::Auto, GridLength::Star(1.0)])
+                    .children((
+                        Button::new()
+                            .style(ButtonStyle::Subtle)
+                            .width(40.0)
+                            .height(40.0)
+                            .content("✕")
+                            .on_click(input.on_close.clone()),
+                        Button::new()
+                            .grid_row(1)
+                            .style(ButtonStyle::Subtle)
+                            .width(40.0)
+                            .vertical_alignment(VerticalAlignment::Stretch)
+                            .horizontal_content_alignment(HorizontalAlignment::Center)
+                            .vertical_content_alignment(VerticalAlignment::Center)
+                            .content(
+                                StackPanel::new().spacing(6.0).children((
+                                    FontIcon::new()
+                                        .glyph("\u{E740}")
+                                        .font_size(14.0)
+                                        .horizontal_alignment(HorizontalAlignment::Center),
+                                    TextBlock::new()
+                                        .text("展开")
+                                        .font_size(11.0)
+                                        .opacity(0.8)
+                                        .horizontal_alignment(HorizontalAlignment::Center),
+                                )),
+                            )
+                            .on_click(input.on_expand.clone()),
+                    )),
+            );
+
+        let info_and_comments = StackPanel::new()
+            .spacing(12.0)
+            .margin(Thickness::new(14.0, 12.0, 14.0, 20.0))
+            .children((
+                TextBlock::new()
+                    .text(input.item.title.clone())
+                    .font_size(16.0)
+                    .font_weight(FontWeight::BOLD)
+                    .text_wrapping(TextWrapping::Wrap),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(10.0)
+                    .children((
+                        PersonPicture::new()
+                            .display_name(input.item.author.as_str())
+                            .width(30.0)
+                            .height(30.0),
+                        StackPanel::new()
+                            .spacing(2.0)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .children((
+                                TextBlock::new()
+                                    .text(input.item.author.clone())
+                                    .font_size(13.0)
+                                    .font_weight(FontWeight::SEMI_BOLD),
+                                TextBlock::new()
+                                    .text(format!(
+                                        "播放 {} · 弹幕 {} · 时长 {}",
+                                        theme::fmt_count(input.item.play_count),
+                                        theme::fmt_count(input.item.danmaku_count),
+                                        theme::fmt_duration(input.item.duration_secs)
+                                    ))
+                                    .font_size(11.0)
+                                    .opacity(0.6),
+                            )),
+                    )),
+                Expander::new()
+                    .header("简介")
+                    .is_expanded(false)
+                    .content(
+                        TextBlock::new()
+                            .text(format!(
+                                "{}\n\nBV 号：{}",
+                                input.item.title, input.item.bvid
+                            ))
+                            .text_wrapping(TextWrapping::Wrap),
+                    ),
+                comments_panel_with(
+                    self.comment_sort,
+                    context.message(HalfPaneMessage::SetSort(CommentSort::Hot)),
+                    context.message(HalfPaneMessage::SetSort(CommentSort::Latest)),
+                ),
+            ));
+
+        let main_pane = Grid::new()
+            .grid_column(1)
+            .rows([GridLength::Pixel(248.0), GridLength::Star(1.0)])
+            .children((
+                Border::new()
+                    .margin(Thickness::new(12.0, 12.0, 12.0, 0.0))
+                    .corner_radius(8.0)
+                    .content(surface),
+                ScrollViewer::new()
+                    .grid_row(1)
+                    .content(info_and_comments),
+            ));
+
+        Border::new()
+            .width(480.0)
+            .horizontal_alignment(HorizontalAlignment::Right)
+            .vertical_alignment(VerticalAlignment::Stretch)
+            .background(ThemeBrush::SolidBackground)
+            .border_brush(ThemeBrush::CardStroke)
+            .border_thickness(Thickness::new(1.0, 0.0, 0.0, 0.0))
+            .content(
+                Grid::new()
+                    .columns([GridLength::Pixel(40.0), GridLength::Star(1.0)])
+                    .children((View::from(left_strip), View::from(main_pane))),
+            )
+            .into()
+    }
 }
