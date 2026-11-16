@@ -27,6 +27,11 @@ windows = { path = "D:/Projects/qaq-winui-reactor/crates/libs/windows", features
     "d3d11",
     "d3dcommon",
     "dxgi",
+    "Media",
+    "Storage_Streams",
+    "systemmediatransportcontrolsinterop",
+    "winuser",
+    "processthreadsapi",
 ] }
 hex = "0.4"
 qrcode = "0.14"

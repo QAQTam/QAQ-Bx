@@ -141,6 +141,7 @@ dependencies = [
  "reqwest",
  "serde",
  "tokio",
+ "windows",
  "windows-canvas",
  "windows-core",
  "windows-reactor",

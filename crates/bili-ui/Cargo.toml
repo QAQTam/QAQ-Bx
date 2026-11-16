@@ -11,6 +11,7 @@ windows-reactor.workspace = true
 # 依赖同源):VideoSurface 挂载桥用 IUnknown::from_raw 接管引擎转移的
 # swapchain 裸指针。
 windows-core = { path = "D:/Projects/qaq-winui-reactor/crates/libs/core" }
+windows.workspace = true
 # 弹幕覆盖层:D2D Canvas(reactor 集成)+ DWrite 文本格式。
 windows-canvas = { path = "D:/Projects/qaq-winui-reactor/crates/libs/canvas", features = ["reactor", "composition"] }
 windows-text = { path = "D:/Projects/qaq-winui-reactor/crates/libs/text" }

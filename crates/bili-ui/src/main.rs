@@ -9,6 +9,7 @@ mod pages;
 mod router;
 mod runtime;
 mod shell;
+mod smtc;
 mod theme;
 mod widgets;
 

@@ -23,6 +23,7 @@ use crate::image_cache::ImageCache;
 use crate::pages;
 use crate::router::{self, Route, NAV_ROUTES};
 use crate::runtime::{block_on, cover_semaphore};
+use crate::smtc::{SmtcCommand, SmtcController};
 use crate::widgets::mini_player;
 use crate::widgets::video_card::{self, HomeSlot};
 
@@ -209,6 +210,11 @@ pub struct AppShell {
     timer: Option<ComponentTimer>,
     /// 登录轮询定时器（2s，独立于播放节拍）。
     login_timer: Option<ComponentTimer>,
+    /// Windows 控制中心媒体控件（SMTC）控制器。
+    smtc: Option<SmtcController>,
+    smtc_rx: Option<Arc<Mutex<std::sync::mpsc::Receiver<SmtcCommand>>>>,
+    smtc_bvid: Option<String>,
+    smtc_playing: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -240,6 +246,8 @@ pub enum Message {
     MiniNext,
     /// 关闭迷你播放条：停止并销毁惰性 VideoEngine，归还播放底座与 D3D11 内存。
     ClosePlayer,
+    /// Windows 控制中心媒体按钮回调（None 表示通道已关闭）。
+    SmtcAction(Option<SmtcCommand>),
 
     // ---- 首页推荐流与 Hover 预解析 ----
     /// 换一换（Refresh 语义：清流 + 预分配首批骨架 + 重发）。
@@ -594,6 +602,48 @@ impl AppShell {
             .unwrap_or(item.duration_secs)
     }
 
+    fn listen_smtc(&self, context: &ComponentContext<Self>) {
+        let Some(rx) = &self.smtc_rx else {
+            return;
+        };
+        let rx = Arc::clone(rx);
+        context.spawn_background(move |_| {
+            let cmd = rx.lock().ok().and_then(|guard| guard.recv().ok());
+            Message::SmtcAction(cmd)
+        });
+    }
+
+    fn sync_smtc(&mut self, context: &ComponentContext<Self>) {
+        if let Some(item) = &self.now_playing {
+            if self.smtc.is_none() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                if let Some(ctrl) = SmtcController::try_init(tx) {
+                    self.smtc = Some(ctrl);
+                    self.smtc_rx = Some(Arc::new(Mutex::new(rx)));
+                    self.listen_smtc(context);
+                }
+            }
+            let Some(smtc) = &self.smtc else {
+                return;
+            };
+            if self.smtc_bvid.as_deref() != Some(item.bvid.as_str()) {
+                let cover_bytes = item.cover.as_ref().map(|img| img.as_bytes());
+                smtc.update_metadata(&item.title, &item.author, cover_bytes);
+                self.smtc_bvid = Some(item.bvid.clone());
+            }
+            if self.smtc_playing != Some(self.playing) {
+                smtc.set_playing(self.playing);
+                self.smtc_playing = Some(self.playing);
+            }
+        } else if self.smtc_bvid.is_some() || self.smtc_playing.is_some() {
+            if let Some(smtc) = &self.smtc {
+                smtc.set_stopped();
+            }
+            self.smtc_bvid = None;
+            self.smtc_playing = None;
+        }
+    }
+
     /// 首页视图（Home 路由与播放页无播放项时的兜底共用）。
     fn home_view(&self, context: &ViewContext<Self>) -> View {
         pages::home::home_page(
@@ -899,6 +949,10 @@ impl Component for AppShell {
             current_meta: None,
             timer,
             login_timer: None,
+            smtc: None,
+            smtc_rx: None,
+            smtc_bvid: None,
+            smtc_playing: None,
         }
     }
 
@@ -921,7 +975,10 @@ impl Component for AppShell {
             }
             Message::PaneOpenChanged(open) => self.pane_open = open,
             Message::TogglePane => self.pane_open = !self.pane_open,
-            Message::OpenVideo(bvid) => self.open_video(&bvid, context),
+            Message::OpenVideo(bvid) => {
+                self.open_video(&bvid, context);
+                self.sync_smtc(context);
+            }
             Message::TogglePlay => {
                 let Some(engine) = &self.engine else {
                     return;
@@ -942,6 +999,7 @@ impl Component for AppShell {
                     engine.play();
                     self.playing = true;
                 }
+                self.sync_smtc(context);
             }
             Message::Seek(value) => {
                 self.position = value.round().clamp(0.0, f64::from(u32::MAX)) as u32;
@@ -984,6 +1042,7 @@ impl Component for AppShell {
                         self.player_notice = Some(reason);
                     }
                 }
+                self.sync_smtc(context);
                 // 续拍:仍持有播放项才继续(Back 到首页后 mini_player 也要状态)。
                 if self.now_playing.is_some() {
                     self.timer =
@@ -1055,7 +1114,31 @@ impl Component for AppShell {
                 if self.route == Route::Player {
                     self.route = self.history.pop().unwrap_or(Route::Home);
                 }
+                self.sync_smtc(context);
             }
+            Message::SmtcAction(Some(cmd)) => {
+                if let Some(engine) = &self.engine {
+                    let status = engine.status();
+                    if status.has_media() {
+                        match cmd {
+                            SmtcCommand::Play => {
+                                if status.eof {
+                                    engine.seek(0.0);
+                                }
+                                engine.play();
+                                self.playing = true;
+                            }
+                            SmtcCommand::Pause => {
+                                engine.pause();
+                                self.playing = false;
+                            }
+                        }
+                        self.sync_smtc(context);
+                    }
+                }
+                self.listen_smtc(context);
+            }
+            Message::SmtcAction(None) => {}
 
             // ---- 首页推荐流与 Hover 预解析 ----
             Message::HomeRefresh => {
