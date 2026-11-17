@@ -91,18 +91,19 @@ impl Route {
     }
 }
 
-/// 非播放页分发（Home / Player / Login / Settings 由 AppShell 直接组装，分支仅为穷尽兜底）。
-pub fn route(route: Route, on_open: Callback<String>) -> View {
+/// 非播放页分发（Home / Popular / Player / Login / Settings / Search 由 AppShell 直接组装，分支仅为穷尽兜底）。
+pub fn route(route: Route, _on_open: Callback<String>) -> View {
     match route {
-        Route::Popular => pages::popular::popular_page(on_open),
         Route::Following => pages::stub::stub_page("关注", "暂无动态"),
         Route::Live => pages::stub::stub_page("直播", "暂无直播"),
         Route::Favorites => pages::stub::stub_page("收藏", "暂无收藏"),
         Route::History => pages::stub::stub_page("历史", "暂无历史记录"),
         Route::WatchLater => pages::stub::stub_page("稍后再看", "暂无内容"),
-        // Home / Player / Login / Settings / Search 由 shell 直接组装（共享壳层状态与回调）。
-        Route::Home | Route::Player | Route::Login | Route::Settings | Route::Search => {
-            pages::stub::stub_page("推荐", "加载中…")
-        }
+        Route::Home
+        | Route::Popular
+        | Route::Player
+        | Route::Login
+        | Route::Settings
+        | Route::Search => pages::stub::stub_page("推荐", "加载中…"),
     }
 }

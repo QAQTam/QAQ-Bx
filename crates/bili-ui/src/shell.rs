@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use bili_core::account::{AccountStat, NavClient, RelationKind, RelationPage, RelationUser};
 use bili_core::danmaku::{DanmakuClient, DanmakuElem};
-use bili_core::feed::{fetch_rcmd_batch, FeedCard, FeedClient, FeedKind, FeedSession};
+use bili_core::feed::{ArchiveCard, fetch_rcmd_batch, FeedCard, FeedClient, FeedKind, FeedSession};
 use bili_core::notify::{
     AtNotice, FeedCursor, LikeNotice, ReplyNotice, SystemNotice, UnreadSummary, WhisperMessage,
     WhisperSession,
@@ -25,7 +25,7 @@ use windows_reactor::*;
 use crate::auth::{
     avatar_thumbnail_url, Auth, AuthState, FlowCell, LoginFlowState, PollOutcome, ProbeReport,
 };
-use crate::data::{self, VideoItem};
+use crate::data::VideoItem;
 use crate::feed_pager;
 use crate::gamepad::{self, GamepadAction, GamepadEvent};
 use crate::image_cache::ImageCache;
@@ -48,6 +48,8 @@ const COVER_FLUSH_INTERVAL: Duration = Duration::from_millis(80);
 const PRERESOLVE_TTL: Duration = Duration::from_secs(180);
 /// 窄屏（竖屏手机/掌机）自适应断点。
 const COMPACT_BREAKPOINT: f64 = 760.0;
+/// 热门页单次分页条数（实测 popular API ps=20 稳定）。
+const POPULAR_PAGE_SIZE: u32 = 20;
 /// Hover 预解析最多缓存条目数。
 const MAX_PRERESOLVE_CACHE: usize = 16;
 /// 关注/粉丝挂件每页拉取条数。
@@ -106,6 +108,14 @@ fn video_item(card: &FeedCard) -> VideoItem {
         duration_secs: card.duration.unwrap_or_default().clamp(0, i64::from(u32::MAX)) as u32,
         play_count: card.stat.as_ref().map_or(0, |stat| stat.view.unsigned_abs()),
         danmaku_count: card.stat.as_ref().map_or(0, |stat| stat.danmaku.unsigned_abs()),
+        like_count: card.stat.as_ref().and_then(|stat| stat.like).map(|v| v.unsigned_abs()),
+        coin_count: card.stat.as_ref().and_then(|stat| stat.coin).map(|v| v.unsigned_abs()),
+        favorite_count: card
+            .stat
+            .as_ref()
+            .and_then(|stat| stat.favorite)
+            .map(|v| v.unsigned_abs()),
+        share_count: card.stat.as_ref().and_then(|stat| stat.share).map(|v| v.unsigned_abs()),
         cover: None,
         pic_url: card.pic.as_deref().map(thumbnail_url),
     }
@@ -312,6 +322,15 @@ pub struct ShellProbe {
     pub search_videos: usize,
     /// 首条搜索结果 bvid(用于验证 open_video 的 search_index 回退)。
     pub search_first_bvid: Option<String>,
+    /// 热门页已加载条数（真实 popular API 分页累计）。
+    pub popular_items: usize,
+    /// 首条热门卡 bvid(用于验证 open_video 的 popular_index 回退)。
+    pub popular_first_bvid: Option<String>,
+    /// 相关推荐已加载条数（真实 archive/related API）。
+    pub related_items: usize,
+    pub related_bvid: String,
+    /// 热门页最近一次失败原因（selftest 定位用）。
+    pub popular_error: Option<String>,
 }
 
 pub struct AppShell {
@@ -420,6 +439,14 @@ pub struct AppShell {
     search_index: HashMap<String, VideoItem>,
     /// 搜索请求代次(新提交递增,旧结果丢弃)。
     search_seq: u64,
+    /// 热门页单源状态（真实 popular API，pn/ps 分页）。
+    popular: pages::popular::PopularFeedState,
+    /// 热门卡索引（bvid → 展示模型；open_video 数据源链一环）。
+    popular_index: HashMap<String, VideoItem>,
+    /// 播放页右栏相关推荐状态（真实 archive/related API，跟随播放代次）。
+    related: pages::player::RelatedPane,
+    /// 相关推荐索引（bvid → 展示模型；open_video 数据源链一环）。
+    related_index: HashMap<String, VideoItem>,
     comments_session: CommentsSessionState,
     /// selftest 探针句柄(正常路径恒为 `None`)。
     probe: Option<std::rc::Rc<std::cell::RefCell<ShellProbe>>>,
@@ -554,6 +581,19 @@ pub enum Message {
         result: Result<(VideoMeta, StreamChoice), String>,
     },
 
+    // ---- 热门页（真实 popular API，无签名 pn/ps 分页）----
+    /// 加载下一页/首屏失败重试（`next_pn` 由单源状态推进；失败不推进=自动重取同页）。
+    PopularMore,
+    PopularLoaded(Result<Vec<VideoItem>, String>),
+
+    // ---- 播放页相关推荐（真实 archive/related API）----
+    RelatedLoaded {
+        seq: u64,
+        bvid: String,
+        res: Result<Vec<VideoItem>, String>,
+    },
+    RelatedRetry,
+
     // ---- 设置持久化 ----
     UpdateSettings(AppSettings),
     FlushSettingsSave,
@@ -673,9 +713,76 @@ fn search_video_item(video: &SearchVideo) -> VideoItem {
         duration_secs: video.duration_secs,
         play_count: video.play_count,
         danmaku_count: video.danmaku_count,
+        // 搜索卡不下发互动计数，保持 None（进播放页后由 video_meta 回填）。
+        like_count: None,
+        coin_count: None,
+        favorite_count: None,
+        share_count: None,
         cover: None,
         pic_url: video.pic_url.clone(),
     }
+}
+
+/// 归档卡（popular/related 真实接口）→ 展示模型(封面占位,由 ImageCache/CoverReady 异步填充)。
+fn archive_video_item(card: &ArchiveCard) -> VideoItem {
+    VideoItem {
+        bvid: card.bvid.clone(),
+        aid: card.aid,
+        cid: card.cid,
+        title: card.title.clone(),
+        author: card.owner.name.clone(),
+        author_mid: card.owner.mid,
+        author_face_url: card.owner.face.as_deref().and_then(normalize_face_url),
+        duration_secs: card.duration.clamp(0, i64::from(u32::MAX)) as u32,
+        play_count: card.stat.view.unsigned_abs(),
+        danmaku_count: card.stat.danmaku.unsigned_abs(),
+        like_count: card.stat.like.map(|v| v.unsigned_abs()),
+        coin_count: card.stat.coin.map(|v| v.unsigned_abs()),
+        favorite_count: card.stat.favorite.map(|v| v.unsigned_abs()),
+        share_count: card.stat.share.map(|v| v.unsigned_abs()),
+        cover: None,
+        pic_url: Some(thumbnail_url(&card.pic)),
+    }
+}
+
+/// 未知元数据稿件的最小展示模型（BILIPLAY_VIDEO 冒烟路由 / open_video 兜底）：
+/// 标题暂以 bvid 占位，真实标题/UP 主/封面由 video_meta 解析管线回填。
+fn minimal_video_item(bvid: &str, title: &str) -> VideoItem {
+    VideoItem {
+        bvid: bvid.to_string(),
+        aid: 0,
+        cid: 0,
+        title: if title.trim().is_empty() {
+            bvid.to_string()
+        } else {
+            title.to_string()
+        },
+        author: String::new(),
+        author_mid: 0,
+        author_face_url: None,
+        duration_secs: 0,
+        play_count: 0,
+        danmaku_count: 0,
+        like_count: None,
+        coin_count: None,
+        favorite_count: None,
+        share_count: None,
+        cover: None,
+        pic_url: None,
+    }
+}
+
+/// 热门分页合并：按 bvid 去重（跨页重叠防御），返回实际新增项。
+fn merge_popular_items(existing: &mut Vec<VideoItem>, incoming: Vec<VideoItem>) -> Vec<VideoItem> {
+    let mut seen: HashSet<String> = existing.iter().map(|item| item.bvid.clone()).collect();
+    let mut fresh = Vec::new();
+    for item in incoming {
+        if seen.insert(item.bvid.clone()) {
+            fresh.push(item);
+        }
+    }
+    existing.extend(fresh.iter().cloned());
+    fresh
 }
 
 impl AppShell {
@@ -700,19 +807,25 @@ impl AppShell {
         out.search_query = self.search_state.query.clone();
         out.search_videos = self.search_state.videos.len();
         out.search_first_bvid = self.search_state.videos.first().map(|item| item.bvid.clone());
+        out.popular_items = self.popular.items.len();
+        out.popular_first_bvid = self.popular.items.first().map(|item| item.bvid.clone());
+        out.related_items = self.related.items.len();
+        out.related_bvid = self.related.bvid.clone();
+        out.popular_error = self.popular.error.clone();
     }
 
     fn open_video(&mut self, bvid: &str, context: &ComponentContext<Self>) {
-        // 数据源：首页已加载卡 → 搜索结果索引 → 占位数据回退（冒烟路由 BILIPLAY_VIDEO 用）。
+        // 数据源：首页已加载卡 → 搜索/热门/相关推荐索引 → 最小模型（真实标题由 video_meta 回填）。
         let mut item = match self
             .home_index
             .get(bvid)
             .cloned()
             .or_else(|| self.search_index.get(bvid).cloned())
-            .or_else(|| data::find(bvid))
+            .or_else(|| self.popular_index.get(bvid).cloned())
+            .or_else(|| self.related_index.get(bvid).cloned())
         {
             Some(item) => item,
-            None => return,
+            None => minimal_video_item(bvid, ""),
         };
         if item.cover.is_none()
             && let Some(url) = &item.pic_url
@@ -723,28 +836,14 @@ impl AppShell {
     }
 
     fn open_video_target(&mut self, target: OpenTarget, context: &ComponentContext<Self>) {
-        if self.home_index.contains_key(&target.bvid) || data::find(&target.bvid).is_some() {
+        if self.home_index.contains_key(&target.bvid)
+            || self.popular_index.contains_key(&target.bvid)
+            || self.related_index.contains_key(&target.bvid)
+        {
             self.open_video(&target.bvid, context);
             return;
         }
-        let item = VideoItem {
-            bvid: target.bvid.clone(),
-            aid: 0,
-            cid: 0,
-            title: if target.title.trim().is_empty() {
-                target.bvid
-            } else {
-                target.title
-            },
-            author: String::new(),
-            author_mid: 0,
-            author_face_url: None,
-            duration_secs: 0,
-            play_count: 0,
-            danmaku_count: 0,
-            cover: None,
-            pic_url: None,
-        };
+        let item = minimal_video_item(&target.bvid, &target.title);
         self.start_playback(item, context);
     }
 
@@ -914,6 +1013,8 @@ impl AppShell {
         self.refresh_comments_snapshot();
         self.schedule_tick(context);
         self.kickoff_video_extras(self.playback_gen, context);
+        // 右栏相关推荐：真实 archive/related 随播放代次拉取（快速切视频由代次校验作废旧响应）。
+        self.fetch_related(self.playback_gen, item.bvid.clone(), context);
 
         let nav = self.auth_service.nav_client();
         let current_key = resolve_profile_key(&self.settings, &nav);
@@ -995,6 +1096,27 @@ impl AppShell {
                 }
                 if cur.author_face_url.is_none() {
                     cur.author_face_url = owner.face.as_deref().and_then(normalize_face_url);
+                }
+            }
+            // 互动计数回填（搜索卡/最小模型缺 stat 时经 view 补齐；已有真实值不覆盖）。
+            if let Some(stat) = &meta.stat {
+                if cur.play_count == 0 {
+                    cur.play_count = stat.view.unsigned_abs();
+                }
+                if cur.danmaku_count == 0 {
+                    cur.danmaku_count = stat.danmaku.unsigned_abs();
+                }
+                if cur.like_count.is_none() {
+                    cur.like_count = stat.like.map(|v| v.unsigned_abs());
+                }
+                if cur.coin_count.is_none() {
+                    cur.coin_count = stat.coin.map(|v| v.unsigned_abs());
+                }
+                if cur.favorite_count.is_none() {
+                    cur.favorite_count = stat.favorite.map(|v| v.unsigned_abs());
+                }
+                if cur.share_count.is_none() {
+                    cur.share_count = stat.share.map(|v| v.unsigned_abs());
                 }
             }
         }
@@ -1106,6 +1228,134 @@ impl AppShell {
             res: block_on(client.fetch_sub(aid, root_rpid, pn, SUB_REPLY_PAGE_SIZE))
                 .map_err(|e| e.to_string()),
         });
+    }
+
+    /// 热门页首拉守卫：导航进入/重试时仅在从未成功加载且不在飞时开拉。
+    fn ensure_popular(&mut self, context: &ComponentContext<Self>) {
+        if self.popular.loaded_once || self.popular.loading {
+            return;
+        }
+        self.fetch_popular(context);
+    }
+
+    fn fetch_popular(&mut self, context: &ComponentContext<Self>) {
+        if self.popular.loading {
+            return;
+        }
+        self.popular.loading = true;
+        self.popular.error = None;
+        spawn_popular_fetch(
+            &self.feed_client,
+            &self.image_cache,
+            self.popular.next_pn,
+            context,
+        );
+    }
+
+    fn absorb_popular(
+        &mut self,
+        res: Result<Vec<VideoItem>, String>,
+        context: &ComponentContext<Self>,
+    ) {
+        self.popular.loading = false;
+        let items = match res {
+            Ok(items) => items,
+            Err(err) => {
+                // next_pn 不推进：「加载更多」即自动重取同页（兼作重试）。
+                self.popular.error = Some(err);
+                return;
+            }
+        };
+        self.popular.next_pn += 1;
+        self.popular.reached_end = items.is_empty();
+        let fresh = merge_popular_items(&mut self.popular.items, items);
+        for mut item in fresh {
+            if item.cover.is_none()
+                && let Some(url) = &item.pic_url
+            {
+                if let Some(cached) = self.image_cache.get(url) {
+                    item.cover = Some(cached);
+                } else {
+                    self.spawn_cover_fetch(item.bvid.clone(), url.clone(), self.feed_gen, context);
+                }
+            }
+            self.popular_index.insert(item.bvid.clone(), item);
+        }
+        self.popular.loaded_once = true;
+    }
+
+    /// 相关推荐拉取：随播放代次发起，旧 bvid 的迟到响应在吸收端双校验丢弃。
+    fn fetch_related(&mut self, seq: u64, bvid: String, context: &ComponentContext<Self>) {
+        self.related = pages::player::RelatedPane {
+            bvid: bvid.clone(),
+            loading: true,
+            ..pages::player::RelatedPane::default()
+        };
+        let client = self.feed_client.clone();
+        let cache = self.image_cache.clone();
+        context.spawn_background(move |_| {
+            let res = block_on(client.related(&bvid)).map_err(|e| e.to_string());
+            let items = match &res {
+                Ok(cards) => cards
+                    .iter()
+                    .map(|card| {
+                        let mut item = archive_video_item(card);
+                        if let Some(url) = &item.pic_url {
+                            item.cover = cache.get(url);
+                        }
+                        item
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            Message::RelatedLoaded {
+                seq,
+                bvid,
+                res: match res {
+                    Ok(_) => Ok(items),
+                    Err(err) => Err(err),
+                },
+            }
+        });
+    }
+
+    fn absorb_related(
+        &mut self,
+        seq: u64,
+        bvid: String,
+        res: Result<Vec<VideoItem>, String>,
+        context: &ComponentContext<Self>,
+    ) {
+        // 代次 + 目标双校验：快速切视频时迟到的旧响应一律丢弃。
+        if seq != self.playback_gen || self.related.bvid != bvid {
+            return;
+        }
+        self.related.loading = false;
+        let items = match res {
+            Ok(items) => items,
+            Err(err) => {
+                self.related.error = Some(err);
+                return;
+            }
+        };
+        for mut item in items {
+            // 接口不保证剔除当前稿件，防御性过滤自身。
+            if item.bvid == self.related.bvid {
+                continue;
+            }
+            if item.cover.is_none()
+                && let Some(url) = &item.pic_url
+            {
+                if let Some(cached) = self.image_cache.get(url) {
+                    item.cover = Some(cached);
+                } else {
+                    self.spawn_cover_fetch(item.bvid.clone(), url.clone(), self.feed_gen, context);
+                }
+            }
+            self.related_index.insert(item.bvid.clone(), item.clone());
+            self.related.items.push(item);
+        }
+        self.related.loaded_once = true;
     }
 
     fn apply_resolved_media(
@@ -1899,6 +2149,37 @@ fn spawn_feed_batch(
     });
 }
 
+/// 单次 popular 分页抓取（后台线程转展示模型 + LRU 缓存命中预填封面）。
+fn spawn_popular_fetch(
+    feed_client: &Arc<FeedClient>,
+    image_cache: &Arc<ImageCache>,
+    pn: u32,
+    context: &ComponentContext<AppShell>,
+) {
+    let client = feed_client.clone();
+    let cache = image_cache.clone();
+    context.spawn_background(move |_| {
+        let res = block_on(client.popular(pn, POPULAR_PAGE_SIZE)).map_err(|e| e.to_string());
+        let items = match &res {
+            Ok(cards) => cards
+                .iter()
+                .map(|card| {
+                    let mut item = archive_video_item(card);
+                    if let Some(url) = &item.pic_url {
+                        item.cover = cache.get(url);
+                    }
+                    item
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        Message::PopularLoaded(match res {
+            Ok(_) => Ok(items),
+            Err(err) => Err(err),
+        })
+    });
+}
+
 impl Component for AppShell {
     type Input = ShellInput;
     type Message = Message;
@@ -1993,11 +2274,11 @@ impl Component for AppShell {
         let route = std::env::var("BILIPLAY_ROUTE")
             .ok()
             .and_then(|ref tag| Route::from_tag(tag));
-        // 冒烟辅助：BILIPLAY_VIDEO=<bvid> 启动即进播放页(与点卡同管线)。
+        // 冒烟辅助：BILIPLAY_VIDEO=<bvid> 启动即进播放页(与点卡同管线;真实元数据由解析管线回填)。
         let now_playing = std::env::var("BILIPLAY_VIDEO")
             .ok()
-            .as_deref()
-            .and_then(data::find);
+            .filter(|bvid| bvid.starts_with("BV"))
+            .map(|ref bvid| minimal_video_item(bvid, ""));
         let route = if crate::notifications::launched_from_notification() {
             Route::Login
         } else {
@@ -2038,6 +2319,12 @@ impl Component for AppShell {
             &home_on_hover,
             &home_on_row_active,
         );
+
+        // 热门页直连（BILIPLAY_ROUTE=popular 等）：真实 popular 首页随启动开拉。
+        let image_cache = Arc::new(ImageCache::new());
+        if route == Route::Popular {
+            spawn_popular_fetch(&feed_client, &image_cache, 1, context);
+        }
 
         let gamepad_rx = Arc::new(Mutex::new(gamepad::spawn_gamepad_poller()));
         Self::listen_gamepad(&gamepad_rx, context);
@@ -2098,7 +2385,7 @@ impl Component for AppShell {
             preresolved_order: VecDeque::new(),
             preresolve_inflight: HashMap::new(),
             pending_open_preresolve: None,
-            image_cache: Arc::new(ImageCache::new()),
+            image_cache,
             auth: AuthState::Unknown,
             login_flow: LoginFlowState::Idle,
             flow,
@@ -2137,6 +2424,15 @@ impl Component for AppShell {
             search_state: pages::search::SearchUiState::default(),
             search_index: HashMap::new(),
             search_seq: 0,
+            popular: pages::popular::PopularFeedState {
+                // pn 从 1 起（实测 pn=0 非法）；直启热门路由时首页已在飞。
+                next_pn: 1,
+                loading: route == Route::Popular,
+                ..pages::popular::PopularFeedState::default()
+            },
+            popular_index: HashMap::new(),
+            related: pages::player::RelatedPane::default(),
+            related_index: HashMap::new(),
             comments_session: CommentsSessionState::default(),
             probe: input.probe.clone(),
             comments_snapshot: CommentsSnapshot::default(),
@@ -2188,6 +2484,23 @@ impl Component for AppShell {
                     if route == Route::Login {
                         self.ensure_account_loaded(context);
                     }
+                    if route == Route::Popular {
+                        self.ensure_popular(context);
+                    }
+                }
+            }
+            Message::PopularMore => {
+                self.fetch_popular(context);
+            }
+            Message::PopularLoaded(res) => {
+                self.absorb_popular(res, context);
+            }
+            Message::RelatedLoaded { seq, bvid, res } => {
+                self.absorb_related(seq, bvid, res, context);
+            }
+            Message::RelatedRetry => {
+                if let Some(item) = self.now_playing.clone() {
+                    self.fetch_related(self.playback_gen, item.bvid, context);
                 }
             }
             Message::PaneOpenChanged(open) => self.pane_open = open,
@@ -2768,6 +3081,9 @@ impl Component for AppShell {
                     if target == Route::Login && self.auth_gen > 0 {
                         self.ensure_account_loaded(context);
                     }
+                    if target == Route::Popular {
+                        self.ensure_popular(context);
+                    }
                 }
             }
             Message::WindowResized(size) => {
@@ -2954,6 +3270,21 @@ impl Component for AppShell {
                     if !applied
                         && let Some(item) =
                             self.search_state.videos.iter_mut().find(|v| v.bvid == bvid)
+                        && item.cover.is_none()
+                    {
+                        item.cover = Some(image.clone());
+                        applied = true;
+                    }
+                    // 热门/相关推荐封面兜底回填（同一有界 LRU，8GB 内存约束内共享字节）。
+                    if !applied
+                        && let Some(item) = self.popular.items.iter_mut().find(|v| v.bvid == bvid)
+                        && item.cover.is_none()
+                    {
+                        item.cover = Some(image.clone());
+                        applied = true;
+                    }
+                    if !applied
+                        && let Some(item) = self.related.items.iter_mut().find(|v| v.bvid == bvid)
                         && item.cover.is_none()
                     {
                         item.cover = Some(image);
@@ -3553,6 +3884,9 @@ impl Component for AppShell {
                         engine: engine.clone(),
                         comments: self.comments_snapshot.clone(),
                         comment_cb: comment_cb.clone(),
+                        related: self.related.clone(),
+                        on_open_video: on_open.clone(),
+                        on_related_retry: context.message(Message::RelatedRetry),
                         on_toggle: context.message(Message::TogglePlay),
                         on_seek: context.callback(|value: f64| Message::Seek(value)),
                         on_volume: context.callback(|value: f64| Message::SetVolume(value)),
@@ -3624,6 +3958,12 @@ impl Component for AppShell {
             pages::search::search_page(&self.search_state, &on_draft, &on_submit, &on_open, compact)
         } else if self.route == Route::Home {
             self.home_view(context)
+        } else if self.route == Route::Popular {
+            pages::popular::popular_page(
+                &self.popular,
+                &on_open,
+                &context.message(Message::PopularMore),
+            )
         } else {
             router::route(self.route, on_open.clone())
         };
@@ -4190,6 +4530,122 @@ mod tests {
             item.author_face_url.as_deref(),
             Some("https://i2.hdslb.com/bfs/face/up.jpg")
         );
+    }
+
+    /// rcmd 卡 stat 的可选互动计数透传（缺失保持 None，UI 不编造数字）。
+    #[test]
+    fn video_item_maps_optional_interaction_counts() {
+        let with_like = FeedCard {
+            id: 1,
+            goto: Some("av".into()),
+            bvid: Some("BV1x".into()),
+            stat: Some(bili_core::feed::CardStat {
+                view: 10,
+                danmaku: 2,
+                like: Some(88),
+                ..Default::default()
+            }),
+            ..FeedCard::default()
+        };
+        let item = video_item(&with_like);
+        assert_eq!(item.like_count, Some(88));
+        assert_eq!(item.coin_count, None);
+        assert_eq!(item.favorite_count, None);
+        assert_eq!(item.share_count, None);
+
+        let bare = FeedCard {
+            id: 2,
+            goto: Some("av".into()),
+            bvid: Some("BV2".into()),
+            ..FeedCard::default()
+        };
+        let item = video_item(&bare);
+        assert_eq!(item.like_count, None);
+        assert_eq!(item.play_count, 0);
+    }
+
+    #[test]
+    fn archive_video_item_maps_owner_stat_and_https_thumbnail() {
+        let card = bili_core::feed::ArchiveCard {
+            aid: 80433022,
+            bvid: "BV1GJ411x7h7".into(),
+            cid: 137649199,
+            title: "测试稿件".into(),
+            pic: "http://i0.hdslb.com/bfs/archive/x.jpg".into(),
+            duration: 210,
+            pubdate: 1501000000,
+            owner: bili_core::feed::Owner {
+                mid: 486906719,
+                name: "索尼音乐中国".into(),
+                face: Some("//i0.hdslb.com/bfs/face/up.jpg".into()),
+            },
+            stat: bili_core::feed::CardStat {
+                view: 1_234_567,
+                danmaku: 4_567,
+                like: Some(89_000),
+                coin: Some(3_420),
+                favorite: Some(5_890),
+                share: Some(123),
+                reply: None,
+            },
+            desc: None,
+            tname: None,
+            tid: None,
+            score: None,
+            videos: None,
+        };
+        let item = archive_video_item(&card);
+        assert_eq!(item.aid, 80433022);
+        assert_eq!(item.cid, 137649199);
+        assert_eq!(item.author_mid, 486906719);
+        assert_eq!(item.duration_secs, 210);
+        assert_eq!(item.play_count, 1_234_567);
+        assert_eq!(item.danmaku_count, 4_567);
+        assert_eq!(item.like_count, Some(89_000));
+        assert_eq!(item.coin_count, Some(3_420));
+        assert_eq!(item.favorite_count, Some(5_890));
+        assert_eq!(item.share_count, Some(123));
+        assert_eq!(
+            item.author_face_url.as_deref(),
+            Some("https://i0.hdslb.com/bfs/face/up.jpg")
+        );
+        // 缩略图后缀随 WebP 探测结果变化，仅锚定 https 升级与图源。
+        assert!(
+            item.pic_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("https://i0.hdslb.com/bfs/archive/x.jpg"))
+        );
+    }
+
+    #[test]
+    fn merge_popular_items_dedups_by_bvid() {
+        let mut existing = vec![
+            minimal_video_item("BV1", "一"),
+            minimal_video_item("BV2", "二"),
+        ];
+        let incoming = vec![
+            minimal_video_item("BV2", "二重叠"),
+            minimal_video_item("BV3", "三"),
+            minimal_video_item("BV3", "三重叠"),
+        ];
+        let fresh = merge_popular_items(&mut existing, incoming);
+        assert_eq!(
+            fresh.iter().map(|item| item.bvid.as_str()).collect::<Vec<_>>(),
+            ["BV3"]
+        );
+        assert_eq!(existing.len(), 3);
+        assert_eq!(existing[1].title, "二");
+    }
+
+    #[test]
+    fn minimal_video_item_falls_back_to_bvid_title() {
+        let item = minimal_video_item("BV1xx", "   ");
+        assert_eq!(item.title, "BV1xx");
+        assert_eq!(item.aid, 0);
+        assert_eq!(item.cid, 0);
+        assert!(item.cover.is_none() && item.pic_url.is_none());
+        let named = minimal_video_item("BV1xx", "真实标题");
+        assert_eq!(named.title, "真实标题");
     }
 
     #[test]

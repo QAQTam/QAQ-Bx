@@ -84,6 +84,17 @@ pub struct CommentCallbacks {
     pub on_load_more_sub: Callback<u64>,
 }
 
+/// 播放页右栏「相关推荐」状态（真实 `archive/related` 数据，shell 单源持有）。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RelatedPane {
+    /// 当前关联目标（与播放代次一起做双校验）。
+    pub bvid: String,
+    pub loading: bool,
+    pub loaded_once: bool,
+    pub error: Option<String>,
+    pub items: Vec<VideoItem>,
+}
+
 #[derive(Clone)]
 pub struct PlayerInput {
     pub item: VideoItem,
@@ -96,13 +107,17 @@ pub struct PlayerInput {
     pub compact: bool,
     /// SwapChain 挂载尝试节拍（仅在未挂载时按 250ms 递增驱动 VideoSurface::try_mount）。
     pub mount_tick: u32,
-    /// 展示总长(引擎 duration 优先,占位数据兜底)。
+    /// 展示总长(引擎 duration 优先,卡片元数据兜底)。
     pub duration_secs: u32,
     /// 引擎错误/媒体失败提示(None = 无)。
     pub notice: Option<String>,
     pub engine: Arc<VideoEngine>,
     pub comments: CommentsSnapshot,
     pub comment_cb: CommentCallbacks,
+    /// 相关推荐（真实 archive/related 数据）。
+    pub related: RelatedPane,
+    pub on_open_video: Callback<String>,
+    pub on_related_retry: Callback<()>,
     pub on_toggle: Callback<()>,
     pub on_seek: Callback<f64>,
     pub on_volume: Callback<f64>,
@@ -124,6 +139,9 @@ impl PartialEq for PlayerInput {
             && Arc::ptr_eq(&self.engine, &other.engine)
             && self.comments == other.comments
             && self.comment_cb == other.comment_cb
+            && self.related == other.related
+            && self.on_open_video == other.on_open_video
+            && self.on_related_retry == other.on_related_retry
             && self.on_toggle == other.on_toggle
             && self.on_seek == other.on_seek
             && self.on_volume == other.on_volume
@@ -349,10 +367,10 @@ impl Component for PlayerPage {
                         .spacing(8.0)
                         .vertical_alignment(VerticalAlignment::Center)
                         .children((
-                            action_pill("点赞", "1.2万"),
-                            action_pill("投币", "3,420"),
-                            action_pill("收藏", "5,890"),
-                            action_pill("分享", "转发"),
+                            action_pill("点赞", input.item.like_count),
+                            action_pill("投币", input.item.coin_count),
+                            action_pill("收藏", input.item.favorite_count),
+                            action_pill("分享", input.item.share_count),
                         )),
                 )),
             Expander::new()
@@ -387,7 +405,7 @@ impl Component for PlayerPage {
                         .content(surface),
                     View::from(transport),
                     View::from(info_and_actions),
-                    related_panel(),
+                    related_panel(input),
                     comments_section,
                 ));
             return ScrollViewer::new().content(compact_body).into();
@@ -417,7 +435,7 @@ impl Component for PlayerPage {
         let right_rail = ScrollViewer::new()
             .grid_column(1)
             .margin(Thickness::new(4.0, 16.0, 16.0, 16.0))
-            .content(related_panel());
+            .content(related_panel(input));
 
         let two_col_body = Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Pixel(RIGHT_RAIL_WIDTH)])
@@ -484,23 +502,32 @@ impl Component for PlayerPage {
     }
 }
 
-fn action_pill(label: &str, count: &str) -> View {
+/// 互动计数胶囊：数字来自真实卡片/`video_meta` 统计；未知时只显示标签不编造数字。
+fn action_pill(label: &str, count: Option<u64>) -> View {
+    let count_text: Option<View> = count.map(|value| {
+        View::from(
+            TextBlock::new()
+                .text(theme::fmt_count(value))
+                .font_size(11.0)
+                .opacity(0.65),
+        )
+    });
+    let children: Vec<View> = std::iter::once(
+        TextBlock::new()
+            .text(label)
+            .font_size(12.0)
+            .font_weight(FontWeight::SEMI_BOLD)
+            .into(),
+    )
+    .chain(count_text)
+    .collect();
     Button::new()
         .style(ButtonStyle::Subtle)
         .content(
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(6.0)
-                .children((
-                    TextBlock::new()
-                        .text(label)
-                        .font_size(12.0)
-                        .font_weight(FontWeight::SEMI_BOLD),
-                    TextBlock::new()
-                        .text(count)
-                        .font_size(11.0)
-                        .opacity(0.65),
-                )),
+                .children(children),
         )
         .into()
 }
@@ -1154,16 +1181,38 @@ fn expanded_sub_reply_row(sub: &ReplyItem, data: &CommentsData) -> View {
         .into()
 }
 
-fn related_panel() -> View {
-    let samples = [
-        ("Rust 写一个原生 WinUI 3 B站客户端有多爽？", "技术宅频道", "14.2万", "08:42"),
-        ("Windows App SDK 2.6 + Direct3D11 零拷贝渲染实战", "图形学笔记", "6.8万", "15:19"),
-        ("2026 掌机桌面播放器横向对比：手柄体验谁最强", "数码实验室", "23.5万", "11:05"),
-        ("mpv 渲染 API + Direct2D 弹幕合批优化全解析", "音视频工坊", "4.1万", "19:30"),
-        ("如何用 XInput 给桌面软件做出 Xbox 主机级交互", "独立开发者", "9.3万", "07:14"),
-        ("WinUI 3 Gallery 新控件精选：SelectorBar 与画中画", "微软生态观察", "5.6万", "10:28"),
+/// 相关推荐状态行（加载中/错误重试/空态共用骨架样式）。
+fn related_status_view(text: &str, on_retry: Option<&Callback<()>>) -> View {
+    let mut children: Vec<View> = vec![
+        TextBlock::new()
+            .text(text)
+            .font_size(12.0)
+            .opacity(0.6)
+            .text_wrapping(TextWrapping::Wrap)
+            .into(),
     ];
+    if let Some(on_retry) = on_retry {
+        let on_retry = on_retry.clone();
+        children.push(
+            Button::new()
+                .content("重试")
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .on_click(move || on_retry.call(()))
+                .into(),
+        );
+    }
+    Border::new()
+        .padding(Thickness::xy(10.0, 10.0))
+        .corner_radius(8.0)
+        .background(ThemeBrush::CardBackground)
+        .border_brush(ThemeBrush::CardStroke)
+        .border_thickness(1.0)
+        .content(StackPanel::new().spacing(8.0).children(children))
+        .into()
+}
 
+fn related_panel(input: &PlayerInput) -> View {
+    let related = &input.related;
     let mut cards: Vec<View> = vec![
         TextBlock::new()
             .text("接下来播放 · 相关推荐")
@@ -1172,73 +1221,100 @@ fn related_panel() -> View {
             .into(),
     ];
 
-    for (title, author, views, duration) in samples {
-        cards.push(related_card(title, author, views, duration));
+    if !related.loaded_once {
+        if let Some(err) = &related.error {
+            cards.push(related_status_view(
+                &format!("相关推荐加载失败：{err}"),
+                Some(&input.on_related_retry),
+            ));
+        } else {
+            cards.push(related_status_view("相关推荐加载中…", None));
+        }
+    } else if related.items.is_empty() {
+        cards.push(related_status_view("暂无相关视频", None));
+    } else {
+        for item in &related.items {
+            cards.push(related_card(item, &input.on_open_video));
+        }
     }
 
     StackPanel::new().spacing(10.0).children(cards).into()
 }
 
-fn related_card(title: &str, author: &str, views: &str, duration: &str) -> View {
-    Border::new()
-        .padding(Thickness::xy(8.0, 8.0))
-        .corner_radius(8.0)
-        .background(ThemeBrush::CardBackground)
-        .border_brush(ThemeBrush::CardStroke)
-        .border_thickness(1.0)
+fn related_card(item: &VideoItem, on_open: &Callback<String>) -> View {
+    let bvid = item.bvid.clone();
+    let on_click = on_open.clone();
+    let cover_inner: View = match &item.cover {
+        Some(img) => Image::new()
+            .source_data(img.clone())
+            .stretch(Stretch::UniformToFill)
+            .into(),
+        None => TextBlock::new()
+            .text("封面加载中")
+            .font_size(11.0)
+            .opacity(0.35)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into(),
+    };
+    Button::new()
+        .style(ButtonStyle::Subtle)
+        .horizontal_content_alignment(HorizontalAlignment::Stretch)
+        .on_click(move || on_click.call(bvid.clone()))
         .content(
-            Grid::new()
-                .columns([GridLength::Pixel(132.0), GridLength::Star(1.0)])
-                .children((
-                    Grid::new().height(74.0).children((
-                        Border::new()
-                            .corner_radius(6.0)
-                            .background(ThemeBrush::SolidBackground)
-                            .content(
-                                TextBlock::new()
-                                    .text("封面")
-                                    .font_size(11.0)
-                                    .opacity(0.35)
-                                    .horizontal_alignment(HorizontalAlignment::Center)
-                                    .vertical_alignment(VerticalAlignment::Center),
-                            ),
-                        Border::new()
-                            .background(ThemeBrush::SolidBackground)
-                            .border_brush(ThemeBrush::CardStroke)
-                            .border_thickness(1.0)
-                            .corner_radius(4.0)
-                            .padding(Thickness::xy(5.0, 1.0))
-                            .margin(Thickness::new(0.0, 0.0, 5.0, 5.0))
-                            .horizontal_alignment(HorizontalAlignment::Right)
-                            .vertical_alignment(VerticalAlignment::Bottom)
-                            .content(
-                                TextBlock::new()
-                                    .text(duration)
-                                    .foreground(ThemeBrush::PrimaryText)
-                                    .font_size(10.0),
-                            ),
-                    )),
-                    StackPanel::new()
-                        .grid_column(1)
-                        .margin(Thickness::new(10.0, 0.0, 0.0, 0.0))
-                        .spacing(4.0)
+            Border::new()
+                .padding(Thickness::xy(8.0, 8.0))
+                .corner_radius(8.0)
+                .background(ThemeBrush::CardBackground)
+                .border_brush(ThemeBrush::CardStroke)
+                .border_thickness(1.0)
+                .content(
+                    Grid::new()
+                        .columns([GridLength::Pixel(132.0), GridLength::Star(1.0)])
                         .children((
-                            TextBlock::new()
-                                .text(title)
-                                .font_size(13.0)
-                                .font_weight(FontWeight::SEMI_BOLD)
-                                .text_wrapping(TextWrapping::Wrap)
-                                .max_lines(2),
-                            TextBlock::new()
-                                .text(author)
-                                .font_size(11.0)
-                                .opacity(0.6),
-                            TextBlock::new()
-                                .text(format!("▶ {views}"))
-                                .font_size(11.0)
-                                .opacity(0.55),
+                            Grid::new().height(74.0).children((
+                                Border::new()
+                                    .corner_radius(6.0)
+                                    .background(ThemeBrush::SolidBackground)
+                                    .content(cover_inner),
+                                Border::new()
+                                    .background(ThemeBrush::SolidBackground)
+                                    .border_brush(ThemeBrush::CardStroke)
+                                    .border_thickness(1.0)
+                                    .corner_radius(4.0)
+                                    .padding(Thickness::xy(5.0, 1.0))
+                                    .margin(Thickness::new(0.0, 0.0, 5.0, 5.0))
+                                    .horizontal_alignment(HorizontalAlignment::Right)
+                                    .vertical_alignment(VerticalAlignment::Bottom)
+                                    .content(
+                                        TextBlock::new()
+                                            .text(theme::fmt_duration(item.duration_secs))
+                                            .foreground(ThemeBrush::PrimaryText)
+                                            .font_size(10.0),
+                                    ),
+                            )),
+                            StackPanel::new()
+                                .grid_column(1)
+                                .margin(Thickness::new(10.0, 0.0, 0.0, 0.0))
+                                .spacing(4.0)
+                                .children((
+                                    TextBlock::new()
+                                        .text(item.title.clone())
+                                        .font_size(13.0)
+                                        .font_weight(FontWeight::SEMI_BOLD)
+                                        .text_wrapping(TextWrapping::Wrap)
+                                        .max_lines(2),
+                                    TextBlock::new()
+                                        .text(item.author.clone())
+                                        .font_size(11.0)
+                                        .opacity(0.6),
+                                    TextBlock::new()
+                                        .text(format!("▶ {}", theme::fmt_count(item.play_count)))
+                                        .font_size(11.0)
+                                        .opacity(0.55),
+                                )),
                         )),
-                )),
+                ),
         )
         .into()
 }

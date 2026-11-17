@@ -2,7 +2,7 @@
 //! AppShell 组件树并派发 Message,断言壳层状态。覆盖「鼠标模拟测不到」
 //! 的路径:快速切视频的播放代次取消、评论双桶缓存、导航历史栈。
 //!
-//! 用法:`bili-ui.exe --selftest [all|boot|nav|comments|rapid-switch|stress|search]`
+//! 用法:`bili-ui.exe --selftest [all|boot|nav|comments|rapid-switch|stress|search|popular]`
 //! 前置:`cargo build -p bili-ui --features selftest`;需要真实网络与
 //! 本地凭据(nav 探测 / feed / 评论均走真实接口)。
 
@@ -14,7 +14,7 @@ use windows_reactor::{component, test::{ComponentHost, RecordingAdapter}};
 use crate::pages::player::CommentSort;
 use crate::shell::{AppShell, Message, ShellInput, ShellProbe};
 
-/// 占位种子数据中可解析真实媒体的测试稿件(`data::find` 直达,不依赖随机 feed)。
+/// 可解析真实媒体的测试稿件（open_video 走最小模型 + video_meta 解析管线，不依赖任何种子数据）。
 const TEST_BV: &str = "BV1GJ411x7h7";
 /// TEST_BV 的真实稿件 id(评论区断言用)。
 const TEST_AID: u64 = 80433022;
@@ -125,6 +125,11 @@ fn comments(s: &mut Scenario) -> Result<(), String> {
         assert!(!probe.comments_sort_latest, "默认排序应为按热度");
         assert!(probe.hot_total.unwrap_or(0) > 0, "总评论数应 > 0");
     }
+    // 相关推荐:真实 archive/related 应随同一次播放就绪。
+    s.wait_for(Duration::from_secs(30), |p| {
+        p.related_items > 0 && p.related_bvid == TEST_BV
+    })
+    .map_err(|err| format!("相关推荐未就绪:{err}"))?;
     let hot_before = s.probe.borrow().hot_replies;
 
     s.send(Message::SetCommentSort(CommentSort::Latest))?;
@@ -248,6 +253,31 @@ fn search(s: &mut Scenario) -> Result<(), String> {
     Ok(())
 }
 
+/// 场景 8:热门页真实数据（导航进入 → popular 分页落定 → 首卡经 popular_index 打开）。
+fn popular(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    s.send(Message::NavTagSelected(Some("popular".into())))?;
+    s.wait_for(Duration::from_secs(30), |p| {
+        p.route_tag == "popular" && p.popular_items > 0
+    })
+    .map_err(|err| format!("热门数据未就绪:{err}"))?;
+    let first = s
+        .probe
+        .borrow()
+        .popular_first_bvid
+        .clone()
+        .ok_or("热门首卡缺少 bvid")?;
+    s.send(Message::OpenVideo(first.clone()))?;
+    s.wait_for(Duration::from_secs(60), |p| {
+        p.route_tag == "player" && p.now_playing_bvid.as_deref() == Some(first.as_str())
+    })
+    .map_err(|err| format!("热门首卡打开失败:{err}"))?;
+    s.send(Message::Back)?;
+    s.sync()?;
+    assert_eq!(s.probe.borrow().route_tag, "popular", "Back 应回到热门页");
+    Ok(())
+}
+
 /// 场景 7:图像编解码探测(WebP WIC 探测器一致性 + 后缀与探测结果一致)。
 fn codec(s: &mut Scenario) -> Result<(), String> {
     s.sync()?;
@@ -283,6 +313,7 @@ const SCENARIOS: &[(&str, fn(&mut Scenario) -> Result<(), String>)] = &[
     ("stress", stress),
     ("search", search),
     ("codec", codec),
+    ("popular", popular),
 ];
 
 /// 解析 `--selftest [scenario]`;非 selftest 调用返回 `None` 走正常启动。
