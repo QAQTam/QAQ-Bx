@@ -1,0 +1,573 @@
+//! 内部状态自测(reactor `test` 模式):不开窗口、不模拟鼠标,直接挂载
+//! AppShell 组件树并派发 Message,断言壳层状态。覆盖「鼠标模拟测不到」
+//! 的路径:快速切视频的播放代次取消、评论双桶缓存、导航历史栈。
+//!
+//! 用法:`qaq-bx-ui.exe --selftest [all|boot|nav|comments|rapid-switch|stress|search|popular|half-pane|codec]`
+//! 前置:`cargo build -p qaq-bx-ui --features selftest`;需要真实网络与
+//! 本地凭据(nav 探测 / feed / 评论均走真实接口)。
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+use windows_reactor::{component, test::{ComponentHost, RecordingAdapter}};
+
+use crate::pages::account::NotifyTab;
+use crate::pages::player::CommentSort;
+use crate::router::Route;
+use crate::shell::{AppShell, Message, ShellInput, ShellProbe};
+
+/// 可解析真实媒体的测试稿件（open_video 走最小模型 + video_meta 解析管线，不依赖任何种子数据）。
+const TEST_BV: &str = "BV1GJ411x7h7";
+/// TEST_BV 的真实稿件 id(评论区断言用)。
+const TEST_AID: u64 = 80433022;
+
+type Host = ComponentHost<RecordingAdapter>;
+
+struct Scenario {
+    host: Host,
+    probe: Rc<RefCell<ShellProbe>>,
+}
+
+impl Scenario {
+    /// 挂载独立的 AppShell 组件树(RecordingAdapter 只记录属性/事件,不开窗)。
+    fn mount() -> Result<Self, String> {
+        let probe = Rc::new(RefCell::new(ShellProbe::default()));
+        let mut host = ComponentHost::mount(
+            RecordingAdapter::default(),
+            [component::<AppShell>(
+                "root",
+                ShellInput {
+                    probe: Some(Rc::clone(&probe)),
+                },
+            )],
+        );
+        host.drain(usize::MAX);
+        Ok(Self { host, probe })
+    }
+
+    fn send(&mut self, message: Message) -> Result<(), String> {
+        let sender = self
+            .host
+            .sender::<AppShell>(&"root".into())
+            .ok_or_else(|| "root 组件 sender 缺失".to_string())?;
+        // 队列关闭(组件退役)时返回 Err——测试场景内组件始终存活,忽略即可。
+        let _ = sender.send(message);
+        Ok(())
+    }
+
+    /// 驱动消息队列至静止,再派发一次 SelfTestSync 强制在尾部刷新探针。
+    fn sync(&mut self) -> Result<(), String> {
+        self.host.drain(usize::MAX);
+        self.send(Message::SelfTestSync)?;
+        self.host.drain(usize::MAX);
+        Ok(())
+    }
+
+    /// 轮询直到谓词成立;每轮全量 drain + sync,超时返回带探针状态的错误。
+    fn wait_for(
+        &mut self,
+        timeout: Duration,
+        predicate: impl Fn(&ShellProbe) -> bool,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.sync()?;
+            if predicate(&self.probe.borrow()) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "等待超时({timeout:?}),最后探针状态:{:?}",
+                    self.probe.borrow()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+/// 场景 1:挂载 + 首页 feed 落定(覆盖 create 的 feed/登录探测启动路径)。
+fn boot(s: &mut Scenario) -> Result<(), String> {
+    s.wait_for(Duration::from_secs(30), |p| {
+        p.route_tag == "home" && p.history_len == 0
+    })
+}
+
+/// 场景 2:导航标签切换与历史栈(设置页 → Back → 首页)。
+fn nav(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    assert_eq!(s.probe.borrow().route_tag, "home", "初始路由应为 home");
+    s.send(Message::NavTagSelected(Some("settings".into())))?;
+    s.sync()?;
+    {
+        let probe = s.probe.borrow();
+        assert_eq!(probe.route_tag, "settings", "导航标签应切换到设置页");
+        assert_eq!(probe.history_len, 1, "导航切换应留一层历史");
+    }
+    s.send(Message::Back)?;
+    s.sync()?;
+    let probe = s.probe.borrow();
+    assert_eq!(probe.route_tag, "home", "Back 应回到首页");
+    assert_eq!(probe.history_len, 0, "返回后历史应为空");
+    Ok(())
+}
+
+/// 场景 3:真实评论区(解析稿件 → 首页评论 → 排序切换 → 双桶缓存保留)。
+fn comments(s: &mut Scenario) -> Result<(), String> {
+    s.send(Message::OpenVideo(TEST_BV.into()))?;
+    s.wait_for(Duration::from_secs(60), |p| {
+        p.now_playing_bvid.as_deref() == Some(TEST_BV)
+            && p.hot_loaded
+            && p.hot_replies > 0
+    })
+    .map_err(|err| format!("评论首页未就绪:{err}"))?;
+    {
+        let probe = s.probe.borrow();
+        assert_eq!(probe.comments_aid, TEST_AID, "评论会话 aid 应为真实稿件");
+        assert!(!probe.comments_sort_latest, "默认排序应为按热度");
+        assert!(probe.hot_total.unwrap_or(0) > 0, "总评论数应 > 0");
+    }
+    // 相关推荐:真实 archive/related 应随同一次播放就绪。
+    s.wait_for(Duration::from_secs(30), |p| {
+        p.related_items > 0 && p.related_bvid == TEST_BV
+    })
+    .map_err(|err| format!("相关推荐未就绪:{err}"))?;
+    let hot_before = s.probe.borrow().hot_replies;
+
+    s.send(Message::SetCommentSort(CommentSort::Latest))?;
+    s.wait_for(Duration::from_secs(60), |p| {
+        p.comments_sort_latest && p.latest_loaded && p.latest_replies > 0
+    })
+    .map_err(|err| format!("按时间排序未就绪:{err}"))?;
+
+    // 双桶缓存:切回热度后原页数据应保留,不得重置。
+    s.send(Message::SetCommentSort(CommentSort::Hot))?;
+    s.wait_for(Duration::from_secs(10), |p| !p.comments_sort_latest)
+        .map_err(|err| format!("切回按热度失败:{err}"))?;
+    s.sync()?;
+    {
+        let probe = s.probe.borrow();
+        assert!(probe.hot_loaded, "热度桶缓存应保留");
+        assert_eq!(probe.hot_replies, hot_before, "热度桶评论数不应被重置");
+    }
+
+    s.send(Message::Back)?;
+    s.sync()?;
+    {
+        let probe = s.probe.borrow();
+        assert_eq!(probe.route_tag, "home", "播放页 Back 应回首页");
+        assert!(
+            probe.now_playing_bvid.is_none(),
+            "移除全局播放条后，离开播放页应停止播放并释放当前视频"
+        );
+    }
+    Ok(())
+}
+
+/// 场景 4:快速连续切视频(刻意不等待解析完成,叠加在飞请求,
+/// 考验 playback_gen 取消路径与评论区会话重置——复现 try_wake panic 的高压路径)。
+fn rapid_switch(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    let gen0 = s.probe.borrow().playback_gen;
+    for _ in 0..3 {
+        s.send(Message::OpenVideo(TEST_BV.into()))?;
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    s.host.drain(usize::MAX);
+    s.sync()?;
+    {
+        let probe = s.probe.borrow();
+        let gen_after = probe.playback_gen;
+        assert!(
+            gen_after >= gen0 + 3,
+            "播放代次应至少递增 3 次(gen {gen0} → {gen_after})"
+        );
+        assert_eq!(probe.route_tag, "player", "三连开之后应停留在播放页");
+    }
+
+    s.send(Message::Back)?;
+    std::thread::sleep(Duration::from_millis(150));
+    s.send(Message::OpenVideo(TEST_BV.into()))?;
+    s.sync()?;
+    {
+        let probe = s.probe.borrow();
+        assert_eq!(probe.route_tag, "player", "返回后再次打开应进播放页");
+        assert!(
+            probe.playback_gen >= gen0 + 4,
+            "返回再开应继续递增代次(gen {} → {})",
+            gen0 + 3,
+            probe.playback_gen
+        );
+    }
+    Ok(())
+}
+
+/// 场景 5:消息风暴——追查 2026-11-16 22:43 的 try_wake panic 类问题。
+/// 在解析/评论/头像请求在飞时高频注入交互消息(排序翻转/翻页/导航/引擎控制),
+/// 多轮叠加,制造消息乱序抵达 update 的工况;headless 下 panic 会被捕获为 FAIL
+/// 而非进程 abort,原始 panic 消息可留存。
+fn stress(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    let gen0 = s.probe.borrow().playback_gen;
+    for _ in 0..3 {
+        s.send(Message::OpenVideo(TEST_BV.into()))?;
+        for _ in 0..8 {
+            s.send(Message::SetCommentSort(CommentSort::Latest))?;
+            s.send(Message::SetCommentSort(CommentSort::Hot))?;
+            s.send(Message::LoadMoreComments)?;
+            s.send(Message::Seek(12.0))?;
+            s.send(Message::TogglePlay)?;
+            s.send(Message::Back)?;
+            s.send(Message::OpenVideo(TEST_BV.into()))?;
+            s.send(Message::NavTagSelected(Some("settings".into())))?;
+            s.send(Message::NavTagSelected(Some("home".into())))?;
+            s.send(Message::Back)?;
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        s.host.drain(usize::MAX);
+    }
+    s.sync()?;
+    let gen_after = s.probe.borrow().playback_gen;
+    assert!(
+        gen_after > gen0,
+        "消息风暴后代次应推进(gen {gen0} → {gen_after})"
+    );
+    Ok(())
+}
+
+/// 场景 6:搜索(真实 WBI 签名搜索 → 结果网格 → 点开首个结果,验证
+/// open_video 的 search_index 回退链)。
+fn search(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    s.send(Message::SearchDraftChanged("rust".into()))?;
+    s.send(Message::SearchSubmitted)?;
+    s.wait_for(Duration::from_secs(45), |p| {
+        p.route_tag == "search" && p.search_videos > 0
+    })
+    .map_err(|err| format!("搜索结果未就绪:{err}"))?;
+    let first = s
+        .probe
+        .borrow()
+        .search_first_bvid
+        .clone()
+        .ok_or("搜索结果缺少首条 bvid")?;
+    s.send(Message::OpenVideo(first.clone()))?;
+    s.wait_for(Duration::from_secs(60), |p| {
+        p.now_playing_bvid.as_deref() == Some(first.as_str())
+    })
+    .map_err(|err| format!("搜索结果打开失败:{err}"))?;
+    s.send(Message::Back)?;
+    s.sync()?;
+    assert_eq!(s.probe.borrow().route_tag, "search", "Back 应回到搜索页");
+    Ok(())
+}
+
+/// 场景 8:热门页真实数据（导航进入 → popular 分页落定 → 首卡经 popular_index 打开）。
+fn popular(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    s.send(Message::NavTagSelected(Some("popular".into())))?;
+    s.wait_for(Duration::from_secs(30), |p| {
+        p.route_tag == "popular" && p.popular_items > 0
+    })
+    .map_err(|err| format!("热门数据未就绪:{err}"))?;
+    let first = s
+        .probe
+        .borrow()
+        .popular_first_bvid
+        .clone()
+        .ok_or("热门首卡缺少 bvid")?;
+    s.send(Message::OpenVideo(first.clone()))?;
+    s.wait_for(Duration::from_secs(60), |p| {
+        p.route_tag == "player" && p.now_playing_bvid.as_deref() == Some(first.as_str())
+    })
+    .map_err(|err| format!("热门首卡打开失败:{err}"))?;
+    s.send(Message::Back)?;
+    s.sync()?;
+    assert_eq!(s.probe.borrow().route_tag, "popular", "Back 应回到热门页");
+    Ok(())
+}
+
+/// 场景 7:图像编解码探测(WebP WIC 探测器一致性 + 后缀与探测结果一致)。
+fn codec(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    let first = crate::codec::webp_supported();
+    let again = crate::codec::webp_supported();
+    assert_eq!(first, again, "探测结果应进程内缓存一致");
+    assert!(
+        first == (crate::codec::raster_suffix() == "webp"),
+        "URL 后缀应与探测结果一致"
+    );
+    println!(
+        "[codec] webp_supported={first} raster_suffix={}",
+        crate::codec::raster_suffix()
+    );
+    // GUID 交叉验证:本机若有真实 WebP 样本(target/bg-probe/),文件可解码
+    // 而 GUID 探测失败 ⇒ GUID 写错,必须修正而不是让 WebP 静默失效。
+    let probe = std::path::Path::new("../bg-probe/b1280.webp");
+    if probe.exists() {
+        let by_file = crate::codec::probe_webp_file(probe);
+        println!("[codec] probe-file={by_file}");
+        if by_file {
+            assert!(first, "真实 WebP 可解码但 GUID 探测失败——GUID 写错了");
+        }
+    }
+    Ok(())
+}
+
+/// 场景 9:首页半屏抽屉挂载 + 加载指示生命周期(回归冷启动首个视频黑屏 /
+/// 关闭播放条丢弃引擎后重开复发的 bug)。半屏态 route 合法地停在 Home——旧门控
+/// 只认 `route == Player`,`mount_tick` 永不脉冲,swapchain 错过唯一一次 metrics
+/// 挂载后再无重试(真机上表现为永久黑屏)。修复后:
+/// 开播 → 环形指示点亮;脉冲驱动 swapchain 挂载;首个 has_media → 指示熄灭。
+fn half_pane_pulse(s: &mut Scenario) -> Result<(), String> {
+    s.send(Message::OpenVideo(TEST_BV.into()))?;
+    s.sync()?;
+    assert!(s.probe.borrow().video_loading, "开播后加载环形指示应点亮(解析/缓冲中)");
+    s.wait_for(Duration::from_secs(60), |p| {
+        p.route_tag == "home"
+            && p.home_half_pane
+            && p.now_playing_bvid.as_deref() == Some(TEST_BV)
+    })
+    .map_err(|err| format!("半屏抽屉未就绪:{err}"))?;
+    s.wait_for(Duration::from_secs(20), |p| p.engine_attached && p.mount_tick >= 1)
+        .map_err(|err| format!("半屏挂载脉冲未驱动 swapchain 挂载(旧 bug 现场):{err}"))?;
+    s.wait_for(Duration::from_secs(60), |p| !p.video_loading)
+        .map_err(|err| format!("媒体就绪后加载指示未熄灭:{err}"))?;
+
+    // 半屏独立控件：弹幕开关切换、静音/恢复、关闭半屏即停止播放
+    assert!(s.probe.borrow().danmaku_enabled, "初始设置应开启弹幕");
+    s.send(Message::ToggleDanmaku)?;
+    s.sync()?;
+    assert!(!s.probe.borrow().danmaku_enabled, "ToggleDanmaku 应关闭弹幕");
+    s.send(Message::ToggleDanmaku)?;
+    s.sync()?;
+    assert!(s.probe.borrow().danmaku_enabled, "再次 ToggleDanmaku 应开启弹幕");
+
+    assert_eq!(s.probe.borrow().volume, 30);
+    s.send(Message::ToggleMute)?;
+    s.sync()?;
+    assert_eq!(s.probe.borrow().volume, 0, "ToggleMute 应静音");
+    s.send(Message::ToggleMute)?;
+    s.sync()?;
+    assert_eq!(s.probe.borrow().volume, 30, "再次 ToggleMute 应恢复原音量");
+
+    s.send(Message::CloseHalfPane)?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(!p.home_half_pane, "CloseHalfPane 应关闭半屏");
+        assert!(p.now_playing_bvid.is_none(), "关闭半屏后应停止后台播放");
+    }
+    Ok(())
+}
+
+/// 场景 10:Mobile 形态联动（390px 切底栏/2 列/禁半窗/私信单页钻取与 Back 栈/Medium 悬浮搜索/回切 Desktop）。
+fn mobile(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(!p.is_mobile, "默认启动应为 Desktop 形态");
+        assert_eq!(p.grid_cols, 4, "1280x800 默认应为 4 列");
+    }
+
+    // 1. 缩放至 390x760：切 Mobile + 2 列
+    s.send(Message::WindowResized(windows_reactor::WindowSize {
+        width: 390.0,
+        height: 760.0,
+    }))?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(p.is_mobile, "390px 应进入 Mobile 形态");
+        assert_eq!(p.grid_cols, 2, "Mobile 应严格为 2 列");
+    }
+
+    // 2. Mobile 禁用 HalfPane：即使设置 HalfPane，点视频应直达 Route::Player
+    s.send(Message::OpenVideo(TEST_BV.into()))?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(!p.home_half_pane, "Mobile 下应禁用 HalfPane");
+        assert_eq!(p.route_tag, "player", "Mobile 点卡应直达播放页");
+    }
+    s.send(Message::Back)?;
+    s.sync()?;
+    assert_eq!(s.probe.borrow().route_tag, "home", "播放页 Back 应回首页");
+
+    // 3. 底栏「更多」新增 WatchLater 导航 + 我的私信单页钻取与 Back 优先级
+    s.send(Message::NavigateCompact(Route::WatchLater))?;
+    s.sync()?;
+    assert_eq!(s.probe.borrow().route_tag, "watch-later");
+
+    s.send(Message::NavigateCompact(Route::Login))?;
+    s.sync()?;
+    assert_eq!(s.probe.borrow().route_tag, "login");
+
+    s.send(Message::SelectNotifyTab(NotifyTab::Whisper))?;
+    s.send(Message::SelectWhisperSession((12_345, 1)))?;
+    s.sync()?;
+    assert!(
+        s.probe.borrow().whisper_detail_open,
+        "Mobile 下选中私信会话应展开单页对话详情"
+    );
+
+    // 第一次 Back 应先退回会话列表而非弹出路由历史
+    s.send(Message::Back)?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(!p.whisper_detail_open, "首次 Back 应先关闭私信详情");
+        assert_eq!(p.route_tag, "login", "首次 Back 不得离开个人中心");
+    }
+
+    // 第二次 Back 才弹出路由回到 watch-later
+    s.send(Message::Back)?;
+    s.sync()?;
+    assert_eq!(s.probe.borrow().route_tag, "watch-later");
+
+    // 4. Medium 半屏（640x900）：处于 2 列区间即保持 Mobile，且顶栏右上可呼出悬浮搜索浮窗并提交跳 Search
+    s.send(Message::WindowResized(windows_reactor::WindowSize {
+        width: 640.0,
+        height: 900.0,
+    }))?;
+    s.sync()?;
+    assert!(s.probe.borrow().is_mobile, "640px 2 列区应保持 Mobile 形态");
+    assert_eq!(s.probe.borrow().grid_cols, 2, "640px 应铺满 2 列");
+    s.send(Message::ToggleSearchOverlay)?;
+    s.sync()?;
+    assert!(s.probe.borrow().search_overlay_open, "600..859 半屏下应可呼出悬浮搜索");
+    s.send(Message::SearchDraftChanged("rust".into()))?;
+    s.send(Message::SearchSubmitted)?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(!p.search_overlay_open, "提交搜索后应自动收起悬浮窗");
+        assert_eq!(p.route_tag, "search", "提交搜索应切至搜索页");
+    }
+
+    // 5. 860x800 起恰能容纳 3 列，切回 Desktop；1280x800 恢复 4 列
+    s.send(Message::WindowResized(windows_reactor::WindowSize {
+        width: 860.0,
+        height: 800.0,
+    }))?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(!p.is_mobile, "860px 3 列起点应切回 Desktop");
+        assert_eq!(p.grid_cols, 3, "860px 应渲染 3 列");
+    }
+
+    s.send(Message::WindowResized(windows_reactor::WindowSize {
+        width: 1280.0,
+        height: 800.0,
+    }))?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(!p.is_mobile);
+        assert_eq!(p.grid_cols, 4);
+        assert!(!p.whisper_detail_open);
+        assert!(!p.search_overlay_open);
+    }
+    Ok(())
+}
+
+const SCENARIOS: &[(&str, &str, fn(&mut Scenario) -> Result<(), String>)] = &[
+    ("boot", "FullPlayer", boot),
+    ("nav", "FullPlayer", nav),
+    ("comments", "FullPlayer", comments),
+    ("rapid-switch", "FullPlayer", rapid_switch),
+    ("stress", "FullPlayer", stress),
+    ("search", "FullPlayer", search),
+    ("codec", "FullPlayer", codec),
+    ("popular", "FullPlayer", popular),
+    ("half-pane", "HalfPane", half_pane_pulse),
+    ("mobile", "HalfPane", mobile),
+];
+
+/// 解析 `--selftest [scenario]`;非 selftest 调用返回 `None` 走正常启动。
+pub fn scenario_from_args() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    match args.next()?.as_str() {
+        "--selftest" => Some(args.next().unwrap_or_else(|| "all".to_string())),
+        _ => None,
+    }
+}
+
+/// 隔离数据目录:不读不写用户真实凭据(AGENTS.md #7,顺带覆盖访客态路径)。
+fn prepare_hermetic_data_dir() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "exe 无父目录".to_string())?
+        .join("selftest-data");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // 2024 edition 的 set_var 为 unsafe;此处在组件挂载前的主线程单次调用,无并发读。
+    unsafe { std::env::set_var("QAQ_BX_DATA_DIR", &dir) };
+    Ok(())
+}
+
+/// 按场景写 settings.json(每次 mount 前调用,AppShell::create 读取)。
+/// 除 half-pane 回归场景外一律 FullPlayer——否则用户的 HalfPane 配置会让
+/// start_playback 走半窗分支(route 合法地留在 Home),路由断言失效。
+fn write_hermetic_settings(home_open_mode: &str) -> Result<(), String> {
+    let dir = qaq_bx_core::resolve_data_dir();
+    std::fs::write(
+        dir.join("settings.json"),
+        format!(
+            r#"{{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"{home_open_mode}","autoplay":true,"hardware_decode":true,"volume":30}}"#
+        ),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// 场景执行器:独立 panic hook(落盘 crash.log,不弹窗),逐场景隔离挂载。
+pub fn run(scenario: &str) {
+    if let Err(err) = prepare_hermetic_data_dir() {
+        println!("[FAIL] 隔离数据目录准备失败:{err}");
+        std::process::exit(1);
+    }
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("[panic] {info}");
+        let log_path = qaq_bx_core::resolve_data_dir().join("crash.log");
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&log_path, format!("QAQ-Bx selftest panic:\n{info}"));
+    }));
+
+    let mut failed = 0usize;
+    for (name, open_mode, func) in SCENARIOS {
+        if scenario != "all" && scenario != *name {
+            continue;
+        }
+        let start = Instant::now();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            write_hermetic_settings(open_mode)?;
+            let mut state = Scenario::mount()?;
+            func(&mut state)
+        }))
+        .unwrap_or_else(|payload| {
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_else(|| "未知 panic".to_string());
+            Err(format!("panic:{message}"))
+        });
+        let elapsed = start.elapsed().as_secs_f32();
+        match outcome {
+            Ok(()) => println!("[PASS] {name} ({elapsed:.1}s)"),
+            Err(err) => {
+                println!("[FAIL] {name} ({elapsed:.1}s):{err}");
+                failed += 1;
+            }
+        }
+    }
+    if failed == 0 {
+        println!("[done] selftest 全部通过");
+    } else {
+        println!("[done] selftest 失败 {failed} 项");
+        std::process::exit(1);
+    }
+}

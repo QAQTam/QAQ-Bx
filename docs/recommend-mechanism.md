@@ -82,7 +82,7 @@ Af = cards => {
   bundle 内嵌混淆 key（`charCodeAt-1` 解混淆）；签名参数可带 `w_webid`（= `_render_data_.access_id`，
   SSR 注入；实测不带也能过 → 可选）。
 
-## 5. biliplay 复刻蓝本（首页 feed 实现 spec）
+## 5. QAQ-Bx 复刻蓝本（首页 feed 实现 spec）
 
 ```
 FeedSession（每应用启动）:

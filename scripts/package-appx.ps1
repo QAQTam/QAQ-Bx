@@ -184,7 +184,7 @@ function Resolve-ToastClsid {
     if (-not [string]::IsNullOrWhiteSpace($Requested)) {
         return $Requested.Trim().Trim('{', '}').ToLowerInvariant()
     }
-    $notifRs = Join-Path $RepoRoot "crates\bili-ui\src\notifications.rs"
+    $notifRs = Join-Path $RepoRoot "crates\qaq-bx-ui\src\notifications.rs"
     if (Test-Path $notifRs) {
         $src = Get-Content $notifRs -Raw
         if ($src -match 'TOAST_ACTIVATOR_CLSID:\s*&str\s*=\s*"([0-9a-fA-F-]+)"') {
@@ -222,13 +222,13 @@ if ($Sign) {
     $signTool = Find-SdkTool "signtool.exe"
 }
 
-Write-Host "[build] cargo build $(if ($isRelease) { '--release ' })-p bili-ui (v$version4 / $resolvedPackageName / CLSID=$resolvedToastClsid)" -ForegroundColor Cyan
+Write-Host "[build] cargo build $(if ($isRelease) { '--release ' })-p qaq-bx-ui (v$version4 / $resolvedPackageName / CLSID=$resolvedToastClsid)" -ForegroundColor Cyan
 Push-Location $RepoRoot
 try {
     if ($isRelease) {
-        & cargo build --release -p bili-ui
+        & cargo build --release -p qaq-bx-ui
     } else {
-        & cargo build -p bili-ui
+        & cargo build -p qaq-bx-ui
     }
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build 失败 (exit=$LASTEXITCODE)"
@@ -249,7 +249,7 @@ New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
 # 1. 复制可执行文件与 windows-reactor-setup 部署的运行时文件/子目录
-$exePath = Join-Path $targetProfileDir "bili-ui.exe"
+$exePath = Join-Path $targetProfileDir "qaq-bx-ui.exe"
 if (-not (Test-Path $exePath)) {
     throw "未找到编译产物: $exePath"
 }
@@ -264,7 +264,7 @@ Get-ChildItem -Path $targetProfileDir -Directory | Where-Object {
 
 $runtimeExts = @(".dll", ".winmd", ".pri", ".xbf", ".mui", ".json")
 Get-ChildItem -Path $targetProfileDir -File | Where-Object {
-    ($runtimeExts -contains $_.Extension.ToLowerInvariant()) -and ($_.Name -notlike "biliplay*")
+    ($runtimeExts -contains $_.Extension.ToLowerInvariant()) -and ($_.Name -notlike "qaq-bx.*") -and ($_.Name -notlike "qaq-bx-cli*")
 } | ForEach-Object {
     Copy-Item -Force $_.FullName (Join-Path $stagingDir $_.Name)
 }

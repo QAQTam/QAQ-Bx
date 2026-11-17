@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/bili-core", "crates/bili-plugin-login", "crates/bili-cli", "crates/bili-ui", "crates/bili-video"]
+members = ["crates/qaq-bx-core", "crates/qaq-bx-plugin-login", "crates/qaq-bx-cli", "crates/qaq-bx-ui", "crates/qaq-bx-video"]
 
 [workspace.package]
 edition = "2024"
-version = "0.0.1"
+version = "0.1.0"
 license = "MIT"
 
 [workspace.dependencies]
@@ -41,8 +41,8 @@ qrcode = "0.14"
 url = "2"
 anyhow = "1"
 
-bili-core = { path = "crates/bili-core" }
-bili-plugin-login = { path = "crates/bili-plugin-login" }
-bili-video = { path = "crates/bili-video" }
+qaq-bx-core = { path = "crates/qaq-bx-core" }
+qaq-bx-plugin-login = { path = "crates/qaq-bx-plugin-login" }
+qaq-bx-video = { path = "crates/qaq-bx-video" }
 # UI：microsoft/windows-rs 下一代（本地 checkout，0.101 未发布故走 path）
 windows-reactor = { path = "D:/Projects/qaq-winui-reactor/crates/libs/reactor" }

@@ -83,87 +83,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "bili-cli"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "bili-core",
- "bili-plugin-login",
- "bili-video",
- "image",
- "qrcode",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "windows",
-]
-
-[[package]]
-name = "bili-core"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "hex",
- "md-5",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "bili-plugin-login"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "bili-core",
- "hex",
- "image",
- "qrcode",
- "reqwest",
- "rsa",
- "serde",
- "serde_json",
- "sha2",
- "url",
-]
-
-[[package]]
-name = "bili-ui"
-version = "0.0.1"
-dependencies = [
- "bili-core",
- "bili-plugin-login",
- "bili-video",
- "reqwest",
- "serde",
- "tokio",
- "windows",
- "windows-bindgen",
- "windows-canvas",
- "windows-collections",
- "windows-core",
- "windows-reactor",
- "windows-reactor-setup",
- "windows-reference",
- "windows-text",
-]
-
-[[package]]
-name = "bili-video"
-version = "0.0.1"
-dependencies = [
- "thiserror",
- "windows",
- "windows-canvas",
- "windows-sys 0.100.0",
- "windows-text",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1106,6 +1025,87 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
+
+[[package]]
+name = "qaq-bx-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "qaq-bx-core",
+ "qaq-bx-plugin-login",
+ "qaq-bx-video",
+ "qrcode",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "windows",
+]
+
+[[package]]
+name = "qaq-bx-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "md-5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "qaq-bx-plugin-login"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "image",
+ "qaq-bx-core",
+ "qrcode",
+ "reqwest",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2",
+ "url",
+]
+
+[[package]]
+name = "qaq-bx-ui"
+version = "0.1.0"
+dependencies = [
+ "qaq-bx-core",
+ "qaq-bx-plugin-login",
+ "qaq-bx-video",
+ "reqwest",
+ "serde",
+ "tokio",
+ "windows",
+ "windows-bindgen",
+ "windows-canvas",
+ "windows-collections",
+ "windows-core",
+ "windows-reactor",
+ "windows-reactor-setup",
+ "windows-reference",
+ "windows-text",
+]
+
+[[package]]
+name = "qaq-bx-video"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "windows",
+ "windows-canvas",
+ "windows-sys 0.100.0",
+ "windows-text",
+]
 
 [[package]]
 name = "qrcode"

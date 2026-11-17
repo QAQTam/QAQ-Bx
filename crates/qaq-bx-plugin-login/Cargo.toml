@@ -1,0 +1,19 @@
+[package]
+name = "qaq-bx-plugin-login"
+description = "QAQ-Bx 第一个插件：B 站扫码登录（generate/poll 流程，见 docs/bilibili-login-research.md）"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+qaq-bx-core.workspace = true
+hex.workspace = true
+image.workspace = true
+qrcode.workspace = true
+reqwest.workspace = true
+rsa.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+url.workspace = true

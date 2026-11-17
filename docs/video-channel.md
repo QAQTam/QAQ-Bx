@@ -55,7 +55,7 @@
   mpv_command/mpv_observe_property/mpv_wait_event/mpv_terminate_destroy +
   mpv_render_context_create/free/render/set_update_context…（client.h/render.h/render_d3d11.h）。
   crates.io 的 `libmpv-rs`（0.9）依赖其自身 fork 的 libmpv-sys 且默认不带 render_d3d11 新 API，
-  不如手写可控。声明文件放 `crates/bili-video/src/ffi.rs`（新 crate，下阶段建）。
+  不如手写可控。声明文件放 `crates/qaq-bx-video/src/ffi.rs`（新 crate，下阶段建）。
 - **libmpv 二进制**：mpv 官方 GitHub releases（libmpv.7z, x86_64）随包分发 `libmpv-2.dll`，
   运行时放 exe 旁。**版本要求**：D3D11 render 为 2024 年 master 引入，发布版最低版本
   **待实测确认（候选 mpv 0.40+）**；若发布版无 D3D11 API，保底顺序见 §5。
@@ -91,10 +91,10 @@
 
 ## 6. 下一步（新会话任务清单）
 
-1. 建 `crates/bili-video`：ffi.rs（libmpv-2.dll 动态加载：Delay-load 或运行时 LoadLibrary +
+1. 建 `crates/qaq-bx-video`：ffi.rs（libmpv-2.dll 动态加载：Delay-load 或运行时 LoadLibrary +
    GetProcAddress，避免硬链接）→ SW 渲染 sample：本地 mp4 → SwapChainPanel 出图。
 2. 换 D3D11 render API + flip swapchain + d3d11va 硬解 sample。
-3. playurl → loadfile 串接（bili-core 补 playurl 客户端：WBI 签名已在 research 定案），
+3. playurl → loadfile 串接（qaq-bx-core 补 playurl 客户端：WBI 签名已在 research 定案），
    Referer 头 + audio-files 外挂音轨。
 4. mpv_observe_property → AppShell Message 桥（播放状态单源改造：Shell 的模拟 timer 换成
    mpv time-pos 回传）。

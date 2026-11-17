@@ -28,7 +28,7 @@
   <Applications>
     <Application
       Id="App"
-      Executable="bili-ui.exe"
+      Executable="qaq-bx-ui.exe"
       EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
         DisplayName="{{DISPLAY_NAME}}"
@@ -53,7 +53,7 @@
         <com:Extension Category="windows.comServer">
           <com:ComServer>
             <com:ExeServer
-              Executable="bili-ui.exe"
+              Executable="qaq-bx-ui.exe"
               Arguments="----AppNotificationActivated:"
               DisplayName="{{DISPLAY_NAME}}">
               <com:Class

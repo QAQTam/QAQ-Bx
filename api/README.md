@@ -1,7 +1,7 @@
 # API 契约锚（OpenAPI + fixtures）
 
-本目录是 biliplay 对 B 站接口的**消费契约**：`openapi/` = 结构锚（人工维护的 OpenAPI 3.1），
-`fixtures/` = 行为锚（真机捕获的截断样本）。两者由 bili-core 的测试共同守卫。
+本目录是 QAQ-Bx 对 B 站接口的**消费契约**：`openapi/` = 结构锚（人工维护的 OpenAPI 3.1），
+`fixtures/` = 行为锚（真机捕获的截断样本）。两者由 qaq-bx-core 的测试共同守卫。
 
 ## 目录
 
@@ -23,7 +23,7 @@ api/
 
 ## 版本与向下兼容策略
 
-1. **契约代**：spec 的 `x-contract-version`（当前 `1`）。bili-core 类型与 spec 同代演进。
+1. **契约代**：spec 的 `x-contract-version`（当前 `1`）。qaq-bx-core 类型与 spec 同代演进。
 2. **服务器新增字段 = 兼容**。Rust serde 不启用 `deny_unknown_fields`；spec 全部对象
    `additionalProperties: true`。升级零动作。
 3. **服务器删除/改名 required 字段 = 破坏性**。`fixtures` 测试红灯 → 评估影响 →
@@ -51,6 +51,6 @@ api/
 ## 变更流程
 
 1. 真机行为变化 → 重跑 `capture-feed-apis.mjs`（新样本入 research/samples）；
-2. 结构差异 → 更新 spec（若破坏 required）→ 升 `x-contract-version` → 迁移 bili-core 类型；
+2. 结构差异 → 更新 spec（若破坏 required）→ 升 `x-contract-version` → 迁移 qaq-bx-core 类型；
 3. 刷新 fixtures：`node .qaqh/research/make-fixtures.mjs`；
-4. `cargo test -p bili-core` 全绿才算契约迁移完成。
+4. `cargo test -p qaq-bx-core` 全绿才算契约迁移完成。

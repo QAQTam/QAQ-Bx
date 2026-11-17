@@ -96,7 +96,7 @@ setLongTokenByPostMsg: function(e) {   // 监听父页面 postMessage
 
 ---
 
-## 3. 持续登录：Cookie 续期链路（✅ 已实现：`crates/bili-plugin-login/src/refresh.rs`）
+## 3. 持续登录：Cookie 续期链路（✅ 已实现：`crates/qaq-bx-plugin-login/src/refresh.rs`）
 
 ### 3.1 检测是否需要刷新（GET，无害，实测通过）
 
@@ -188,7 +188,7 @@ e = 65537
 **原生 Rust 复用已验证**：`rsa` crate（0.9）+ `sha2` 提取公钥实现 OAEP-SHA256，
 native path 经服务器解密通过（`GET /correspond/1/<native_path>` 返回含 `#1-name`
 refresh_csrf 与 `#1-value` refresh_token 的 SSR 页）。实现见
-`crates/bili-plugin-login/src/correspond.rs`——**客户端无需携带 wasm 文件**。
+`crates/qaq-bx-plugin-login/src/correspond.rs`——**客户端无需携带 wasm 文件**。
 
 Node 端验证脚本与 wasm 测试向量存于 `.qaqh/research/`（wasm-test-vector.json）。
 
@@ -289,7 +289,7 @@ GET  /x/passport-login/web/sns/authorize/url
 
 ---
 
-## 7. Rust 实现路线（biliplay-rs）
+## 7. Rust 实现路线（QAQ-Bx）
 
 1. **依赖**：`reqwest`（cookie store 开启）+ `hmac`/`sha2`（bili_ticket）+ `md5`（wbi）+ `serde_json`。
 2. **登录**：实现 generate + poll（§2），二维码用 `qrcode` crate 本地渲染；poll 间隔 2s；code=0 后从 `data.url` 解析查询参数拿第一组 Cookie，同时保留 `refresh_token`。
@@ -308,14 +308,14 @@ GET  /x/passport-login/web/sns/authorize/url
 | 文件 | 内容 |
 |---|---|
 | `.qaqh/secrets/bili-cookies.json` | 完整 Cookie（39 枚，含 HttpOnly 全值）⚠️ 敏感，勿提交 git |
-| `crates/bili-plugin-login/src/correspond.rs` | correspond path 原生实现（RSA-OAEP-SHA256，公钥已提取，服务器验证通过） |
-| `crates/bili-plugin-login/src/refresh.rs` | Cookie 续期链路（info→correspond/1→refresh→sso→confirm，官方同序） |
+| `crates/qaq-bx-plugin-login/src/correspond.rs` | correspond path 原生实现（RSA-OAEP-SHA256，公钥已提取，服务器验证通过） |
+| `crates/qaq-bx-plugin-login/src/refresh.rs` | Cookie 续期链路（info→correspond/1→refresh→sso→confirm，官方同序） |
 | `.qaqh/research/wasm-test-vector.json` | 官方 wasm 加密测试向量（模数/输入/密文） |
 | `.qaqh/research/wasm_rsa_encrypt_bg.wasm` | 官方 wasm 本体（已可抛弃，留作对照） |
 | `.qaqh/research/cdp-*.mjs` | CDP 工具集（capture/qrcodelogin/eval/navigate/shot/watch/dumpcookies） |
 | `.qaqh/research/chunk895.js` / `index-bundle.js` | token-iframe 刷新组件与主站 bundle（§3/§4/§5 证据） |
 
-## 9. 实现校准（bili-plugin-login 首版实测修正）
+## 9. 实现校准（qaq-bx-plugin-login 首版实测修正）
 
 实现扫码登录插件时，以下细节与最初推断不同（均经真实登录实测修正）：
 

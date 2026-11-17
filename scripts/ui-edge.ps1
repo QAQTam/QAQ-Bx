@@ -1,6 +1,6 @@
-<#
+﻿<#
 .SYNOPSIS
-    biliplayRS 极端场景走查：访客态（无本地凭据）与快速连续切视频。
+    QAQ-Bx 极端场景走查：访客态（无本地凭据）与快速连续切视频。
 .EXAMPLE
     .\scripts\ui-edge.ps1            # 构建并跑两场景，截图输出 target/ui-demo/frames-edge/
     .\scripts\ui-edge.ps1 -SkipBuild # 跳过构建
@@ -26,6 +26,9 @@ public static class UiEdgeNative {
     public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
@@ -33,6 +36,7 @@ public static class UiEdgeNative {
     public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     public const uint MOUSEEVENTF_LEFTUP = 0x0004;
     public const uint MOUSEEVENTF_WHEEL = 0x0800;
+    public const uint SWP_NOZORDER = 0x0004;
     public const int SW_RESTORE = 9;
 }
 "@
@@ -62,6 +66,23 @@ function Click-Fast {
     [UiEdgeNative]::mouse_event([UiEdgeNative]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
 }
 
+function Drag-WindowEdge {
+    param([int]$StartX, [int]$StartY, [int]$EndX, [int]$EndY)
+    [void][UiEdgeNative]::SetCursorPos($StartX, $StartY)
+    Start-Sleep -Milliseconds 120
+    [UiEdgeNative]::mouse_event([UiEdgeNative]::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 80
+    $steps = 16
+    for ($i = 1; $i -le $steps; $i++) {
+        $x = [int][Math]::Round($StartX + ($EndX - $StartX) * ($i / [double]$steps))
+        $y = [int][Math]::Round($StartY + ($EndY - $StartY) * ($i / [double]$steps))
+        [void][UiEdgeNative]::SetCursorPos($x, $y)
+        Start-Sleep -Milliseconds 18
+    }
+    [UiEdgeNative]::mouse_event([UiEdgeNative]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 350
+}
+
 function Scroll-Fast {
     param([int]$TotalDelta)
     for ($i = 0; $i -lt 12; $i++) {
@@ -71,15 +92,15 @@ function Scroll-Fast {
 }
 
 if (-not $SkipBuild) {
-    Write-Host "[build] cargo build -p bili-ui" -ForegroundColor Cyan
+    Write-Host "[build] cargo build -p qaq-bx-ui" -ForegroundColor Cyan
     Push-Location $RepoRoot
     try {
-        & cargo build -p bili-ui
+        & cargo build -p qaq-bx-ui
         if ($LASTEXITCODE -ne 0) { throw "cargo build 失败" }
     } finally { Pop-Location }
 }
 
-$exe = Join-Path $RepoRoot "target\debug\bili-ui.exe"
+$exe = Join-Path $RepoRoot "target\debug\qaq-bx-ui.exe"
 if (-not (Test-Path $exe)) { throw "未找到 $exe" }
 $dataDir = Join-Path $RepoRoot "target\debug\data"
 $credPath = Join-Path $dataDir "credentials.json"
@@ -90,7 +111,7 @@ function Wait-MainWindow {
     $hwnd = [IntPtr]::Zero
     for ($i = 0; $i -lt 60; $i++) {
         $Proc.Refresh()
-        if ($Proc.HasExited) { throw "bili-ui.exe 提前退出 ($($Proc.ExitCode))" }
+        if ($Proc.HasExited) { throw "qaq-bx-ui.exe 提前退出 ($($Proc.ExitCode))" }
         if ($Proc.MainWindowHandle -ne [IntPtr]::Zero) { $hwnd = $Proc.MainWindowHandle; break }
         Start-Sleep -Milliseconds 250
     }
@@ -169,8 +190,8 @@ try {
 }
 
 # ---------- 场景 E6：热门页真实数据直启 + 点击首卡 ----------
-Write-Host "[E6] 热门页（BILIPLAY_ROUTE=popular）真实 popular API 数据" -ForegroundColor Cyan
-$env:BILIPLAY_ROUTE = "popular"
+Write-Host "[E6] 热门页（QAQ_BX_ROUTE=popular）真实 popular API 数据" -ForegroundColor Cyan
+$env:QAQ_BX_ROUTE = "popular"
 $proc = $null
 try {
     $proc = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -PassThru
@@ -188,13 +209,13 @@ try {
     $proc.Refresh()
     if ($proc.HasExited) { throw "热门页点卡后进程退出 ($($proc.ExitCode))" }
 } finally {
-    Remove-Item Env:BILIPLAY_ROUTE -ErrorAction SilentlyContinue
+    Remove-Item Env:QAQ_BX_ROUTE -ErrorAction SilentlyContinue
     if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
 }
 
 # ---------- 场景 E7：播放页相关推荐真实数据 + 点击相关推荐卡 ----------
-Write-Host "[E7] 相关推荐（BILIPLAY_VIDEO）真实 archive/related 数据" -ForegroundColor Cyan
-$env:BILIPLAY_VIDEO = "BV1GJ411x7h7"
+Write-Host "[E7] 相关推荐（QAQ_BX_VIDEO）真实 archive/related 数据" -ForegroundColor Cyan
+$env:QAQ_BX_VIDEO = "BV1GJ411x7h7"
 $proc = $null
 try {
     $proc = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -PassThru
@@ -213,7 +234,72 @@ try {
     $proc.Refresh()
     if ($proc.HasExited) { throw "相关推荐点卡后进程退出 ($($proc.ExitCode))" }
 } finally {
-    Remove-Item Env:BILIPLAY_VIDEO -ErrorAction SilentlyContinue
+    Remove-Item Env:QAQ_BX_VIDEO -ErrorAction SilentlyContinue
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+}
+
+# ---------- 场景 E8：Mobile 窄屏形态（最小宽高钳制 + 底栏 5-Tab + 2×3 更多 + 2 列开播） ----------
+Write-Host "[E8] Mobile 窄屏形态走查（390x640 钳制与 5-Tab 交互）" -ForegroundColor Cyan
+$proc = $null
+try {
+    $proc = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -PassThru
+    $hwnd = Wait-MainWindow $proc
+    Start-Sleep -Milliseconds 2500
+
+    $dpi = [Math]::Max(96, [int][UiEdgeNative]::GetDpiForWindow($hwnd))
+    $scale = $dpi / 96.0
+    $wRect = New-Object UiEdgeNative+RECT
+    $cRect = New-Object UiEdgeNative+RECT
+    [void][UiEdgeNative]::GetWindowRect($hwnd, [ref]$wRect)
+    [void][UiEdgeNative]::GetClientRect($hwnd, [ref]$cRect)
+    $nonClientW = ($wRect.Right - $wRect.Left) - ($cRect.Right - $cRect.Left)
+    $nonClientH = ($wRect.Bottom - $wRect.Top) - ($cRect.Bottom - $cRect.Top)
+
+    # 1. 拖窄右边框超越 390px 下限，验证最小客户区宽度不小于 390 DIP
+    Drag-WindowEdge -StartX ($wRect.Right - 2) -StartY ($wRect.Top + 260) -EndX ($wRect.Left + [int](200 * $scale)) -EndY ($wRect.Top + 260)
+    [void][UiEdgeNative]::GetClientRect($hwnd, [ref]$cRect)
+    $clientDipW = ($cRect.Right - $cRect.Left) / $scale
+    if ($clientDipW -lt 388.0) {
+        throw "最小客户区宽度钳制失效: 实际=${clientDipW} DIP < 390 DIP"
+    }
+
+    # 2. 统一调至 390×760 DIP 标准 Mobile 视口截图与点击
+    $targetOuterW = [int][Math]::Round(390.0 * $scale) + $nonClientW
+    $targetOuterH = [int][Math]::Round(760.0 * $scale) + $nonClientH
+    [void][UiEdgeNative]::SetWindowPos($hwnd, [IntPtr]::Zero, $wRect.Left, $wRect.Top, $targetOuterW, $targetOuterH, [UiEdgeNative]::SWP_NOZORDER)
+    Start-Sleep -Milliseconds 800
+    [void][UiEdgeNative]::GetWindowRect($hwnd, [ref]$wRect)
+    $mX = $wRect.Left; $mY = $wRect.Top
+    $mW = $wRect.Right - $wRect.Left; $mH = $wRect.Bottom - $wRect.Top
+
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e10-mobile-home.png"
+
+    # 底栏第 2 Tab「热门」 (col 1 center = 30% 宽, 距底 ~32 DIP)
+    $barY = $mY + $mH - [int](32 * $scale)
+    Click-Fast -X ($mX + [int]($mW * 0.30)) -Y $barY
+    Start-Sleep -Milliseconds 2600
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e11-mobile-popular.png"
+
+    # 底栏第 5 Tab「更多」 (col 4 center = 90% 宽)
+    Click-Fast -X ($mX + [int]($mW * 0.90)) -Y $barY
+    Start-Sleep -Milliseconds 450
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e12-mobile-more.png"
+
+    # 点击「更多」2×3 菜单右下角「设置」并截图（右下偏上约 90 DIP）
+    Click-Fast -X ($mX + $mW - [int](68 * $scale)) -Y ($mY + $mH - [int](96 * $scale))
+    Start-Sleep -Milliseconds 500
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e13-mobile-settings.png"
+
+    # 切回「推荐」(col 0 center = 10% 宽) 并点击左列首卡开播（吸顶播放页）
+    Click-Fast -X ($mX + [int]($mW * 0.10)) -Y $barY
+    Start-Sleep -Milliseconds 700
+    Click-Fast -X ($mX + [int]($mW * 0.28)) -Y ($mY + [int](185 * $scale))
+    Start-Sleep -Milliseconds 2600
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e14-mobile-player.png"
+
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "Mobile 走查后进程退出 ($($proc.ExitCode))" }
+} finally {
     if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
 }
 

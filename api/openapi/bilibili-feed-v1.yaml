@@ -1,11 +1,11 @@
 openapi: 3.1.0
 info:
-  title: bilibili Feed 消费契约（biliplay）
+  title: bilibili Feed 消费契约（QAQ-Bx）
   version: 1.0.0
   x-contract-version: 1
   x-observed-at: "2026-11-16"
   description: |
-    **biliplay 对 B 站 feed 组接口的消费契约锚 —— 不是 B 站官方文档。**
+    **QAQ-Bx 对 B 站 feed 组接口的消费契约锚 —— 不是 B 站官方文档。**
 
     来源纪律（项目红线）：全部字段来自 CDP 真机捕获 + 主动重放实测
     （`.qaqh/research/capture-feed-apis.mjs`，样本 `.qaqh/research/samples/feed/`），
@@ -112,7 +112,7 @@ paths:
       operationId: popular
       summary: 综合热门（无 WBI，pn/ps 分页）
       description: |
-        热门页数据源（bili-ui 热门 Tab）：`pn` 从 1 起连续分页，
+        热门页数据源（qaq-bx-ui 热门 Tab）：`pn` 从 1 起连续分页，
         返回空 `list` 即终态；客户端按 bvid 去重合并。
       security: [{ cookieAuth: [] }]
       parameters:

@@ -11,3 +11,11 @@
 /package/
 /packaging/certs/*.pfx
 /packaging/certs/*.cer
+
+# 宣传视频工具链依赖与渲染产物
+/promo-video/node_modules/
+/promo-video/dist/
+/promo-video/out/
+/promo-video/.cache/
+/promo-video/assets/raw-demo.mp4
+/target/ui-demo/

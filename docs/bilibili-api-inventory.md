@@ -92,7 +92,7 @@
   一次全量 ~20-30 条，形状与 popular/precious/ranking 同族（`aid/bvid/cid/title/
   pic/duration/pubdate/owner{mid,name,face}/stat{view,danmaku,...}`）。
 - 实测 BV1GJ411x7h7 code=0；fixture 锚 `api/fixtures/feed-related.json`，
-  消费端 `bili-core::feed::FeedClient::related`（冒烟 `live_related_smoke`）。
+  消费端 `qaq-bx-core::feed::FeedClient::related`（冒烟 `live_related_smoke`）。
 - 未保证不含当前稿件，客户端按 bvid 过滤自身。
 
 ## 7. 热门/榜单 ✅（批量实测 2026-11-16）
@@ -128,19 +128,19 @@
 
 风控上报类（可忽略或后续研究）：`/x/internal/gaia-gateway/ExClimbWuzhi|ExClimbCongLing|ExGetAxe`（设备指纹上报，POST）。
 
-## 9. 第三方客户端最小实现路线（bili-plugin-parse）
+## 9. 第三方客户端最小实现路线（qaq-bx-plugin-parse）
 
 1. **视频详情**：`view`（无签名）→ 拿 `cid/title/stat/pages`
 2. **播放**：`playurl(bvid,cid,fnval=16)`（WBI）→ DASH m4s + 音频分离（播放器需 demux，如 `mp4`/`fmp4` 处理或对接 ffmpeg）
 3. **弹幕**：`dm/web/view` + `seg.so`（WBI）→ protobuf 解析（prost）
 4. **评论**：`reply/main`（无签名）→ cursor 翻页
 5. **搜索/首页/热门**：search/rcmd/popular
-6. **WBI 签名模块**（bili-core）：nav → wbi_img → mixin → md5；Node 参考实现见 `.qaqh/research/replay-apis.mjs`（已验证）
+6. **WBI 签名模块**（qaq-bx-core）：nav → wbi_img → mixin → md5；Node 参考实现见 `.qaqh/research/replay-apis.mjs`（已验证）
 
 ## 10. 本次实测速记
 
 - `search/all/v2` 用原生签名重放 → code=0（WBI 算法复现正确性定案）
-- **Rust 侧 WBI 签名 2026-11-16 真机通过**（`bili-core::wbi` + `biliplay feed`：rcmd code=0）
+- **Rust 侧 WBI 签名 2026-11-16 真机通过**（`qaq-bx-core::wbi` + `qaq-bx feed`：rcmd code=0）
 - `dm/seg.so` 338KB protobuf，`0a…` 起始（len-delim field 1 = 弹幕元素数组）
 - `playurl` 的 `fnval=4044` 拒绝、`fnval=16` 通过 —— 客户端按需请求 DASH
 - `reply/wbi/main` 风控（-403），`reply/main`（无签名）可用
@@ -161,10 +161,10 @@ Ground truth：`BV1amaH6aE2m`（用户确认的商单视频；手机 App 显示�
   `bilibili.app.archive.v1.View`，需 appkey+sign，实测 web cookie 调用 -400）。
   推测角标为服务器下发图片（web popular 卡存在 `rcmd_reason.corner_mark.img_url`
   同类机制），非客户端硬编码。
-- APK（iBiliPlayer，36 dex）字符串池全量提取（`.qaqh/research/dex-strings.mjs` →
+- APK（iQAQ-Bxer，36 dex）字符串池全量提取（`.qaqh/research/dex-strings.mjs` →
   `apk-model-strings.txt`）证据：`argue_icon/argue_msg/argue_uri` = 播放页声明条体系
   （该视频未用）；arsc 中"商业推广/创作声明"文案全部为**投稿侧**（花火平台流程，
   `activity://uper/commercial_declare`）；proto rights 为位掩码无字段名常量。
-- **biliplay 决策**：不区分（也无法区分）。影响面为零——广告卡已过滤（`goto=ad`），
+- **QAQ-Bx 决策**：不区分（也无法区分）。影响面为零——广告卡已过滤（`goto=ad`），
   商单视频本身可正常播放，角标位置我们不渲染。
 - 复用资产：`dex-strings.mjs` 可提取任意 APK 字符串池，后续挖 app 机制可复用。
