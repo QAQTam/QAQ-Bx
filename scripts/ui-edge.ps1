@@ -168,4 +168,53 @@ try {
     if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
 }
 
+# ---------- 场景 E6：热门页真实数据直启 + 点击首卡 ----------
+Write-Host "[E6] 热门页（BILIPLAY_ROUTE=popular）真实 popular API 数据" -ForegroundColor Cyan
+$env:BILIPLAY_ROUTE = "popular"
+$proc = $null
+try {
+    $proc = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -PassThru
+    $hwnd = Wait-MainWindow $proc
+    Start-Sleep -Milliseconds 3000 # 等待真实分页数据与封面
+    $rect = New-Object UiEdgeNative+RECT
+    [void][UiEdgeNative]::GetWindowRect($hwnd, [ref]$rect)
+    $winX = $rect.Left; $winY = $rect.Top
+
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e6-popular-real.png"
+    # 首行卡片点击（网格首卡中心区域）→ 应与点首页卡同管线进播放页
+    Click-Fast -X ($winX + 330) -Y ($winY + 360)
+    Start-Sleep -Milliseconds 2800
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e7-popular-card-player.png"
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "热门页点卡后进程退出 ($($proc.ExitCode))" }
+} finally {
+    Remove-Item Env:BILIPLAY_ROUTE -ErrorAction SilentlyContinue
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+}
+
+# ---------- 场景 E7：播放页相关推荐真实数据 + 点击相关推荐卡 ----------
+Write-Host "[E7] 相关推荐（BILIPLAY_VIDEO）真实 archive/related 数据" -ForegroundColor Cyan
+$env:BILIPLAY_VIDEO = "BV1GJ411x7h7"
+$proc = $null
+try {
+    $proc = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -PassThru
+    $hwnd = Wait-MainWindow $proc
+    Start-Sleep -Milliseconds 3200 # 等待相关推荐拉取与右栏封面
+    $rect = New-Object UiEdgeNative+RECT
+    [void][UiEdgeNative]::GetWindowRect($hwnd, [ref]$rect)
+    $winX = $rect.Left; $winY = $rect.Top
+    $winW = $rect.Right - $rect.Left
+
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e8-player-related-real.png"
+    # 右栏 360px 相关推荐首卡（标题区 y≈150-260）
+    Click-Fast -X ($winX + $winW - 180) -Y ($winY + 210)
+    Start-Sleep -Milliseconds 2800
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e9-related-card-opened.png"
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "相关推荐点卡后进程退出 ($($proc.ExitCode))" }
+} finally {
+    Remove-Item Env:BILIPLAY_VIDEO -ErrorAction SilentlyContinue
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+}
+
 Write-Host "[done] 极端场景走查完成，截图位于 $FramesDir" -ForegroundColor Green
