@@ -8,13 +8,14 @@
 ```
 api/
 ├── openapi/
-│   └── bilibili-feed-v1.yaml   # feed 组契约（rcmd/ogv/popular/precious/ranking）
+│   └── bilibili-feed-v1.yaml   # feed 组契约（rcmd/ogv/popular/precious/ranking/related）
 └── fixtures/
     ├── feed-rcmd.json          # 首页推荐（goto=av/ad/live 多态卡）
     ├── feed-ogv.json           # 剧集卡（season_type=1 样本）
     ├── feed-popular.json       # 综合热门
     ├── feed-ranking.json       # 排行榜
-    └── feed-precious.json      # 入站必刷
+    ├── feed-precious.json      # 入站必刷
+    └── feed-related.json       # 播放页相关视频（data 为 ArchiveCard 裸数组）
 ```
 
 全量真机样本（未截断）：`.qaqh/research/samples/feed/`（含每次捕获的完整 URL 与时间戳）。
@@ -36,7 +37,8 @@ api/
    - rcmd 无必需参数；翻页锚 `fresh_idx/fresh_idx_1h/brush`；
    - 翻页跨页有重复 → 客户端去重；
    - ogv `season_type ∈ {1,2,3,4,5,7}`；
-   - precious/ranking 一次全量。
+   - precious/ranking 一次全量；
+   - related `data` 为裸数组（无 list/items 包裹），客户端过滤当前稿件自身。
 
 ## 为什么手写 serde 而不做 OpenAPI codegen
 

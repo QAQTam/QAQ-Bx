@@ -76,6 +76,21 @@ fn ogv_fixture_matches_contract_v1() {
     assert!(s.cover.starts_with("http"), "ogv 封面异常");
 }
 
+/// 相关视频：`data` 直接为 ArchiveCard 数组（无 list/items 包裹层，与 popular 族不同）。
+#[test]
+fn related_fixture_matches_contract_v1() {
+    let raw = fixture("feed-related");
+    let env: Envelope<Vec<ArchiveCard>> =
+        serde_json::from_value(raw).expect("related fixture 信封反序列化失败");
+    assert_eq!(env.code, 0);
+    let cards = env.data.expect("related 缺 data 数组");
+    assert!(!cards.is_empty(), "related fixture 空");
+    let c = &cards[0];
+    assert!(c.aid > 0 && c.bvid.starts_with("BV"), "related 首卡字段异常");
+    assert!(c.cid > 0 && c.duration > 0 && c.pubdate > 1_000_000_000);
+    assert!(!c.owner.name.is_empty() && c.pic.starts_with("http"));
+}
+
 /// 契约警报示例：required 字段若被服务器删除（如未来去掉 stat.danmaku），
 /// 在重新捕获 fixture 后本组测试将失败 → 升级契约代（api/README.md）。
 #[test]

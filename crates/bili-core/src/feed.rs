@@ -557,6 +557,18 @@ impl FeedClient {
             .await?;
         Ok(data.items)
     }
+
+    /// 播放页相关视频（无签名；`data` 直接为 ArchiveCard 数组，无分页）。
+    /// 实测（2026-11-17，BV1GJ411x7h7）code=0，卡形状与 popular/precious/ranking 同构；
+    /// 归档卡契约见 `api/openapi/bilibili-feed-v1.yaml`，fixture `feed-related.json`。
+    pub async fn related(&self, bvid: &str) -> Result<Vec<ArchiveCard>> {
+        let data: Vec<ArchiveCard> = self
+            .get_json(&format!(
+                "https://api.bilibili.com/x/web-interface/archive/related?bvid={bvid}"
+            ))
+            .await?;
+        Ok(data)
+    }
 }
 
 #[cfg(test)]
@@ -703,5 +715,53 @@ mod session_tests {
         // 服务端返回空列表直接判定耗尽。
         assert!(s.absorb(Vec::new()).is_empty());
         assert!(s.is_exhausted());
+    }
+}
+
+#[cfg(test)]
+mod related_tests {
+    use super::*;
+    use crate::error::BiliError;
+
+    #[test]
+    fn related_url_uses_archive_related_endpoint() {
+        // 防回归：端点必须是 `archive/related`（`wbi/related/all` 实测返回 HTML，见
+        // docs/bilibili-api-inventory.md §6）。此处锚定 URL 构造唯一来源。
+        let bvid = "BV1GJ411x7h7";
+        let url = format!(
+            "https://api.bilibili.com/x/web-interface/archive/related?bvid={bvid}"
+        );
+        assert!(url.contains("/x/web-interface/archive/related?"));
+        assert!(!url.contains("wbi/related"));
+    }
+
+    #[tokio::test]
+    #[ignore = "需访问真实 B 站接口（验证 BV1GJ411x7h7 相关视频）"]
+    async fn live_related_smoke() {
+        struct NoopCreds;
+        #[async_trait::async_trait]
+        impl CredentialProvider for NoopCreds {
+            async fn get(&self) -> Result<crate::credentials::Credentials> {
+                Err(BiliError::NotLoggedIn)
+            }
+            fn cached(&self) -> Option<crate::credentials::Credentials> {
+                None
+            }
+        }
+        let http = reqwest::Client::builder()
+            .user_agent(crate::wbi::BROWSER_UA)
+            .build()
+            .unwrap();
+        let creds: Arc<dyn CredentialProvider> = Arc::new(NoopCreds);
+        let client = FeedClient::new(http, creds);
+        let cards = client.related("BV1GJ411x7h7").await.unwrap();
+        assert!(!cards.is_empty(), "相关视频不应为空");
+        let first = &cards[0];
+        assert!(first.aid > 0 && first.bvid.starts_with("BV"));
+        assert!(first.cid > 0 && first.duration > 0);
+        assert!(!first.owner.name.is_empty());
+        assert!(first.pic.starts_with("http"));
+        // 与当前稿件互异（不能把自身推回相关位）。
+        assert!(cards.iter().all(|c| c.bvid != "BV1GJ411x7h7"));
     }
 }

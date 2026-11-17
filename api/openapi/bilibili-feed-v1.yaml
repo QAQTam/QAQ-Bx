@@ -27,6 +27,9 @@ info:
       ad 卡 `id` 可为 0 且无 `bvid`）。
     - WBI 签名：`w_rid = md5(排序后 query 过滤 !'()* + mixin32)`，
       mixin 表与 nav 密钥见 docs/bilibili-api-inventory.md §4。
+    - 2026-11-17 补录：播放页相关视频真实端点定案
+      `/x/web-interface/archive/related`（无签名，`data` 为 ArchiveCard 裸数组），
+      旧猜测 `/x/web-interface/wbi/related/all` 实测返回 HTML（不存在）。
 
 servers:
   - url: https://api.bilibili.com
@@ -108,6 +111,9 @@ paths:
       tags: [feed]
       operationId: popular
       summary: 综合热门（无 WBI，pn/ps 分页）
+      description: |
+        热门页数据源（bili-ui 热门 Tab）：`pn` 从 1 起连续分页，
+        返回空 `list` 即终态；客户端按 bvid 去重合并。
       security: [{ cookieAuth: [] }]
       parameters:
         - { name: pn, in: query, schema: { type: integer, minimum: 1 }, example: 1 }
@@ -126,6 +132,34 @@ paths:
                       data: { $ref: "#/components/schemas/ArchiveListData" }
               examples:
                 sample: { externalValue: "../fixtures/feed-popular.json" }
+
+  /x/web-interface/archive/related:
+    get:
+      tags: [feed]
+      operationId: archiveRelated
+      summary: 播放页相关视频（无 WBI，一次全量）
+      description: |
+        2026-11-17 实测定案（BV1GJ411x7h7，code=0）：`data` 直接为 ArchiveCard
+        数组（**无** list/items 包裹层）；不保证不含当前稿件，客户端按 bvid 过滤自身。
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - { name: bvid, in: query, required: true, schema: { type: string }, example: BV1GJ411x7h7 }
+      responses:
+        "200":
+          description: 相关归档卡数组
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    required: [data]
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/ArchiveCard" }
+              examples:
+                sample: { externalValue: "../fixtures/feed-related.json" }
 
   /x/web-interface/popular/precious:
     get:
