@@ -5,6 +5,17 @@
 
 ## 新增
 
+- **全局内敛搜索框（标题栏唯一入口）**:原「TextBox + 外置放大镜按钮」组合改为
+  一体化 `Border` 壳(圆角/描边/填充)+ 无边框透明 `TextBox` + 内嵌放大镜
+  `Button`；`PreviewKeyDown` 隧道事件挂在外壳上,Enter 按下即提交
+  (主/小键盘 Enter 均认,`search_enter_submits` 纯函数判定 + 单测锁定;
+  释放与其他键放行不拦截,避免与评论输入框等抢键)。搜索页删除页内
+  「TextBox + 搜索按钮」重复入口,只留标题与提示行——发起与改词统一走
+  全局框。窄屏(compact)全局框收窄至 260px。自动化走查新增 E8 场景:
+  前台句柄硬校验(ALT 解锁前台锁重试)→ 点击标题栏输入区 → 剪贴板粘贴
+  关键词(绕开中文 IME 组合态吞字母/吞 Enter)→ SendKeys {ENTER} →
+  断言进程存活;截图实测 e10 草稿进框、e11 回车直达结果页(标题栏副标题
+  同步「搜索」,页内无任何输入框)。
 - **相关视频真实端点定案**(`bili-core::feed::FeedClient::related`):
   `/x/web-interface/archive/related?bvid=<BV>`(无签名、访客可用,实测 code=0);
   `data` 为 ArchiveCard **裸数组**(无 list/items 包裹层),形状与 popular/precious/ranking 同族。
@@ -37,6 +48,21 @@
 
 ## 变更
 
+- **修复:播放页右栏相关推荐卡片长短不一(高)**:卡片高此前由内容驱动——封面列定高
+  74px,文本列(标题 1~2 行 × UP 主 × 播放量)随行数浮动,网格行取两列最大值,
+  标题占满两行的卡比一行的卡高约半行。改为文本列三槽定高(标题恒定预留两行
+  40px、元信息各 18px,常量与 `max_lines` 封顶同源),所有卡严格等高且
+  UP 主/播放量基线对齐;封面垂直居中。回归单测
+  `pages::player::tests::related_card_slots_are_content_independent`
+  锁定「卡高与数据无关 + 定高槽容得下最坏字体行高(Noto Sans SC ≈1.48em)」。
+- **修复:播放页右栏相关推荐卡片宽窄不一(宽,同项续修)**:卡片宽同样由内容驱动,
+  实测同列卡宽 290~311px 参差且不满栏。右栏 ScrollViewer 先改
+  `HorizontalScrollBarVisibility::Disabled`(消除无限宽量测与横向滚动),但
+  arrange 仍按各卡自然宽;再为卡片 Button 与状态行定宽
+  `RELATED_CARD_WIDTH = 360 − 4 − 16`(与栅格列/缘距严格同源),无横向滚动时
+  presenter 按视口宽统一定宽。实机截图像素复测:所有卡外沿严格 316px、
+  右缘一致 x=1259,标题同列宽换行、时长徽标对齐。单测追加宽度算术不变量
+  (卡宽==栏视口算式;边框内衬 18 + 封列 132 + 间距 10 + 文本保底 120 ≤ 定宽)。
 - **修复:冷启动/关播放条后首个视频黑屏**(半屏抽屉挂载脉冲门控):swapchain
   挂载重试此前只认 `route == Player`;HalfPane 模式点首页卡 `route` 合法停在
   Home,面板 metrics 抢在引擎产出 swapchain 前触发唯一一次挂载即错过,再无重试;

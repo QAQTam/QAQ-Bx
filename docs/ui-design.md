@@ -21,7 +21,7 @@ Grid rows: [TitleBar(Auto)] [NavigationView(Star)] [MiniPlayer(Auto)]
 
 | 层 | 控件 | 设计要点 |
 |---|---|---|
-| 标题栏 | `TitleBar` | 左：应用图标 + "QAQ-Bx"；中：搜索框（占位，路由到搜索页）；右：通知按钮（登录态）。高度 Tall。 |
+| 标题栏 | `TitleBar` | 左：应用图标 + "QAQ-Bx"；中：**全局内敛搜索框**（`Border` 壳 + 无边框 `TextBox` + 内嵌放大镜 `Button`；`PreviewKeyDown` 隧道 Enter 即提交；全站唯一搜索入口）；右：通知按钮（登录态）。高度 Tall。 |
 | 导航 | `NavigationView` | `PaneDisplayMode::LeftCompact`（窄图标栏，悬停展开，对照媒体播放器左侧栏）。 |
 | 迷你播放条 | 自组（StackPanel+Slider） | 见 §5。播放页打开时隐藏（播放页自带全量传输控制）。 |
 
@@ -147,7 +147,7 @@ Border(顶部 1px 分隔线, 高 64)
 
 - 队列：Flyout 或右侧滑出 SplitView（骨架期不做，仅留 Message 槽位）。
 - 设置页：`RadioButtons`（清晰度偏好：360P/480P/720P/1080P/1080P+/4K）、`ToggleSwitch`（自动播放、弹幕、硬解）、`NumberBox`（弹幕密度）——数据落 `data/settings.json`。
-- 搜索页（**已接入**）：标题栏/页内 `TextBox` + 搜索按钮 → `/x/web-interface/wbi/search/all/v2`（WBI 签名）→ 结果卡片网格（复用视频卡片，封面经 ImageCache 异步填充）；建议词 API（`search/default`）后续接入。
+- 搜索页（**已接入**）：入口仅标题栏全局内敛搜索框（页内不再放输入框，只留标题与提示行）→ `/x/web-interface/wbi/search/all/v2`（WBI 签名）→ 结果卡片网格（复用视频卡片，封面经 ImageCache 异步填充）；建议词 API（`search/default`）后续接入。
 
 ## 7. 组件骨架结构（本轮落地）
 
@@ -168,7 +168,7 @@ crates/bili-ui/src/
     home.rs       推荐页（卡片网格）
     popular.rs    热门页（复用网格，真实 popular API 分页）
     favorites.rs  收藏/历史/稍后（空态页 InfoBar 提示"待接入"）
-    search.rs     搜索页（AutoSuggestBox + 空态）
+    search.rs     搜索页（结果网格 + 空态；输入统一走标题栏全局搜索框）
     settings.rs   设置页（控件齐全，状态暂存内存）
     player.rs     播放页（占位视频面 + 传输控制 + 信息区）
 ```
