@@ -127,7 +127,7 @@ Grid columns: [左滚动列(Star)] [右栏(Pixel 360)]
 |---|---|
 | 视频面 | **已接入**：`SwapChainPanel`（mpv render API D3D11 interop，见 `docs/video-channel.md`）+ 弹幕覆盖层；滚动超 300px 过渡为右下角小窗（PiP）。 |
 | 传输控制 | 对照 MediaTransportControls：左（音量 Slider+按钮）；中（上一部/播放暂停/下一部 + 进度 Slider + 时间 TextBlock ×2）；右（倍速/全屏/弹幕开关）。 |
-| 信息区/评论区 | **评论区已接入真实数据**（`/x/v2/reply/main` 主楼 + `/x/v2/reply/reply` 楼中楼）：总评论数、按热度/按时间排序切换、置顶/UP主/LV/IP属地/UP主觉得很赞徽标、楼中楼预览与展开/加载更多/收起、空态/错误重试；写接口（发评/点赞）未接入。右栏 360px 为「接下来播放 · 相关推荐」（占位样本数据，待接入相关视频 API）。 |
+| 信息区/评论区 | **评论区已接入真实数据**（`/x/v2/reply/main` 主楼 + `/x/v2/reply/reply` 楼中楼）：总评论数、按热度/按时间排序切换、置顶/UP主/LV/IP属地/UP主觉得很赞徽标、楼中楼预览与展开/加载更多/收起、空态/错误重试；写接口（发评/点赞）未接入。右栏 360px「接下来播放 · 相关推荐」**已接入真实数据**（`/x/web-interface/archive/related`，随播放代次刷新，封面复用 ImageCache，点击走同一 open_video 管线）。 |
 
 返回：TitleBar 返回键（`is_back_button_visible(true)` + history pop），或面包屑。
 
@@ -157,7 +157,7 @@ crates/bili-ui/src/
   shell.rs       AppShell：TitleBar + NavigationView + 路由 + MiniPlayer + 窗口 visuals
   router.rs      Route enum（home/popular/…/player/…）+ route() 分发
   theme.rs       设计 token 常量（间距/圆角/字号）+ 通用小件
-  data.rs        占位数据 VideoItem / ChannelItem（后续由 bili-core feed 替换）
+  data.rs        展示模型 VideoItem（内容全部来自 bili-core 卡片族转换，无占位数据）
   widgets/
     mod.rs
     video_card.rs    视频卡片 + 卡片网格
@@ -166,7 +166,7 @@ crates/bili-ui/src/
   pages/
     mod.rs
     home.rs       推荐页（卡片网格）
-    popular.rs    热门页（复用网格，占位数据）
+    popular.rs    热门页（复用网格，真实 popular API 分页）
     favorites.rs  收藏/历史/稍后（空态页 InfoBar 提示"待接入"）
     search.rs     搜索页（AutoSuggestBox + 空态）
     settings.rs   设置页（控件齐全，状态暂存内存）

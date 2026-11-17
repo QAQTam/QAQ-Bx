@@ -85,8 +85,15 @@
 **实测口径坑**：`pub_time` 是字符串日期（"2017-09-22 14:21:29"）；`goto="ogv_season"`；
 `trackid` 字符串、`ogv_creative_id` 数值（类型两态，不进消费面）。
 
-`GET /x/web-interface/wbi/related/all?bvid=&aid=` → **返回 HTML（端点不存在）**，
-播放页"相关视频"的真实端点未定（待从播放页流量抓取）。
+`GET /x/web-interface/archive/related?bvid=<BV>` → **2026-11-17 定案**（此前猜测的
+`/x/web-interface/wbi/related/all` 实测返回 HTML，端点不存在）：
+
+- 无签名、无 Cookie；`data` 直接为 ArchiveCard 数组（**无** list/items 包裹层），
+  一次全量 ~20-30 条，形状与 popular/precious/ranking 同族（`aid/bvid/cid/title/
+  pic/duration/pubdate/owner{mid,name,face}/stat{view,danmaku,...}`）。
+- 实测 BV1GJ411x7h7 code=0；fixture 锚 `api/fixtures/feed-related.json`，
+  消费端 `bili-core::feed::FeedClient::related`（冒烟 `live_related_smoke`）。
+- 未保证不含当前稿件，客户端按 bvid 过滤自身。
 
 ## 7. 热门/榜单 ✅（批量实测 2026-11-16）
 

@@ -1,75 +1,82 @@
-# Handoff — 真实评论区数据与点击后 UP 主头像接入
+# Handoff — mock 数据清零:热门页 + 相关推荐接入线上真实数据
 
-> 记录时间：2026-11-16  
-> 工作区：`d:\biliplay-rs`（基线版本 `0.0.1`）
-
----
-
-## 1. 已完成（Completed）
-
-### 1.1 `bili-core` 评论区客户端与数据契约
-- 新增 [reply.rs](crates/bili-core/src/reply.rs) 并通过 [lib.rs](crates/bili-core/src/lib.rs) 导出 `ReplyClient`、`ReplySort`、`ReplyCursor`、`ReplyItem`、`ReplyPage`、`SubReplyPage`：
-  - 主楼分页：`GET https://api.bilibili.com/x/v2/reply/main?type=1&oid={aid}&mode={3|2}[&next=..&pagination_str=..]`（无 WBI，沿用 `httpx::get_json_with_ticket` 防盗链头 + Cookie + `bili_ticket`，规避 `/x/v2/reply/wbi/main` 的 `-403` 风控）。
-  - 楼中楼分页：`GET https://api.bilibili.com/x/v2/reply/reply?type=1&oid={aid}&root={rpid}&pn={pn}&ps={ps}`。
-  - 解析字段：`upper.mid`、`top_replies`（置顶）、`replies`（含楼中楼预览）、`up_action`（UP 主点赞/回复）、`reply_control`（`time_desc`、`location` 自动剥离 `"IP属地："` 前缀、`is_up_top`）、`cursor`（`next`、`pagination_reply.next_offset`、`is_end`、`all_count`）。
-  - 头像 URL 统一归一化（`//` 与 `http://` 升 `https://`）。
-- [loose.rs](crates/bili-core/src/loose.rs)：新增 `u64_any_or_zero` / `i64_any_or_zero` 处理 B 站响应中可能出现的 `null` 或字符串数字。
-- [wbi.rs](crates/bili-core/src/wbi.rs)：将 `encode_component` 开放为 `pub(crate)` 供 `reply.rs` 编码 `pagination_str` 复用。
-- [player.rs](crates/bili-core/src/player.rs)：为 `VideoMeta`（`/x/web-interface/view`）补充解析 `desc`、`pubdate`、`owner: Option<Owner>`、`stat: Option<CardStat>`，供缺卡片元数据场景补全 UP 主头像、昵称、简介与 `aid`。
-- 单测与真实接口冒烟：
-  - `reply::tests` 3 个单测覆盖 URL 构造、主楼/置顶/`null` 字段反序列化、楼中楼分页 `has_more` 计算。
-  - `player::tests::video_meta_parses_owner_desc_stat_and_minimal_shape` 覆盖 `VideoMeta` 完整与最小 JSON 解析。
-  - `cargo test -p bili-core reply::tests::live_reply_smoke -- --ignored` 已对 `BV1GJ411x7h7`（`aid=80433022`）实弹验证主评论第 1/2 页与楼中楼接口通过。
-
-### 1.2 点击后 UP 主头像与评论区 UI 接入（`bili-ui`）
-- [data.rs](crates/bili-ui/src/data.rs)：`VideoItem` 新增 `author_mid: u64` 与 `author_face_url: Option<String>`。
-- [auth.rs](crates/bili-ui/src/auth.rs)：`avatar_thumbnail_url` 增加 `//` 协议相对地址升级 `https://` 处理（`@96w_96h_1c.jpg` 缩略图）。
-- [theme.rs](crates/bili-ui/src/theme.rs) & [account.rs](crates/bili-ui/src/pages/account.rs)：抽出共享 `theme::avatar_view`（已解码 `Image::source_data` + `PersonPicture` 首字兜底），去除 `account.rs` 重复实现。
-- [pages/player.rs](crates/bili-ui/src/pages/player.rs)：
-  - `PlayerPage` 与 `HalfPanePreview` 同步接入真实 UP 主异步头像（圆形裁剪 `36x36` / `30x30`，不再仅显示 `PersonPicture` 姓名首字），以及登录态评论输入栏当前用户头像。
-  - 评论区接入 `CommentsSnapshot`（`rev + Arc::ptr_eq` O(1) 变更检测，避免 250ms 播放节拍重复比对整表）与 `CommentCallbacks`：
-    - 展示总评论数、按热度/按时间排序切换、主楼列表（`keyed_children` 唯一键防重）、置顶/UP主/LV/IP属地/UP主觉得很赞徽标、加载中/空态/错误重试、加载更多评论与终态提示。
-    - 楼中楼预览与「展开全部 / 加载更多回复 / 收起回复」交互（含子回复头像展示）。
-  - 清理原 `player.rs` 中“接口待接入/即将接入/布局样式预览”等解释性提示文本（对齐 `AGENTS.md` #1）。
-- [shell.rs](crates/bili-ui/src/shell.rs)：
-  - 集成 `ReplyClient` 与 `CommentsSessionState`（热度/时间双桶独立缓存，切换排序不丢失已拉取页；按 `rpid` 客户端去重防重叠）。
-  - `video_item(FeedCard)` 透传首页推荐卡 `owner.mid` 与 `owner.face`（首页网格不提前下载头像，仅点击进半窗/播放页后触发，契合 8GB 内存约束）。
-  - 点击视频（首页卡片、热门占位、通知/私信链接、`BILIPLAY_VIDEO`）后通过 `kickoff_video_extras` / `absorb_video_meta` 统一拉取 UP 主头像与第 1 页评论；若 `cid > 0` 但缺 `aid` 或 `author_face_url`，后台单飞补拉 `video_meta`。
-  - 统一 `spawn_avatars` / `Message::AvatarLoaded`：以 `playback_epoch` 取消已切走视频的在飞头像下载，`avatar_inflight: HashMap<String, u64>` 区分持久通知头像（`0`）与播放头像（`playback_gen`），并用 80ms `FlushPlaybackAvatars` 合并批刷评论头像减少 UI 重绘；`avatar_cache` 容量扩至 256。
-  - 抽出 `half_pane_layer` 复用桌面端与窄屏模式半窗渲染。
-  - 新增单测：`video_item_carries_owner_mid_and_normalized_face_url`、`comments_session_tracks_avatar_refs_and_builds_snapshot`。
+> 记录时间:2026-11-17
+> 工作区:`d:\biliplay-rs`(基线版本 `0.0.1`,`just dev` 自更新末尾修订号)
 
 ---
 
-## 2. 当前状态（Current）
+## 1. 已完成(Completed)
 
-- 代码改动清单（未 commit）：
-  - 新增：`crates/bili-core/src/reply.rs`、`handoff.md`
-  - 修改：`crates/bili-core/src/lib.rs`、`crates/bili-core/src/loose.rs`、`crates/bili-core/src/player.rs`、`crates/bili-core/src/wbi.rs`、`crates/bili-ui/src/auth.rs`、`crates/bili-ui/src/data.rs`、`crates/bili-ui/src/pages/account.rs`、`crates/bili-ui/src/pages/player.rs`、`crates/bili-ui/src/shell.rs`、`crates/bili-ui/src/theme.rs`
-- 编译与测试进度：
-  - 最后一次修改（[pages/player.rs](crates/bili-ui/src/pages/player.rs)）完成后已执行 `cargo test --workspace` 全量通过（exit 0：`bili-core` 40 passed + 5 fixture tests、`bili-plugin-login` 7 passed、`bili-ui` 18 passed、`bili-video` 1 passed；其余 `--ignored` 测试中 `reply::tests::live_reply_smoke` 此前已实网验证通过）。
+### 1.1 `bili-core` 相关视频真实端点定案
+- 新增 [feed.rs](crates/bili-core/src/feed.rs) `FeedClient::related(bvid)`:
+  `GET https://api.bilibili.com/x/web-interface/archive/related?bvid=<BV>`(无签名,访客可用)。
+  实测 BV1GJ411x7h7 `code=0`,`data` 为 **ArchiveCard 裸数组**(无 `list/items` 包裹,与
+  popular/precious/ranking 同 schema);旧猜测 `wbi/related/all` 返回 HTML(不存在)。
+- 契约面:`api/openapi/bilibili-feed-v1.yaml` 新增 `archiveRelated` 路径;
+  新 fixture [feed-related.json](api/fixtures/feed-related.json)(真机截断样本,3 卡)。
+- 测试:`feed_fixtures::related_fixture_matches_contract_v1`(契约锚)、
+  `feed::related_tests::related_url_uses_archive_related_endpoint`(端点防回归)、
+  `feed::related_tests::live_related_smoke`(`--ignored` 实网通过:非空/字段完整/不含自身 bvid)。
+
+### 1.2 `bili-ui` 占位数据全部删除
+- [data.rs](crates/bili-ui/src/data.rs):12 条假视频与 `seed/all/find/popular` 删除,
+  仅保留展示模型 `VideoItem`;内容一律来自 `video_item(FeedCard)` /
+  `archive_video_item(ArchiveCard)`(新增)/ `search_video_item(SearchVideo)`。
+- `open_video` 数据源链:首页 → 搜索 → **热门索引** → **相关推荐索引** →
+  `minimal_video_item`(真实标题/aid/cid/UP 主由 `video_meta` 解析管线回填);
+  `open_video_target` 复用同一最小模型;`BILIPLAY_VIDEO=<bvid>` 冒烟不再依赖种子表。
+- `ShellProbe` 新增 `popular_items/popular_first_bvid/related_items/related_bvid/popular_error`。
+
+### 1.3 热门页真实数据([popular.rs](crates/bili-ui/src/pages/popular.rs))
+- `PopularFeedState`(AppShell 单源,`next_pn` 从 **1** 起——实测 `pn=0` 返回 `-400`):
+  `FeedClient::popular(pn, 20)` 真实分页;底栏状态机 加载中/重试(失败不推进页号)/
+  「没有更多了」(空页终态)/「加载更多」;跨页 bvid 去重 `merge_popular_items`。
+- 路由改造:`Route::Popular` 由 shell view 直接组装(共享状态),`router.rs` 仅剩空态页分发。
+
+### 1.4 播放页右栏相关推荐真实数据([player.rs](crates/bili-ui/src/pages/player.rs))
+- `RelatedPane`(bvid+loading+loaded_once+error+items)随 `playback_gen` 在
+  `start_playback` 拉取;吸收端 代次+目标 bvid 双校验丢弃切视频迟到响应;防御性过滤自身 bvid。
+- 卡片渲染真实 封面/标题/UP 主/播放数/时长,点击 → `on_open_video`(`Message::OpenVideo`,
+  经 `related_index` 与首页卡同管线);加载中/失败重试/暂无三态齐备。
+- 封面管线:`FlushCovers` 兜底回填扩展到 热门卡 与 相关推荐卡(同一有界 LRU)。
+- **互动计数真实化**:播放页信息区原写死的「点赞 1.2万/投币 3,420/收藏 5,890/分享 转发」
+  胶囊删除;`VideoItem` 增 `like/coin/favorite/share_count: Option<u64>`,
+  rcmd/归档卡透传 + `absorb_video_meta` 经 view 回填(None 时只显示标签不编数字)。
+  实机对比:Rick Astley MV 298.2万/129.6万/156.9万/50.8万 vs 另一稿件 1.1万/2894/2992/443。
+
+### 1.5 测试与自动化
+- `cargo test --workspace` exit 0:`bili-core` 44+6 fixture、`bili-plugin-login` 7、
+  `bili-ui` 27(新增 `archive_video_item_*`/`merge_popular_items_*`/`minimal_video_item_*`/`video_item_maps_optional_interaction_counts`)、`bili-video` 1。
+- `just selftest all`:**8 场景全绿**(新增 `popular`:导航→真实分页→点首卡→Back;
+  `comments` 场景新增相关推荐就绪断言)。
+- `scripts/ui-edge.ps1` 新增 E6(热门直启+点首卡)与 E7(`BILIPLAY_VIDEO` 直启+点右栏推荐卡),
+  实机跑通 exit 0;截图证据:热门页 20 条真实视频、右栏真实相关推荐(含 2026-11-17 新鲜稿件)、
+  点推荐卡打开 Rick Astley 官方 MV(真实弹幕流)无 panic。
 
 ---
 
-## 3. 待决事项（Pending）
+## 2. 当前状态(Current)
 
-1. **集成测试与自动化点击测试（`AGENTS.md` #4）**：
-   - 尚未执行 `just demo`（`scripts/ui-demo.ps1`）或真机启动 `bili-ui.exe` 点击验证，需实机确认无 panic 及无布局截断/溢出（特别是半窗宽度拖拽到 340px 时评论卡片与楼中楼排版、圆形头像 `Border::corner_radius` 在 WinUI 3 下的裁剪效果）。
-2. **极端场景 UI 走查**：
-   - 评论区关闭（`code=12002`）、0 评论视频、无本地凭据（访客态）打开视频、快速连续切视频、以及从半窗预览展开至全屏播放页切换期间的状态衔接。
-3. **评论输入栏范围确认**：
-   - 当前保留了 `TextBox` + `发布` 按钮（纯 UI 控件，未接 `POST /x/v2/reply/add` 写接口），待确认后续是否需要单独接入发评与点赞接口或暂保持只读。
-4. **文档与自更新打包（`AGENTS.md` #5）**：
-   - 尚未更新 `docs/ui-design.md`（§4 第 129 行仍写“评论区占位”），尚未新增 `docs/Update-<X.Y.Z>.md`，也尚未执行 `just dev` 生成自更新 AppX。
-5. **令牌规范核查（`AGENTS.md` #7）**：
-   - 本机 `data/credentials.json` 为接手前已存在文件，本次未额外写入测试凭据；后续若做需要登录态的自动化测试，结束后注意恢复/清理临时令牌。
+- 改动文件(未 commit):`crates/bili-core/src/feed.rs`、`crates/bili-core/tests/feed_fixtures.rs`、
+  `crates/bili-ui/src/{data.rs,shell.rs,router.rs,selftest.rs,pages/popular.rs,pages/player.rs}`、
+  `api/fixtures/feed-related.json`(新)、`api/openapi/bilibili-feed-v1.yaml`、`api/README.md`、
+  `docs/{bilibili-api-inventory.md,ui-design.md,Update-0.0.2.md(新)}`、`scripts/ui-edge.ps1`、`handoff.md`。
+- `just dev` 自更新 AppX:v0.0.1.6(debug+自签)打包中/已完成(见本文件末尾追加记录)。
 
 ---
 
-## 4. 下一步（Next Steps）
+## 3. 待决事项(Pending)
 
-1. 构建并运行真机 UI 验证：
-   - 执行 `cargo build -p bili-ui` 与 `.\scripts\ui-demo.ps1`（或设置 `BILIPLAY_VIDEO=BV1GJ411x7h7` 启动 `bili-ui.exe` 并查看 `target/ui-demo/frames/` 截图与 `data/crash.log`）。
-   - 重点验证：点击卡片后半窗/全屏 UP 主头像显示、评论主楼与头像渲染、切换「按热度 / 按时间」、点击「加载更多评论」、楼中楼「点击展开 / 加载更多回复 / 收起回复」交互。
-2. 视情况在 `scripts/ui-demo.ps1` 增补评论排序切换与楼中楼展开的自动化点击用例。
-3. 更新 `docs/ui-design.md` 与 `docs/Update-0.0.1.md`（或目标版本号文档），最后运行 `just dev` 打包末尾修订号自更新 AppX。
+1. **空态页(非 mock,维持现状)**:关注/直播/收藏/历史/稍后再看仍是空态文案,
+   未接对应登录态端点;如需接入按 docs/bilibili-api-inventory.md §8 端点表推进。
+2. **评论写接口**(发评/点赞)与搜索建议词(`search/default`)仍未接入。
+3. 热门页「换一换」类刷新语义未做(API 为固定轮播分页,现仅 加载更多/重试)。
+4. `just demo` 主脚本 8 场景未纳入热门/推荐点击(已由 `ui-edge.ps1` E6/E7 覆盖,
+   若要把截图宣传片并入 promo 录制再迁一次)。
+
+---
+
+## 4. 下一步(Next Steps)
+
+1. 若需登录态页面真实化:先 `bili-plugin-login` 走扫码 → 按 AGENTS.md #7 测试后清理令牌。
+2. 版本号:用户未提版本提升,后续继续 `just dev` 自增末尾修订号;功能面大版本再开 `Update-0.1.0.md`。
