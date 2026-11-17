@@ -2,7 +2,7 @@
 //! AppShell 组件树并派发 Message,断言壳层状态。覆盖「鼠标模拟测不到」
 //! 的路径:快速切视频的播放代次取消、评论双桶缓存、导航历史栈。
 //!
-//! 用法:`bili-ui.exe --selftest [all|boot|nav|comments|rapid-switch|stress|search|popular]`
+//! 用法:`bili-ui.exe --selftest [all|boot|nav|comments|rapid-switch|stress|search|popular|half-pane|codec]`
 //! 前置:`cargo build -p bili-ui --features selftest`;需要真实网络与
 //! 本地凭据(nav 探测 / feed / 评论均走真实接口)。
 
@@ -305,15 +305,37 @@ fn codec(s: &mut Scenario) -> Result<(), String> {
     Ok(())
 }
 
-const SCENARIOS: &[(&str, fn(&mut Scenario) -> Result<(), String>)] = &[
-    ("boot", boot),
-    ("nav", nav),
-    ("comments", comments),
-    ("rapid-switch", rapid_switch),
-    ("stress", stress),
-    ("search", search),
-    ("codec", codec),
-    ("popular", popular),
+/// 场景 9:首页半屏抽屉挂载 + 加载指示生命周期(回归冷启动首个视频黑屏 /
+/// 关闭播放条丢弃引擎后重开复发的 bug)。半屏态 route 合法地停在 Home——旧门控
+/// 只认 `route == Player`,`mount_tick` 永不脉冲,swapchain 错过唯一一次 metrics
+/// 挂载后再无重试(真机上表现为永久黑屏)。修复后:
+/// 开播 → 环形指示点亮;脉冲驱动 swapchain 挂载;首个 has_media → 指示熄灭。
+fn half_pane_pulse(s: &mut Scenario) -> Result<(), String> {
+    s.send(Message::OpenVideo(TEST_BV.into()))?;
+    s.sync()?;
+    assert!(s.probe.borrow().video_loading, "开播后加载环形指示应点亮(解析/缓冲中)");
+    s.wait_for(Duration::from_secs(60), |p| {
+        p.route_tag == "home"
+            && p.home_half_pane
+            && p.now_playing_bvid.as_deref() == Some(TEST_BV)
+    })
+    .map_err(|err| format!("半屏抽屉未就绪:{err}"))?;
+    s.wait_for(Duration::from_secs(20), |p| p.engine_attached && p.mount_tick >= 1)
+        .map_err(|err| format!("半屏挂载脉冲未驱动 swapchain 挂载(旧 bug 现场):{err}"))?;
+    s.wait_for(Duration::from_secs(60), |p| !p.video_loading)
+        .map_err(|err| format!("媒体就绪后加载指示未熄灭:{err}"))
+}
+
+const SCENARIOS: &[(&str, &str, fn(&mut Scenario) -> Result<(), String>)] = &[
+    ("boot", "FullPlayer", boot),
+    ("nav", "FullPlayer", nav),
+    ("comments", "FullPlayer", comments),
+    ("rapid-switch", "FullPlayer", rapid_switch),
+    ("stress", "FullPlayer", stress),
+    ("search", "FullPlayer", search),
+    ("codec", "FullPlayer", codec),
+    ("popular", "FullPlayer", popular),
+    ("half-pane", "HalfPane", half_pane_pulse),
 ];
 
 /// 解析 `--selftest [scenario]`;非 selftest 调用返回 `None` 走正常启动。
@@ -325,9 +347,7 @@ pub fn scenario_from_args() -> Option<String> {
     }
 }
 
-/// 隔离数据目录:不读不写用户真实凭据(AGENTS.md #7,顺带覆盖访客态路径),
-/// settings 固定 FullPlayer——否则用户的 HalfPane 配置会让 start_playback
-/// 走半窗分支(route 合法地留在 Home),路由断言失效。
+/// 隔离数据目录:不读不写用户真实凭据(AGENTS.md #7,顺带覆盖访客态路径)。
 fn prepare_hermetic_data_dir() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = exe
@@ -335,14 +355,23 @@ fn prepare_hermetic_data_dir() -> Result<(), String> {
         .ok_or_else(|| "exe 无父目录".to_string())?
         .join("selftest-data");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::write(
-        dir.join("settings.json"),
-        r#"{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"FullPlayer","autoplay":true,"hardware_decode":true,"volume":30}"#,
-    )
-    .map_err(|e| e.to_string())?;
     // 2024 edition 的 set_var 为 unsafe;此处在组件挂载前的主线程单次调用,无并发读。
     unsafe { std::env::set_var("BILIPLAY_DATA_DIR", &dir) };
     Ok(())
+}
+
+/// 按场景写 settings.json(每次 mount 前调用,AppShell::create 读取)。
+/// 除 half-pane 回归场景外一律 FullPlayer——否则用户的 HalfPane 配置会让
+/// start_playback 走半窗分支(route 合法地留在 Home),路由断言失效。
+fn write_hermetic_settings(home_open_mode: &str) -> Result<(), String> {
+    let dir = bili_core::resolve_data_dir();
+    std::fs::write(
+        dir.join("settings.json"),
+        format!(
+            r#"{{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"{home_open_mode}","autoplay":true,"hardware_decode":true,"volume":30}}"#
+        ),
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// 场景执行器:独立 panic hook(落盘 crash.log,不弹窗),逐场景隔离挂载。
@@ -361,12 +390,13 @@ pub fn run(scenario: &str) {
     }));
 
     let mut failed = 0usize;
-    for (name, func) in SCENARIOS {
+    for (name, open_mode, func) in SCENARIOS {
         if scenario != "all" && scenario != *name {
             continue;
         }
         let start = Instant::now();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            write_hermetic_settings(open_mode)?;
             let mut state = Scenario::mount()?;
             func(&mut state)
         }))

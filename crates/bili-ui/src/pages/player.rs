@@ -111,6 +111,8 @@ pub struct PlayerInput {
     pub duration_secs: u32,
     /// 引擎错误/媒体失败提示(None = 无)。
     pub notice: Option<String>,
+    /// 解析/缓冲中:视频面上叠加 Fluent 环形加载指示(shell 单源,首个 has_media 熄灭)。
+    pub loading: bool,
     pub engine: Arc<VideoEngine>,
     pub comments: CommentsSnapshot,
     pub comment_cb: CommentCallbacks,
@@ -136,6 +138,7 @@ impl PartialEq for PlayerInput {
             && self.mount_tick == other.mount_tick
             && self.duration_secs == other.duration_secs
             && self.notice == other.notice
+            && self.loading == other.loading
             && Arc::ptr_eq(&self.engine, &other.engine)
             && self.comments == other.comments
             && self.comment_cb == other.comment_cb
@@ -216,6 +219,7 @@ impl Component for PlayerPage {
                 tick: input.mount_tick,
             })
         };
+        let surface = surface_with_loading(surface, input.loading);
 
         // 顶部主播放占位槽：未小窗时由上层稳定悬浮的 VideoSurface 覆盖；进入小窗后展示回到顶部提示。
         let top_player_slot: View = if is_pip {
@@ -373,18 +377,21 @@ impl Component for PlayerPage {
                             action_pill("分享", input.item.share_count),
                         )),
                 )),
-            Expander::new()
-                .header("简介")
-                .is_expanded(false)
-                .content(
+            // 简介：内联展示（无展开/收起态，长文本随页面滚动），替代 Expander。
+            StackPanel::new()
+                .spacing(4.0)
+                .children((
                     TextBlock::new()
-                        .text(format_desc_text(
-                            &input.item.title,
-                            &input.item.bvid,
-                            input.desc.as_deref(),
-                        ))
+                        .text("简介")
+                        .font_size(13.0)
+                        .font_weight(FontWeight::SEMI_BOLD)
+                        .opacity(0.75),
+                    TextBlock::new()
+                        .text(format_desc_body(&input.item.bvid, input.desc.as_deref()))
+                        .font_size(13.0)
+                        .opacity(0.85)
                         .text_wrapping(TextWrapping::Wrap),
-                ),
+                )),
         ));
 
         let comments_section = comments_panel_with(
@@ -532,12 +539,43 @@ fn action_pill(label: &str, count: Option<u64>) -> View {
         .into()
 }
 
-fn format_desc_text(title: &str, bvid: &str, desc: Option<&str>) -> String {
-    if let Some(d) = desc.map(str::trim).filter(|s| !s.is_empty() && *s != "-") {
-        format!("{title}\n\n{d}\n\nBV 号：{bvid}")
-    } else {
-        format!("{title}\n\nBV 号：{bvid}")
+/// 加载态在视频面上叠加 Fluent 环形指示器（ProgressRing）。状态单源在 shell：
+/// start_playback 点亮，首个 `has_media` 或失败熄灭；视图纯映射，无常驻组件状态，
+/// 因此任何重建都不会让指示器卡死。
+fn surface_with_loading(surface: View, loading: bool) -> View {
+    if !loading {
+        return surface;
     }
+    Grid::new()
+        .children((
+            surface,
+            StackPanel::new()
+                .spacing(10.0)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center)
+                .children((
+                    ProgressRing::new()
+                        .is_indeterminate(true)
+                        .is_active(true)
+                        .width(44.0)
+                        .height(44.0),
+                    TextBlock::new()
+                        .text("视频加载中…")
+                        .font_size(13.0)
+                        .opacity(0.85),
+                )),
+        ))
+        .into()
+}
+
+/// 简介正文：不再内嵌标题（顶部已大字展示），空简介走占位，末行保留 BV 号。
+/// 纯内联展示、无展开状态——任何视图重建都不会把用户操作"顶"回去。
+fn format_desc_body(bvid: &str, desc: Option<&str>) -> String {
+    let d = desc
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "-")
+        .unwrap_or("暂无简介");
+    format!("{d}\n\nBV 号：{bvid}")
 }
 
 fn comments_panel_with(
@@ -1330,6 +1368,8 @@ pub struct HalfPaneInput {
     pub width: f64,
     pub max_width: f64,
     pub notice: Option<String>,
+    /// 解析/缓冲中:半窗视频面叠加环形加载指示(与全播放页同源状态)。
+    pub loading: bool,
     pub engine: Arc<VideoEngine>,
     pub comments: CommentsSnapshot,
     pub comment_cb: CommentCallbacks,
@@ -1348,6 +1388,7 @@ impl PartialEq for HalfPaneInput {
             && (self.width - other.width).abs() < 0.5
             && (self.max_width - other.max_width).abs() < 0.5
             && self.notice == other.notice
+            && self.loading == other.loading
             && Arc::ptr_eq(&self.engine, &other.engine)
             && self.comments == other.comments
             && self.comment_cb == other.comment_cb
@@ -1422,6 +1463,7 @@ impl Component for HalfPanePreview {
                 tick: input.mount_tick,
             })
         };
+        let surface = surface_with_loading(surface, input.loading);
 
         let cur_w = pane_width;
         let drag_handle = Border::new()
@@ -1526,18 +1568,21 @@ impl Component for HalfPanePreview {
                                     .opacity(0.6),
                             )),
                     )),
-                Expander::new()
-                    .header("简介")
-                    .is_expanded(false)
-                    .content(
+                // 简介：内联展示，无展开态（见 format_desc_body 注释）。
+                StackPanel::new()
+                    .spacing(4.0)
+                    .children((
                         TextBlock::new()
-                            .text(format_desc_text(
-                                &input.item.title,
-                                &input.item.bvid,
-                                input.desc.as_deref(),
-                            ))
+                            .text("简介")
+                            .font_size(12.0)
+                            .font_weight(FontWeight::SEMI_BOLD)
+                            .opacity(0.75),
+                        TextBlock::new()
+                            .text(format_desc_body(&input.item.bvid, input.desc.as_deref()))
+                            .font_size(12.0)
+                            .opacity(0.85)
                             .text_wrapping(TextWrapping::Wrap),
-                    ),
+                    )),
                 comments_panel_with(
                     &input.comments,
                     input.my_avatar.as_ref(),
@@ -1588,6 +1633,27 @@ impl Component for HalfPanePreview {
                 .into()
         } else {
             drawer.into()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_desc_body;
+
+    #[test]
+    fn desc_body_keeps_text_and_bvid_without_title() {
+        let s = format_desc_body("BV1xx411c7mD", Some("  真实简介  "));
+        assert!(s.starts_with("真实简介"), "应保留去首尾空白后的正文: {s}");
+        assert!(s.ends_with("BV 号：BV1xx411c7mD"));
+        assert!(!s.contains("简介\n\n真实简介\n\n真实简介"));
+    }
+
+    #[test]
+    fn desc_body_falls_back_for_missing_or_placeholder_desc() {
+        for case in [None, Some(""), Some("   "), Some("-")] {
+            let s = format_desc_body("BV1", case);
+            assert!(s.starts_with("暂无简介"), "缺省/占位简介应落占位文案: {s}");
         }
     }
 }

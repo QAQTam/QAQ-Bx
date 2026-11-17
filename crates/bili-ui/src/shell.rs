@@ -331,6 +331,14 @@ pub struct ShellProbe {
     pub related_bvid: String,
     /// 热门页最近一次失败原因（selftest 定位用）。
     pub popular_error: Option<String>,
+    /// 挂载脉冲计数(selftest:半屏/播放页 swapchain 未挂载时的重试驱动)。
+    pub mount_tick: u32,
+    /// 引擎 swapchain 是否已成功挂载到面板。
+    pub engine_attached: bool,
+    /// 视频加载指示(ProgressRing)是否点亮。
+    pub video_loading: bool,
+    /// 首页是否处于半屏预览态(route 合法地停在 Home)。
+    pub home_half_pane: bool,
 }
 
 pub struct AppShell {
@@ -462,6 +470,9 @@ pub struct AppShell {
     engine_duration: Option<f64>,
     /// 媒体失败/引擎错误提示(播放页显示一次)。
     player_notice: Option<String>,
+    /// 视频加载态:解析/缓冲中为 true(驱动 ProgressRing 环形指示);
+    /// 首个 has_media、解析失败或关播熄灭。
+    video_loading: bool,
     /// 视频引擎(SwapChainPanel 渲染 + mpv;惰性按需创建，关闭迷你条即释放全部解码/D3D 内存)。
     engine: Option<Arc<VideoEngine>>,
     /// 当前播放项的元信息(cid/aid/duration;弹幕拉取参数)。
@@ -812,6 +823,10 @@ impl AppShell {
         out.related_items = self.related.items.len();
         out.related_bvid = self.related.bvid.clone();
         out.popular_error = self.popular.error.clone();
+        out.mount_tick = self.mount_tick;
+        out.engine_attached = self.engine.as_ref().is_some_and(|e| e.attached());
+        out.video_loading = self.video_loading;
+        out.home_half_pane = self.home_half_pane;
     }
 
     fn open_video(&mut self, bvid: &str, context: &ComponentContext<Self>) {
@@ -1009,6 +1024,7 @@ impl AppShell {
         self.position = 0;
         self.engine_duration = None;
         self.player_notice = None;
+        self.video_loading = true;
         self.comments_session.reset(item.aid, item.author_mid);
         self.refresh_comments_snapshot();
         self.schedule_tick(context);
@@ -1678,6 +1694,7 @@ impl AppShell {
                 width: self.settings.half_pane_width,
                 max_width: self.window_width,
                 notice: self.player_notice.clone(),
+                loading: self.video_loading,
                 engine: engine.clone(),
                 comments: self.comments_snapshot.clone(),
                 comment_cb,
@@ -2086,6 +2103,15 @@ fn apply_feed_page<T>(
     }
 }
 
+/// 挂载脉冲门控:全播放页 **或** 首页半屏抽屉打开时,swapchain 未挂载成功
+/// 就要持续重试(250ms 一拍经 `mount_tick` 驱动 `VideoSurface::try_mount`)。
+/// 半屏抽屉 route 停留在 Home——旧门控只认 `route == Player`,冷启动时面板
+/// metrics 抢在引擎产出 swapchain 之前触发一次就再无第二次机会,首个视频
+/// 永久黑屏;`ClosePlayer` 丢弃引擎后重开又新建引擎,同样复发。
+fn mount_pulse_active(route: Route, home_half_pane: bool, engine_attached: bool) -> bool {
+    (route == Route::Player || home_half_pane) && !engine_attached
+}
+
 fn spawn_resolve_media(
     auth_service: &Arc<Auth>,
     settings: &AppSettings,
@@ -2290,10 +2316,12 @@ impl Component for AppShell {
         // 冒烟播放与点卡同构:仅在 BILIPLAY_VIDEO 指定时才提前创建 VideoEngine；日常启动 0 播放内存占用。
         let mut timer = None;
         let mut engine = None;
+        let mut video_loading = false;
         if let Some(item) = &now_playing {
             engine = Some(VideoEngine::with_config(video_config_from(&settings)));
             spawn_resolve_media(&auth_service, &settings, item.clone(), playback_gen, context);
             timer = Some(context.set_local_timeout(PLAYBACK_TICK, || Message::PositionTick));
+            video_loading = true;
         }
 
         let initial_win_w = settings
@@ -2446,6 +2474,7 @@ impl Component for AppShell {
             settings,
             engine_duration: None,
             player_notice: None,
+            video_loading,
             engine,
             current_meta: None,
             timer,
@@ -2634,6 +2663,7 @@ impl Component for AppShell {
                 if let Some(engine) = &self.engine {
                     let status = engine.status();
                     if status.has_media() {
+                        self.video_loading = false;
                         self.position = status.time_pos.round().clamp(0.0, f64::from(u32::MAX)) as u32;
                         self.playing = !status.pause && !status.eof;
                         if status.duration > 0.0 {
@@ -2641,7 +2671,7 @@ impl Component for AppShell {
                         }
                     }
                     // 仅当 SwapChain 尚未挂载成功时按 250ms 递增驱动 VideoSurface::try_mount()。
-                    if self.route == Route::Player && !engine.attached() {
+                    if mount_pulse_active(self.route, self.home_half_pane, engine.attached()) {
                         self.mount_tick = self.mount_tick.wrapping_add(1);
                     }
                     // 引擎错误(初始化/挂载/设备级)一次性上屏。
@@ -2649,6 +2679,7 @@ impl Component for AppShell {
                         && let Some(reason) = engine.error()
                     {
                         self.player_notice = Some(reason);
+                        self.video_loading = false;
                     }
                 }
                 self.sync_smtc(context);
@@ -2893,6 +2924,7 @@ impl Component for AppShell {
                 }
                 self.player_notice = Some(format!("视频解析失败:{reason}"));
                 self.playing = false;
+                self.video_loading = false;
             }
             Message::MiniNext => {}
             Message::ClosePlayer => {
@@ -2907,6 +2939,7 @@ impl Component for AppShell {
                 self.position = 0;
                 self.engine_duration = None;
                 self.player_notice = None;
+                self.video_loading = false;
                 self.current_meta = None;
                 self.timer = None;
                 self.comments_session.reset(0, 0);
@@ -3377,6 +3410,7 @@ impl Component for AppShell {
                         if matched_open {
                             self.player_notice = Some(format!("视频解析失败:{reason}"));
                             self.playing = false;
+                            self.video_loading = false;
                         }
                     }
                 }
@@ -3881,6 +3915,7 @@ impl Component for AppShell {
                         mount_tick: self.mount_tick,
                         duration_secs: self.display_duration(item),
                         notice: self.player_notice.clone(),
+                        loading: self.video_loading,
                         engine: engine.clone(),
                         comments: self.comments_snapshot.clone(),
                         comment_cb: comment_cb.clone(),
@@ -4463,6 +4498,21 @@ mod tests {
         let (max_qn, codecs) = resolve_params_for(&settings, &nav);
         assert_eq!(max_qn, 64);
         assert_eq!(codecs, &["hev1", "avc1", "av01"]);
+    }
+
+    #[test]
+    fn mount_pulse_covers_half_pane_and_stops_when_attached() {
+        // 全播放页未挂载 → 脉冲。
+        assert!(mount_pulse_active(Route::Player, false, false));
+        // 半屏抽屉(route 停在 Home)未挂载 → 必须脉冲(修复冷启动/关闭播放条后首个视频黑屏)。
+        assert!(mount_pulse_active(Route::Home, true, false));
+        // 已挂载成功 → 任何路由都停脉冲。
+        assert!(!mount_pulse_active(Route::Player, false, true));
+        assert!(!mount_pulse_active(Route::Home, true, true));
+        // 首页无半屏抽屉、无播放画面 → 不脉冲(省电:无 surface 需要挂载)。
+        assert!(!mount_pulse_active(Route::Home, false, false));
+        // 其它空态页(收藏/历史等)同理不脉冲。
+        assert!(!mount_pulse_active(Route::Favorites, false, false));
     }
 
     #[test]
