@@ -62,22 +62,49 @@ pub fn build_title_bar(
         .grid_row(0);
 
     if layout.shows_inline_title_search() {
+        // 全局内敛搜索框：Border 壳 + 无边框透明 TextBox + 内嵌放大镜 Button，PreviewKeyDown Enter 即提交。
         let search_w = title_search_box_width(layout.window_width);
+        let on_enter = {
+            let on_submit = on_search_submit.clone();
+            RoutedCallback::new(move |ev: KeyEventInfo| {
+                if crate::shell::search_enter_submits(&ev) {
+                    on_submit.call(());
+                    true
+                } else {
+                    false
+                }
+            })
+        };
         bar = bar.content(
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .children((
-                    TextBox::new()
-                        .placeholder_text("搜索视频、UP 主")
-                        .width(search_w)
-                        .text(search_draft)
-                        .on_text_changed(on_search_draft),
-                    Button::new()
-                        .style(ButtonStyle::Subtle)
-                        .on_click(on_search_submit)
-                        .content(SymbolIcon::new().symbol(Symbol::Find)),
-                )),
+            Border::new()
+                .width(search_w)
+                .height(32.0)
+                .corner_radius(6.0)
+                .background(ThemeBrush::CardBackground)
+                .border_brush(ThemeBrush::CardStroke)
+                .border_thickness(1.0)
+                .padding(Thickness::xy(2.0, 1.0))
+                .on_preview_key_down(on_enter)
+                .content(
+                    Grid::new()
+                        .columns([GridLength::Star(1.0), GridLength::Auto])
+                        .children((
+                            TextBox::new()
+                                .grid_column(0)
+                                .placeholder_text("搜索视频、UP 主")
+                                .text(search_draft)
+                                .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
+                                .border_thickness(0.0)
+                                .on_text_changed(on_search_draft),
+                            Button::new()
+                                .grid_column(1)
+                                .style(ButtonStyle::Subtle)
+                                .height(26.0)
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .on_click(on_search_submit)
+                                .content(SymbolIcon::new().symbol(Symbol::Find)),
+                        )),
+                ),
         );
     }
 
@@ -142,6 +169,18 @@ pub fn floating_search_layers(
             }),
     );
 
+    let on_enter = {
+        let on_submit = on_submit.clone();
+        RoutedCallback::new(move |ev: KeyEventInfo| {
+            if crate::shell::search_enter_submits(&ev) {
+                on_submit.call(());
+                true
+            } else {
+                false
+            }
+        })
+    };
+
     let card = KeyedView::new(
         "search-popup",
         Border::new()
@@ -154,6 +193,7 @@ pub fn floating_search_layers(
             .border_thickness(1.0)
             .horizontal_alignment(HorizontalAlignment::Stretch)
             .vertical_alignment(VerticalAlignment::Top)
+            .on_preview_key_down(on_enter)
             .content(
                 Grid::new()
                     .columns([GridLength::Star(1.0), GridLength::Auto, GridLength::Auto])

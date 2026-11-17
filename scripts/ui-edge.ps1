@@ -17,6 +17,7 @@ $FramesDir = Join-Path $OutRoot "frames-edge"
 New-Item -ItemType Directory -Force -Path $FramesDir | Out-Null
 
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
 Add-Type -ReferencedAssemblies System.Drawing @"
 using System;
 using System.Runtime.InteropServices;
@@ -33,6 +34,8 @@ public static class UiEdgeNative {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, int dx, int dy, int dwData, UIntPtr dwExtraInfo);
+    [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     public const uint MOUSEEVENTF_LEFTUP = 0x0004;
     public const uint MOUSEEVENTF_WHEEL = 0x0800;
@@ -299,6 +302,49 @@ try {
 
     $proc.Refresh()
     if ($proc.HasExited) { throw "Mobile 走查后进程退出 ($($proc.ExitCode))" }
+} finally {
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+}
+
+# ---------- 场景 E9：全局内敛搜索框——真实键入 + Enter 直接发起搜索 ----------
+Write-Host "[E9] 全局搜索框键入 rust 后按 Enter 发起搜索" -ForegroundColor Cyan
+$proc = $null
+try {
+    $proc = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -PassThru
+    $hwnd = Wait-MainWindow $proc
+    # 前台硬校验：GetForegroundWindow 必须是 qaq-bx-ui，否则 SendKeys 会泄漏到别的窗口
+    # （IDE/输入法）。ALT 按下-释放模拟解锁前台锁后重试；仍失败则判场景 FAIL。
+    $ok = $false
+    for ($i = 0; $i -lt 10 -and -not $ok; $i++) {
+        if ([UiEdgeNative]::GetForegroundWindow() -eq $hwnd) { $ok = $true; break }
+        [UiEdgeNative]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+        [UiEdgeNative]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+        [void][UiEdgeNative]::SetForegroundWindow($hwnd)
+        Start-Sleep -Milliseconds 300
+    }
+    if (-not $ok) { throw "E9 FAIL: 无法把 qaq-bx-ui 置前台" }
+    Start-Sleep -Milliseconds 1500
+    $dpi = [Math]::Max(96, [int][UiEdgeNative]::GetDpiForWindow($hwnd))
+    $scale = $dpi / 96.0
+    $rect = New-Object UiEdgeNative+RECT
+    [void][UiEdgeNative]::GetWindowRect($hwnd, [ref]$rect)
+    $winX = $rect.Left; $winY = $rect.Top
+    $winW = $rect.Right - $rect.Left
+
+    # 标题栏 Tall 内容行：全局搜索框居中偏左（约 48% 宽、24 DIP 高）
+    Click-Fast -X ($winX + [int]($winW * 0.48)) -Y ($winY + [int](24 * $scale))
+    Start-Sleep -Milliseconds 300
+    # 剪贴板粘贴进框：绕开中文 IME——直键字母会进拼音组合态，
+    # 且组合态的 {ENTER} 会被 IME 吃掉（提交候选词而非搜索）。
+    Set-Clipboard -Value "rust"
+    [System.Windows.Forms.SendKeys]::SendWait("^v")
+    Start-Sleep -Milliseconds 400
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e15-search-draft.png"
+    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    Start-Sleep -Milliseconds 4000 # 真实 WBI 搜索 + 结果封面
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e16-search-enter-results.png"
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "搜索框 Enter 后进程退出 ($($proc.ExitCode))" }
 } finally {
     if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
 }

@@ -21,7 +21,7 @@ Grid rows: [TitleBar(Auto)] [NavigationView(Star)]
 
 | 层 | 控件 | 设计要点 |
 |---|---|---|
-| 标题栏 | `TitleBar` | 左：应用图标 + "QAQ-Bx"；中：搜索框（随窗口宽度在 `200..360` DIP 自适应，路由到搜索页）；右：通知按钮（登录态）。高度 Tall。 |
+| 标题栏 | `TitleBar` | 左：应用图标 + "QAQ-Bx"；中：**全局内敛搜索框**（`Border` 壳 + 无边框透明 `TextBox` + 内嵌放大镜 `Button`，`PreviewKeyDown` 隧道 Enter 即提交；随窗口宽度在 `200..360` DIP 自适应，桌面端全站唯一入口）；右：通知按钮（登录态）与 Medium 窄屏搜索触发按钮。高度 Tall。 |
 | 导航 | `NavigationView` | `PaneDisplayMode::LeftCompact`（窄图标栏，悬停展开，对照媒体播放器左侧栏）。 |
 | 全局播放条 | **已移除** | 不再保留全局底部 `MiniPlayer`；播放控制与生命周期完全收口至每个视频容器自身的独立控件（全屏播放页 `PlayerPage` 与首页右侧半窗 `HalfPanePreview`），离开播放页或关闭半窗即停止播放并释放引擎资源。 |
 
@@ -50,7 +50,7 @@ Grid rows: [TitleBar(Auto)] [NavigationView(Star)]
 - `WindowVisuals::new().backdrop(WindowBackdrop::Mica).client_size(1280.0, 800.0).constraints(WindowConstraints { min_width: Some(390.0), min_height: Some(640.0), .. })`。
 - **正交两维布局单源（`crates/qaq-bx-ui/src/layout.rs`）**：
   - `ShellChromeMode::{Mobile, Desktop}`（断点 `860.0` DIP —— 恰好对应桌面 `36px` 边距下 3 列下限 `56+72+236×3+24=860`）：
-    - `Mobile`（`< 860.0`，涵盖 `390..859` 全部 2 列窗口与 1280/1080p@125% 半屏贴靠）：隐藏左侧 `NavigationView` 改用底部 5-Tab 栏（推荐/热门/搜索/我的/更多 `2×3` 菜单含关注·直播·收藏·历史·稍后再看·设置）；禁用右侧 `HalfPanePreview`；`MiniPlayer` 切为 `56px` 单行浮条；推荐/热门/搜索严格 **2 列等宽铺满**（`160..414px` 弹性卡宽，播放/弹幕移至封面左下角半透明胶囊，关闭悬停缩放动画）；播放页与个人中心走单列自适应模式。
+    - `Mobile`（`< 860.0`，涵盖 `390..859` 全部 2 列窗口与 1280/1080p@125% 半屏贴靠）：隐藏左侧 `NavigationView` 改用底部 5-Tab 栏（推荐/热门/搜索/我的/更多 `2×3` 菜单含关注·直播·收藏·历史·稍后再看·设置）；禁用右侧 `HalfPanePreview`；视频仅在播放页保留单列播控，不再显示全局底部条；推荐/热门/搜索严格 **2 列等宽铺满**（`160..414px` 弹性卡宽，播放/弹幕移至封面左下角半透明胶囊，关闭悬停缩放动画）；播放页与个人中心走单列自适应模式。
     - `Desktop`（`>= 860.0`，3+ 列桌面全态）：保留左侧 `NavigationView`、双栏播放页、可选半窗抽屉与桌面 236×240 卡片网格。
   - `ContentLayoutTier::{Compact (<600), Medium (600..860), Expanded (>=860)}`：
     - `Compact`（`< 600`）：`TitleBar` 右侧仅留登录态通知铃铛（防挤爆系统三键），播放页视频高上限 `260` DIP；
@@ -149,7 +149,7 @@ Grid columns: [左滚动列(Star)] [右栏(Pixel 360)]
 
 - 队列：Flyout 或右侧滑出 SplitView（骨架期不做，仅留 Message 槽位）。
 - 设置页：`RadioButtons`（清晰度偏好：360P/480P/720P/1080P/1080P+/4K）、`ToggleSwitch`（自动播放、弹幕、硬解）、`NumberBox`（弹幕密度）——数据落 `data/settings.json`。
-- 搜索页（**已接入**）：标题栏/页内 `TextBox` + 搜索按钮 → `/x/web-interface/wbi/search/all/v2`（WBI 签名）→ 结果卡片网格（复用视频卡片，封面经 ImageCache 异步填充）；建议词 API（`search/default`）后续接入。
+- 搜索页（**已接入**）：桌面端（`>= 860` DIP）统一走标题栏全局内敛搜索框（页内不再放输入框，只留标题与提示行；`< 860` Mobile/Medium 保留页内/浮窗输入保底）→ `/x/web-interface/wbi/search/all/v2`（WBI 签名）→ 结果卡片网格（复用视频卡片，封面经 ImageCache 异步填充）；建议词 API（`search/default`）后续接入。
 
 ## 7. 组件骨架结构（本轮落地）
 
@@ -171,7 +171,7 @@ crates/qaq-bx-ui/src/
     home.rs       推荐页（卡片网格）
     popular.rs    热门页（复用网格，真实 popular API 分页）
     favorites.rs  收藏/历史/稍后（空态页 InfoBar 提示"待接入"）
-    search.rs     搜索页（AutoSuggestBox + 空态）
+    search.rs     搜索页（结果网格 + 空态；输入统一走标题栏全局搜索框）
     settings.rs   设置页（控件齐全，状态暂存内存）
     player.rs     播放页（占位视频面 + 传输控制 + 信息区）
 ```

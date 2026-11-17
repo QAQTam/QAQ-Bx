@@ -1,21 +1,22 @@
-//! 搜索页：标题栏/页内输入 + 综合搜索结果网格。
+//! 搜索页：综合搜索结果网格。
 //!
+//! 桌面全态（`>= 860` DIP）统一走标题栏全局内敛搜索框(输入+按钮一体,Enter 即提交),
+//! 页内不再放置重复输入框；窄屏（`< 860` DIP）标题栏隐藏内嵌搜索框时保留页内搜索栏。
 //! 状态由 `AppShell` 单源持有(`SearchUiState`);结果卡复用 `video_grid`,
 //! 封面经 `ImageCache` 异步填充(`CoverReady` 兜底回填)。空态/错误态就地展示。
 
 use std::rc::Rc;
 
-use windows_reactor::*;
-
 use crate::data::VideoItem;
 use crate::layout::ViewportLayout;
 use crate::theme;
 use crate::widgets::video_card;
+use windows_reactor::*;
 
 /// 搜索页展示状态(`AppShell` 单源持有)。
 #[derive(Clone, Default)]
 pub struct SearchUiState {
-    /// 输入框草稿(每次 TextChanged 更新)。
+    /// 全局搜索框草稿(每次 TextChanged 更新;本页只读展示)。
     pub draft: String,
     /// 已提交查询(当前结果对应的词;空串表示尚未搜索)。
     pub query: String,
@@ -36,53 +37,73 @@ pub fn search_page(
     let margin_x = layout.page_margin_x();
     let header_top = if layout.is_mobile() { 12.0 } else { 18.0 };
 
-    let submit_btn = {
-        let on_submit = on_submit.clone();
-        Button::new()
-            .style(ButtonStyle::Subtle)
-            .on_click(move || on_submit.call(()))
+    let header_sub: View = if layout.shows_inline_title_search() {
+        // 桌面全态统一走标题栏全局内敛搜索框，页内仅展示提示行。
+        theme::text("使用顶部搜索框搜索视频、UP 主，回车即可")
+            .font_size(12.0)
+            .opacity(0.55)
+            .into()
+    } else {
+        let on_enter = {
+            let on_submit = on_submit.clone();
+            RoutedCallback::new(move |ev: KeyEventInfo| {
+                if crate::shell::search_enter_submits(&ev) {
+                    on_submit.call(());
+                    true
+                } else {
+                    false
+                }
+            })
+        };
+        let submit_btn = {
+            let on_submit = on_submit.clone();
+            Button::new()
+                .style(ButtonStyle::Subtle)
+                .on_click(move || on_submit.call(()))
+                .content(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(6.0)
+                        .children((
+                            View::from(SymbolIcon::new().symbol(Symbol::Find)),
+                            View::from(TextBlock::new().text("搜索")),
+                        )),
+                )
+        };
+        Border::new()
+            .on_preview_key_down(on_enter)
             .content(
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(6.0)
+                Grid::new()
+                    .columns([GridLength::Star(1.0), GridLength::Auto])
+                    .column_spacing(8.0)
                     .children((
-                        View::from(SymbolIcon::new().symbol(Symbol::Find)),
-                        View::from(TextBlock::new().text("搜索")),
+                        View::from(
+                            TextBox::new()
+                                .placeholder_text("搜索视频、UP 主")
+                                .text(state.draft.clone())
+                                .on_text_changed({
+                                    let on_draft = on_draft.clone();
+                                    move |text: Rc<str>| on_draft.call(text)
+                                }),
+                        ),
+                        View::from(submit_btn.grid_column(1)),
                     )),
             )
+            .into()
     };
-
-    let mut search_bar = Grid::new()
-        .columns([GridLength::Star(1.0), GridLength::Auto])
-        .column_spacing(8.0)
-        .children((
-            View::from(
-                TextBox::new()
-                    .placeholder_text("搜索视频、UP 主")
-                    .text(state.draft.clone())
-                    .on_text_changed({
-                        let on_draft = on_draft.clone();
-                        move |text: Rc<str>| on_draft.call(text)
-                    }),
-            ),
-            View::from(submit_btn.grid_column(1)),
-        ));
-    if !layout.is_single_column() {
-        search_bar = search_bar
-            .max_width(520.0)
-            .horizontal_alignment(HorizontalAlignment::Left);
-    }
 
     let header = Border::new()
         .padding(Thickness::new(margin_x, header_top, margin_x, 12.0))
         .grid_row(0)
         .content(
-            StackPanel::new().spacing(10.0).children((
-                theme::text("搜索")
-                    .font_size(layout.page_title_size())
-                    .font_weight(FontWeight::BOLD),
-                search_bar,
-            )),
+            StackPanel::new()
+                .spacing(if layout.shows_inline_title_search() { 4.0 } else { 10.0 })
+                .children((
+                    theme::text("搜索")
+                        .font_size(layout.page_title_size())
+                        .font_weight(FontWeight::BOLD),
+                    header_sub,
+                )),
         );
 
     let body: View = if state.loading && state.videos.is_empty() {

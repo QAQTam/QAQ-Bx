@@ -520,13 +520,21 @@ pub struct AppShell {
     demo_timer: Option<ComponentTimer>,
 }
 
+/// 全局搜索框壳的 Enter 判定:PreviewKeyDown 隧道命中主键盘/小键盘 Enter
+/// (`original_key` 对 NumpadEnter 上报 0x0D)才提交;释放与其余键放行不拦截。
+/// 纯函数便于单测锁行为,视图侧 `on_preview_key_down` 只做「判定→投递→handled」。
+pub(crate) fn search_enter_submits(ev: &KeyEventInfo) -> bool {
+    !ev.status.is_released
+        && (ev.key == VirtualKey::ENTER || ev.original_key == VirtualKey::ENTER)
+}
+
 #[derive(Clone)]
 pub enum Message {
     Back,
     /// selftest 空转消息:驱动探针在队列尾部刷新状态(生产路径零开销)。
     #[cfg(feature = "selftest")]
     SelfTestSync,
-    /// 搜索框草稿变更(标题栏/搜索页输入)。
+    /// 全局搜索框草稿变更(标题栏内敛搜索框 TextChanged)。
     SearchDraftChanged(String),
     /// 提交当前草稿发起搜索(新提交递增 seq,旧在飞结果丢弃)。
     SearchSubmitted,
@@ -4548,6 +4556,41 @@ mod tests {
         assert!(!mount_pulse_active(Route::Home, false, false));
         // 其它空态页(收藏/历史等)同理不脉冲。
         assert!(!mount_pulse_active(Route::Favorites, false, false));
+    }
+
+    /// 全局搜索框 Enter 提交门控:按下(主/小键盘)提交并拦截;释放与其他键放行。
+    #[test]
+    fn search_enter_gate_only_handles_press() {
+        let press = |key: VirtualKey, original: VirtualKey, released: bool| KeyEventInfo {
+            key,
+            original_key: original,
+            status: PhysicalKeyStatus {
+                repeat_count: 1,
+                scan_code: 0x1C,
+                is_extended: false,
+                is_menu_down: false,
+                was_down: false,
+                is_released: released,
+            },
+            modifiers: InputModifiers::NONE,
+        };
+        assert!(
+            search_enter_submits(&press(VirtualKey::ENTER, VirtualKey::ENTER, false)),
+            "主键盘 Enter 按下应提交"
+        );
+        // 小键盘 Enter:VKEY 为 NumpadEnter(0x68),original_key 上报 0x0D。
+        assert!(
+            search_enter_submits(&press(VirtualKey(0x68), VirtualKey::ENTER, false)),
+            "小键盘 Enter 也应提交"
+        );
+        assert!(
+            !search_enter_submits(&press(VirtualKey::ENTER, VirtualKey::ENTER, true)),
+            "释放事件不重复提交"
+        );
+        assert!(
+            !search_enter_submits(&press(VirtualKey(0x41), VirtualKey(0x41), false)),
+            "普通字符键放行不拦截"
+        );
     }
 
     #[test]

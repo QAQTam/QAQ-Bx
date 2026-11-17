@@ -1,11 +1,12 @@
 # Update 0.0.2 — 消灭占位数据:热门页与相关推荐接入线上真实数据
 
-> 记录时间:2026-11-17。Cargo workspace 版本 `0.0.1`,`just dev` 打包时末尾修订号自动递增。
+> 记录时间:2026-11-17。Cargo workspace 版本已升 `0.0.2`,`just dev` 打自更新包时末尾修订号自 `.1` 起递增。
 > 目标:把仓库内剩余的 mock/占位样本数据全部替换为真实 Bilibili 线上接口数据。
 
 ## 新增
 
-- **相关视频真实端点定案**(`qaq-bx-core::feed::FeedClient::related`):
+- **全局内敛搜索框（标题栏唯一入口）**：原「TextBox + 外置放大镜按钮」组合改为一体化 `Border` 壳（圆角/描边/填充）+ 无边框透明 `TextBox` + 内嵌放大镜 `Button`；`PreviewKeyDown` 隧道事件挂在外壳上，Enter 按下即提交（主/小键盘 Enter 均认，`search_enter_submits` 纯函数判定 + 单测锁定；释放与其他键放行不拦截，避免与评论输入框等抢键）。桌面端（`>= 860` DIP）搜索页删除页内「TextBox + 搜索按钮」重复入口，只留标题与提示行——发起与改词统一走全局框（注：v0.1.0 下 `< 860` Mobile/Medium 因标题栏隐藏内嵌搜索框，在搜索页仍保留页内/浮窗输入保底）。自动化走查新增 E8 场景：前台句柄硬校验（ALT 解锁前台锁重试）→ 点击标题栏输入区 → 剪贴板粘贴关键词（绕开中文 IME 组合态吞字母/吞 Enter）→ `SendKeys {ENTER}` → 断言进程存活。
+- **相关视频真实端点定案**（`qaq-bx-core::feed::FeedClient::related`）：
   `/x/web-interface/archive/related?bvid=<BV>`(无签名、访客可用,实测 code=0);
   `data` 为 ArchiveCard **裸数组**(无 list/items 包裹层),形状与 popular/precious/ranking 同族。
   此前猜测的 `/x/web-interface/wbi/related/all` 实测返回 HTML,已在契约与文档中纠正。
@@ -37,6 +38,21 @@
 
 ## 变更
 
+- **修复:播放页右栏相关推荐卡片长短不一(高)**:卡片高此前由内容驱动——封面列定高
+  74px,文本列(标题 1~2 行 × UP 主 × 播放量)随行数浮动,网格行取两列最大值,
+  标题占满两行的卡比一行的卡高约半行。改为文本列三槽定高(标题恒定预留两行
+  40px、元信息各 18px,常量与 `max_lines` 封顶同源),所有卡严格等高且
+  UP 主/播放量基线对齐;封面垂直居中。回归单测
+  `pages::player::tests::related_card_slots_are_content_independent`
+  锁定「卡高与数据无关 + 定高槽容得下最坏字体行高(Noto Sans SC ≈1.48em)」。
+- **修复:播放页右栏相关推荐卡片宽窄不一(宽,同项续修)**:卡片宽同样由内容驱动,
+  实测同列卡宽 290~311px 参差且不满栏。右栏 ScrollViewer 先改
+  `HorizontalScrollBarVisibility::Disabled`(消除无限宽量测与横向滚动),但
+  arrange 仍按各卡自然宽;再为卡片 Button 与状态行定宽
+  `RELATED_CARD_WIDTH = 360 − 4 − 16`(与栅格列/缘距严格同源),无横向滚动时
+  presenter 按视口宽统一定宽。实机截图像素复测:所有卡外沿严格 316px、
+  右缘一致 x=1259,标题同列宽换行、时长徽标对齐。单测追加宽度算术不变量
+  (卡宽==栏视口算式;边框内衬 18 + 封列 132 + 间距 10 + 文本保底 120 ≤ 定宽)。
 - **修复:冷启动/关播放条后首个视频黑屏**(半屏抽屉挂载脉冲门控):swapchain
   挂载重试此前只认 `route == Player`;HalfPane 模式点首页卡 `route` 合法停在
   Home,面板 metrics 抢在引擎产出 swapchain 前触发唯一一次挂载即错过,再无重试;
