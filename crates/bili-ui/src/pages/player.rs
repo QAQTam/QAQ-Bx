@@ -17,6 +17,19 @@ const PLAYER_SLOT_HEIGHT: f64 = 420.0;
 const RIGHT_RAIL_WIDTH: f64 = 360.0;
 const PIP_SCROLL_THRESHOLD: f64 = 300.0;
 
+/// 相关推荐卡封面高（132px 宽对应的 16:9 区域）。
+const RELATED_COVER_HEIGHT: f64 = 74.0;
+/// 相关推荐卡定宽：右栏 360px 栅格列 − ScrollViewer 左右缘距(4+16)。
+/// 与首页卡同款「显式定宽」配方——ScrollViewer 横向量测不可依赖,
+/// 卡片必须自带宽度才能严格等宽满栏。
+const RELATED_CARD_WIDTH: f64 = RIGHT_RAIL_WIDTH - 4.0 - 16.0;
+/// 相关推荐卡标题定高槽（恒定预留两行，标题换行与否不改变卡片高度）。
+const RELATED_TITLE_HEIGHT: f64 = 40.0;
+/// 相关推荐卡元信息定高槽（UP 主 / 播放量各一行）。
+const RELATED_META_HEIGHT: f64 = 18.0;
+/// 相关推荐卡文本列行距（与 StackPanel::spacing 同源，供高度推导）。
+const RELATED_TEXT_SPACING: f64 = 4.0;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CommentSort {
     #[default]
@@ -415,7 +428,11 @@ impl Component for PlayerPage {
                     related_panel(input),
                     comments_section,
                 ));
-            return ScrollViewer::new().content(compact_body).into();
+            // 横向 Disabled:内容按视口宽量测,相关推荐卡满栏等高,长短宽窄一律。
+            return ScrollViewer::new()
+                .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+                .content(compact_body)
+                .into();
         }
 
         let left_scroll_content = StackPanel::new()
@@ -442,6 +459,9 @@ impl Component for PlayerPage {
         let right_rail = ScrollViewer::new()
             .grid_column(1)
             .margin(Thickness::new(4.0, 16.0, 16.0, 16.0))
+            // 横向 Disabled:默认 Auto 会以无限宽量测内容,推荐卡 Star 列退化为
+            // 自然宽,卡片随标题长短参差且不满栏;禁用后按视口宽满栏等宽。
+            .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
             .content(related_panel(input));
 
         let two_col_body = Grid::new()
@@ -1240,6 +1260,7 @@ fn related_status_view(text: &str, on_retry: Option<&Callback<()>>) -> View {
         );
     }
     Border::new()
+        .width(RELATED_CARD_WIDTH)
         .padding(Thickness::xy(10.0, 10.0))
         .corner_radius(8.0)
         .background(ThemeBrush::CardBackground)
@@ -1297,6 +1318,7 @@ fn related_card(item: &VideoItem, on_open: &Callback<String>) -> View {
     };
     Button::new()
         .style(ButtonStyle::Subtle)
+        .width(RELATED_CARD_WIDTH)
         .horizontal_content_alignment(HorizontalAlignment::Stretch)
         .on_click(move || on_click.call(bvid.clone()))
         .content(
@@ -1310,7 +1332,10 @@ fn related_card(item: &VideoItem, on_open: &Callback<String>) -> View {
                     Grid::new()
                         .columns([GridLength::Pixel(132.0), GridLength::Star(1.0)])
                         .children((
-                            Grid::new().height(74.0).children((
+                            Grid::new()
+                                .height(RELATED_COVER_HEIGHT)
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .children((
                                 Border::new()
                                     .corner_radius(6.0)
                                     .background(ThemeBrush::SolidBackground)
@@ -1334,22 +1359,25 @@ fn related_card(item: &VideoItem, on_open: &Callback<String>) -> View {
                             StackPanel::new()
                                 .grid_column(1)
                                 .margin(Thickness::new(10.0, 0.0, 0.0, 0.0))
-                                .spacing(4.0)
+                                .spacing(RELATED_TEXT_SPACING)
                                 .children((
                                     TextBlock::new()
                                         .text(item.title.clone())
                                         .font_size(13.0)
                                         .font_weight(FontWeight::SEMI_BOLD)
                                         .text_wrapping(TextWrapping::Wrap)
-                                        .max_lines(2),
+                                        .max_lines(2)
+                                        .height(RELATED_TITLE_HEIGHT),
                                     TextBlock::new()
                                         .text(item.author.clone())
                                         .font_size(11.0)
-                                        .opacity(0.6),
+                                        .opacity(0.6)
+                                        .height(RELATED_META_HEIGHT),
                                     TextBlock::new()
                                         .text(format!("▶ {}", theme::fmt_count(item.play_count)))
                                         .font_size(11.0)
-                                        .opacity(0.55),
+                                        .opacity(0.55)
+                                        .height(RELATED_META_HEIGHT),
                                 )),
                         )),
                 ),
@@ -1639,7 +1667,10 @@ impl Component for HalfPanePreview {
 
 #[cfg(test)]
 mod tests {
-    use super::format_desc_body;
+    use super::{
+        format_desc_body, RIGHT_RAIL_WIDTH, RELATED_CARD_WIDTH, RELATED_COVER_HEIGHT,
+        RELATED_META_HEIGHT, RELATED_TEXT_SPACING, RELATED_TITLE_HEIGHT,
+    };
 
     #[test]
     fn desc_body_keeps_text_and_bvid_without_title() {
@@ -1655,5 +1686,35 @@ mod tests {
             let s = format_desc_body("BV1", case);
             assert!(s.starts_with("暂无简介"), "缺省/占位简介应落占位文案: {s}");
         }
+    }
+
+    /// 相关推荐卡等高回归：文本列三槽全为常量定高，卡片高度与标题
+    /// 1 行/2 行无关；且定高槽必须容得下最坏字体行高（Noto Sans SC ≈1.48em），
+    /// 防止再退回「内容驱动行高 → 卡片长短不一」。
+    #[test]
+    fn related_card_slots_are_content_independent() {
+        const LINE_EM: f64 = 1.48;
+        // 标题两行必须放入定高槽（max_lines(2) 封顶行数，槽高封顶卡高）。
+        assert!(2.0 * 13.0 * LINE_EM <= RELATED_TITLE_HEIGHT, "标题槽应容两行 13px 文本");
+        // UP 主 / 播放量各一行必须放入元信息槽。
+        assert!(11.0 * LINE_EM <= RELATED_META_HEIGHT, "元信息槽应容一行 11px 文本");
+        // 卡高 = max(封面, 文本列定高)，两侧皆常量 → 与数据内容无关；
+        // 且必须同时容下封面与文本列，定高不会产生裁切。
+        let text_col = RELATED_TITLE_HEIGHT + RELATED_META_HEIGHT * 2.0 + RELATED_TEXT_SPACING * 2.0;
+        let card_body = RELATED_COVER_HEIGHT.max(text_col);
+        assert!(card_body >= RELATED_COVER_HEIGHT, "封面完整可见");
+        assert!(card_body >= text_col, "文本列完整可见");
+        // 宽度同理：卡宽由常量 RELATED_CARD_WIDTH 定死（右栏栅格列 − ScrollViewer
+        // 缘距），与标题长度无关；封列 132 + 间距 10 + 边框/内衬 18 之外须容文本列。
+        assert!(
+            RELATED_CARD_WIDTH == RIGHT_RAIL_WIDTH - 4.0 - 16.0,
+            "卡宽应恰好满栏"
+        );
+        let chrome = 1.0 * 2.0 + 8.0 * 2.0; // 边框 + Border 内衬
+        let min_text_width = 120.0; // 短标题/UP 主仍要可读的保底宽
+        assert!(
+            chrome + 132.0 + 10.0 + min_text_width <= RELATED_CARD_WIDTH,
+            "定宽 {RELATED_CARD_WIDTH} 应容下封列+文本列"
+        );
     }
 }
