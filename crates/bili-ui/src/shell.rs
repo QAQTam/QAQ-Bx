@@ -501,13 +501,21 @@ pub struct AppShell {
     toast_rx: Option<Arc<Mutex<std::sync::mpsc::Receiver<()>>>>,
 }
 
+/// 全局搜索框壳的 Enter 判定:PreviewKeyDown 隧道命中主键盘/小键盘 Enter
+/// (`original_key` 对 NumpadEnter 上报 0x0D)才提交;释放与其余键放行不拦截。
+/// 纯函数便于单测锁行为,视图侧 `on_preview_key_down` 只做「判定→投递→handled」。
+pub(crate) fn search_enter_submits(ev: &KeyEventInfo) -> bool {
+    !ev.status.is_released
+        && (ev.key == VirtualKey::ENTER || ev.original_key == VirtualKey::ENTER)
+}
+
 #[derive(Clone)]
 pub enum Message {
     Back,
     /// selftest 空转消息:驱动探针在队列尾部刷新状态(生产路径零开销)。
     #[cfg(feature = "selftest")]
     SelfTestSync,
-    /// 搜索框草稿变更(标题栏/搜索页输入)。
+    /// 全局搜索框草稿变更(标题栏内敛搜索框 TextChanged)。
     SearchDraftChanged(String),
     /// 提交当前草稿发起搜索(新提交递增 seq,旧在飞结果丢弃)。
     SearchSubmitted,
@@ -3987,10 +3995,7 @@ impl Component for AppShell {
                 &on_change,
             )
         } else if self.route == Route::Search {
-            let on_draft =
-                context.callback(|text: Rc<str>| Message::SearchDraftChanged(text.to_string()));
-            let on_submit = context.message(Message::SearchSubmitted);
-            pages::search::search_page(&self.search_state, &on_draft, &on_submit, &on_open, compact)
+            pages::search::search_page(&self.search_state, &on_open, compact)
         } else if self.route == Route::Home {
             self.home_view(context)
         } else if self.route == Route::Popular {
@@ -4078,24 +4083,50 @@ impl Component for AppShell {
             .on_back_requested(context.message(Message::Back))
             .on_pane_toggle_requested(context.message(Message::TogglePane))
             .grid_row(0)
-            .content(
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
-                    .children((
-                        TextBox::new()
-                            .placeholder_text("搜索视频、UP 主")
-                            .width(360.0)
-                            .text(self.search_state.draft.clone())
-                            .on_text_changed(context.callback(|text: Rc<str>| {
-                                Message::SearchDraftChanged(text.to_string())
-                            })),
-                        Button::new()
-                            .style(ButtonStyle::Subtle)
-                            .on_click(context.message(Message::SearchSubmitted))
-                            .content(SymbolIcon::new().symbol(Symbol::Find)),
-                    )),
-            );
+            .content({
+                // 全局内敛搜索框：输入 + 内嵌放大镜按钮一体，Enter(隧道)即提交。
+                // 全站唯一搜索入口——搜索页不再放置页内输入框。
+                let on_submit = context.message(Message::SearchSubmitted);
+                let on_enter = RoutedCallback::new(move |ev: KeyEventInfo| {
+                    if search_enter_submits(&ev) {
+                        on_submit.call(());
+                        true
+                    } else {
+                        false
+                    }
+                });
+                Border::new()
+                    .width(if compact { 260.0 } else { 360.0 })
+                    .height(32.0)
+                    .corner_radius(6.0)
+                    .background(ThemeBrush::CardBackground)
+                    .border_brush(ThemeBrush::CardStroke)
+                    .border_thickness(1.0)
+                    .padding(Thickness::xy(2.0, 1.0))
+                    .on_preview_key_down(on_enter)
+                    .content(
+                        Grid::new()
+                            .columns([GridLength::Star(1.0), GridLength::Auto])
+                            .children((
+                                TextBox::new()
+                                    .grid_column(0)
+                                    .placeholder_text("搜索视频、UP 主")
+                                    .text(self.search_state.draft.clone())
+                                    .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
+                                    .border_thickness(0.0)
+                                    .on_text_changed(context.callback(|text: Rc<str>| {
+                                        Message::SearchDraftChanged(text.to_string())
+                                    })),
+                                Button::new()
+                                    .grid_column(1)
+                                    .style(ButtonStyle::Subtle)
+                                    .height(26.0)
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .on_click(context.message(Message::SearchSubmitted))
+                                    .content(SymbolIcon::new().symbol(Symbol::Find)),
+                            )),
+                    )
+            });
 
         if matches!(self.auth, AuthState::LoggedIn(_)) {
             let total_unread = self.unread_summary.total();
@@ -4513,6 +4544,41 @@ mod tests {
         assert!(!mount_pulse_active(Route::Home, false, false));
         // 其它空态页(收藏/历史等)同理不脉冲。
         assert!(!mount_pulse_active(Route::Favorites, false, false));
+    }
+
+    /// 全局搜索框 Enter 提交门控:按下(主/小键盘)提交并拦截;释放与其他键放行。
+    #[test]
+    fn search_enter_gate_only_handles_press() {
+        let press = |key: VirtualKey, original: VirtualKey, released: bool| KeyEventInfo {
+            key,
+            original_key: original,
+            status: PhysicalKeyStatus {
+                repeat_count: 1,
+                scan_code: 0x1C,
+                is_extended: false,
+                is_menu_down: false,
+                was_down: false,
+                is_released: released,
+            },
+            modifiers: InputModifiers::NONE,
+        };
+        assert!(
+            search_enter_submits(&press(VirtualKey::ENTER, VirtualKey::ENTER, false)),
+            "主键盘 Enter 按下应提交"
+        );
+        // 小键盘 Enter:VKEY 为 NumpadEnter(0x68),original_key 上报 0x0D。
+        assert!(
+            search_enter_submits(&press(VirtualKey(0x68), VirtualKey::ENTER, false)),
+            "小键盘 Enter 也应提交"
+        );
+        assert!(
+            !search_enter_submits(&press(VirtualKey::ENTER, VirtualKey::ENTER, true)),
+            "释放事件不重复提交"
+        );
+        assert!(
+            !search_enter_submits(&press(VirtualKey(0x41), VirtualKey(0x41), false)),
+            "普通字符键放行不拦截"
+        );
     }
 
     #[test]

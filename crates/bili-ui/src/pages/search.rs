@@ -1,20 +1,19 @@
-//! 搜索页：标题栏/页内输入 + 综合搜索结果网格。
+//! 搜索页：综合搜索结果网格。
 //!
-//! 状态由 `AppShell` 单源持有(`SearchUiState`);结果卡复用 `video_grid`,
-//! 封面经 `ImageCache` 异步填充(`CoverReady` 兜底回填)。空态/错误态就地展示。
-
-use std::rc::Rc;
-
-use windows_reactor::*;
+//! 搜索入口全站唯一——标题栏全局内敛搜索框(输入+按钮一体,Enter 即提交),
+//! 本页不再放置页内输入框。状态由 `AppShell` 单源持有(`SearchUiState`);
+//! 结果卡复用 `video_grid`,封面经 `ImageCache` 异步填充(`CoverReady` 兜底回填)。
+//! 空态/错误态就地展示。
 
 use crate::data::VideoItem;
 use crate::theme;
 use crate::widgets::video_card;
+use windows_reactor::*;
 
 /// 搜索页展示状态(`AppShell` 单源持有)。
 #[derive(Clone, Default)]
 pub struct SearchUiState {
-    /// 输入框草稿(每次 TextChanged 更新)。
+    /// 全局搜索框草稿(每次 TextChanged 更新;本页只读展示)。
     pub draft: String,
     /// 已提交查询(当前结果对应的词;空串表示尚未搜索)。
     pub query: String,
@@ -25,55 +24,19 @@ pub struct SearchUiState {
     pub total: Option<u64>,
 }
 
-pub fn search_page(
-    state: &SearchUiState,
-    on_draft: &Callback<Rc<str>>,
-    on_submit: &Callback<()>,
-    on_open: &Callback<String>,
-    compact: bool,
-) -> View {
+pub fn search_page(state: &SearchUiState, on_open: &Callback<String>, compact: bool) -> View {
     let margin_x = if compact { 12.0 } else { 36.0 };
 
-    let submit_btn = {
-        let on_submit = on_submit.clone();
-        Button::new()
-            .style(ButtonStyle::Subtle)
-            .on_click(move || on_submit.call(()))
-            .content(
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(6.0)
-                    .children((
-                        View::from(SymbolIcon::new().symbol(Symbol::Find)),
-                        View::from(TextBlock::new().text("搜索")),
-                    )),
-            )
-    };
-
+    // 页头只留标题与当前查询上下文;发起/修改关键词一律走标题栏全局搜索框。
     let header = Border::new()
         .padding(Thickness::new(margin_x, 18.0, margin_x, 12.0))
         .grid_row(0)
         .content(
-            StackPanel::new().spacing(10.0).children((
+            StackPanel::new().spacing(4.0).children((
                 theme::text("搜索")
                     .font_size(28.0)
                     .font_weight(FontWeight::BOLD),
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
-                    .children((
-                        View::from(
-                            TextBox::new()
-                                .placeholder_text("搜索视频、UP 主")
-                                .width(420.0)
-                                .text(state.draft.clone())
-                                .on_text_changed({
-                                    let on_draft = on_draft.clone();
-                                    move |text: Rc<str>| on_draft.call(text)
-                                }),
-                        ),
-                        View::from(submit_btn),
-                    )),
+                theme::text("使用顶部搜索框搜索视频、UP 主,回车即可").font_size(12.0).opacity(0.55),
             )),
         );
 
