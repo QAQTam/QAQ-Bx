@@ -300,7 +300,7 @@ pub fn compact_bottom_bar(
                                     .glyph(symbol_glyph(symbol))
                                     .font_size(14.0)
                                     .foreground(icon_fg)
-                                    .opacity(if selected { 1.0 } else { 0.72 })
+                                    .opacity(if selected { 1.0 } else { 0.85 })
                                     .horizontal_alignment(HorizontalAlignment::Center)
                                     .vertical_alignment(VerticalAlignment::Center),
                             ),
@@ -317,7 +317,7 @@ pub fn compact_bottom_bar(
                             } else {
                                 ThemeBrush::PrimaryText
                             })
-                            .opacity(if selected { 1.0 } else { 0.72 })
+                            .opacity(if selected { 1.0 } else { 0.85 })
                             .horizontal_alignment(HorizontalAlignment::Center),
                     )),
                 )
@@ -341,6 +341,16 @@ pub fn compact_bottom_bar(
     children.push(tab_btn(4, Symbol::More, "更多", more_active, on_toggle_more).into());
 
     use crate::widgets::glass::{capsule, GlassBar, GlassBarInput};
+    let tab_row: View = Grid::new()
+        .columns([
+            GridLength::Star(1.0),
+            GridLength::Star(1.0),
+            GridLength::Star(1.0),
+            GridLength::Star(1.0),
+            GridLength::Star(1.0),
+        ])
+        .children(children)
+        .into();
     Grid::new().children((Border::new()
         .height(capsule::HEIGHT)
         .margin(Thickness::new(
@@ -353,20 +363,17 @@ pub fn compact_bottom_bar(
         .border_brush(ThemeBrush::CardStroke)
         .border_thickness(Thickness::new(1.0, 1.0, 1.0, 1.0))
         .content(
-            // 玻璃宿主组件:composition 圆角玻璃(backdrop+tint)垫在本网格
-            // 视觉栈底,Tab 行浮在其上(见 widgets/glass.rs)。
-            View::component::<GlassBar>(GlassBarInput {
-                content: Grid::new()
-                    .columns([
-                        GridLength::Star(1.0),
-                        GridLength::Star(1.0),
-                        GridLength::Star(1.0),
-                        GridLength::Star(1.0),
-                        GridLength::Star(1.0),
-                    ])
-                    .children(children)
-                    .into(),
-            }),
+            // 玻璃宿主(空内容,只承载 composition 玻璃)与 Tab 行为兄弟:
+            // 实测 SetElementChildVisual 的 child visual 盖在宿主 XAML 内容
+            // 之上,玻璃与 Tab 行同网格混排会把 Tab 行毛玻璃化(只透出
+            // 模糊鬼影);XAML 后绘制的兄弟压在玻璃 child visual 之上,
+            // 所以 Tab 行必须排在玻璃宿主之后(见 widgets/glass.rs)。
+            Grid::new().children((
+                View::component::<GlassBar>(GlassBarInput {
+                    content: Grid::new().into(),
+                }),
+                tab_row,
+            )),
         ),))
     .into()
 }

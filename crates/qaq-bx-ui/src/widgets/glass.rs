@@ -1,10 +1,15 @@
 //! 底栏「悬浮液态玻璃」(iOS 26 风格)——路线 0 阶段 1:纯 stock composition。
 //!
-//! 渲染栈:`compact_bottom_bar` 的悬浮胶囊 Border → 内容网格(本组件根,
-//! `ElementRef<Grid>`)→ fork imperative `observe_composition_host` 拿
-//! Compositor 与尺寸 → 圆角 ShapeVisual(半透明白 tint 霜面)→
-//! `request_set_child_visual` 垫到 Tab 行之下。尺寸变化由 Metrics 事件
-//! 驱动 geometry/visual 同步更新。
+//! 渲染栈:`compact_bottom_bar` 的悬浮胶囊 Border → 玻璃宿主网格(本组件
+//! 根,`ElementRef<Grid>`,内容为空)→ fork imperative
+//! `observe_composition_host` 拿 Compositor 与尺寸 → 效果刷 Sprite(模糊
+//! 背板)+ tint 色 Sprite 双层 → `request_set_child_visual` 挂到宿主。
+//! 尺寸变化由 Metrics 事件驱动 geometry/visual 同步更新。
+//!
+//! **z 序实测发现(2026-11-19)**:`SetElementChildVisual` 的 child visual
+//! 盖在宿主元素 XAML 内容**之上**(玻璃曾与 Tab 行同网格混排,Tab 行整体
+//! 被毛玻璃化只剩模糊鬼影)。所以 Tab 行必须是玻璃宿主的**兄弟节点且后
+//! 绘制**(XAML 文档序在后 = z 序在上),见 `chrome.rs::compact_bottom_bar`。
 //!
 //! **实测发现(2026-11-19)**:`CreateBackdropBrush()` 直接做形状填充被
 //! 运行时拒绝(E_INVALIDARG)——backdrop brush 仅可作为
@@ -28,8 +33,8 @@ use std::{cell::RefCell, rc::Rc};
 use windows_core::{IUnknown, Interface as _};
 use windows_numerics::Vector2;
 use windows_reactor::{
-    Component, ComponentContext, CompositionHostEvent, ElementRef, ElementObservation, Grid, View,
-    ViewContext,
+    ColorScheme, Component, ComponentContext, CompositionHostEvent, ElementRef, ElementObservation,
+    Grid, View, ViewContext,
 };
 
 include!(concat!(env!("OUT_DIR"), "/winrt_bindings.rs"));
@@ -46,9 +51,10 @@ pub mod capsule {
     pub const FLOAT_MARGIN: f64 = 10.0;
 }
 
-/// 中性 tint 霜面(白,α≈0.30)。不随主题自适应(诚实清单项:
-/// ActualTheme 观察未接,若深色下发灰再引入主题观察重建 tint)。
+/// 浅色主题 tint 霜面(白,α≈0.30,backdrop 采样保持可见)。
 const TINT_ALPHA: u8 = 0x4D;
+/// 深色主题 tint 霜面(近黑,α≈0.40):暗玻璃衬托白图标(iOS 暗玻璃参考)。
+const DARK_TINT_ALPHA: u8 = 0x66;
 
 /// 玻璃材质参数(iOS 26 霜面参考的 stock 近似)。
 mod material {
@@ -56,6 +62,25 @@ mod material {
     pub const BLUR_STD_DEV: f32 = 9.0;
     /// 饱和度增益(D2D1_SATURATION_PROP_SATURATION;iOS 玻璃参考 ≈1.1-1.2)。
     pub const SATURATION: f32 = 1.15;
+}
+
+/// 主题 → 霜面色:浅色白霜 / 深色暗霜(主题自适应 tint,经
+/// `on_color_scheme` 观察驱动 `CompositionColorBrush.SetColor` 原地更新)。
+fn tint_color(scheme: ColorScheme) -> Color {
+    match scheme {
+        ColorScheme::Dark => Color {
+            a: DARK_TINT_ALPHA,
+            r: 0x0A,
+            g: 0x0A,
+            b: 0x0A,
+        },
+        _ => Color {
+            a: TINT_ALPHA,
+            r: 0xFF,
+            g: 0xFF,
+            b: 0xFF,
+        },
+    }
 }
 
 /// Metrics 尺寸 → 玻璃几何尺寸(非法值忽略;正数钳制)。
@@ -66,11 +91,18 @@ fn glass_metrics(width: f64, height: f64) -> Option<(f32, f32)> {
     Some((width as f32, height as f32))
 }
 
-/// 组件入参:Tab 行内容(chrome.rs 每次渲染重建;structural PartialEq
-/// 一致则组件不重挂,玻璃宿主元素保持绑定)。
+/// 组件入参:宿主网格内容(chrome.rs 传空 Grid——Tab 行是玻璃宿主的
+/// 兄弟节点后绘制,不能放进本网格,否则被玻璃 child visual 盖住;
+/// structural PartialEq 一致则组件不重挂,玻璃宿主元素保持绑定)。
 #[derive(Clone, PartialEq)]
 pub struct GlassBarInput {
     pub content: View,
+}
+
+/// 组件消息:窗口配色(主题)变化 → tint 霜面自适应。
+#[derive(Clone, Copy)]
+pub enum GlassMessage {
+    Scheme(ColorScheme),
 }
 
 /// 底栏玻璃宿主组件:根网格绑 `ElementRef<Grid>`,观察 composition host
@@ -85,17 +117,20 @@ pub struct GlassBar {
 struct GlassState {
     compositor: Option<Compositor>,
     runtime: Option<GlassRuntime>,
+    scheme: Option<ColorScheme>,
 }
 
 struct GlassRuntime {
     geometry: CompositionRoundedRectangleGeometry,
     container: ContainerVisual,
     children: Vec<Visual>,
+    /// tint 霜面笔刷句柄(主题变化时 SetColor 原地更新,不重建视觉)。
+    tint: CompositionColorBrush,
 }
 
 impl Component for GlassBar {
     type Input = GlassBarInput;
-    type Message = ();
+    type Message = GlassMessage;
 
     fn create(_input: &Self::Input, _context: &ComponentContext<Self>) -> Self {
         Self {
@@ -104,7 +139,23 @@ impl Component for GlassBar {
         }
     }
 
-    fn update(&mut self, _message: Self::Message, _context: &ComponentContext<Self>) {}
+    fn update(&mut self, message: Self::Message, _context: &ComponentContext<Self>) {
+        match message {
+            GlassMessage::Scheme(scheme) => {
+                self.state.borrow_mut().scheme = Some(scheme);
+                let tint = self
+                    .state
+                    .borrow()
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.tint.clone());
+                if let Some(tint) = tint {
+                    let _ = tint.SetColor(tint_color(scheme));
+                    eprintln!("[glass] tint adapted to {scheme:?}");
+                }
+            }
+        }
+    }
 
     fn view(&self, input: &Self::Input, context: &mut ViewContext<Self>) -> View {
         let element = self.element.clone();
@@ -113,6 +164,9 @@ impl Component for GlassBar {
             eprintln!("[glass] observe registered");
             GlassObserver { element, state }.observe()
         });
+        // 主题观察:订阅即回报当前方案,之后仅变化派发(reactor
+        // on_color_scheme 契约,与 shell 的 on_window_size 同一范式)。
+        context.on_color_scheme(context.callback(GlassMessage::Scheme));
 
         Grid::new()
             .element_ref(&self.element)
@@ -245,17 +299,13 @@ impl GlassObserver {
                 eprintln!("[glass] effect graph failed at {step}; tint-only fallback");
             }
         }
-        // 层 2:tint 霜面色层。
+        // 层 2:tint 霜面色层(随主题:浅白 / 深暗)。
         let Ok(tint) = compositor.CreateColorBrush() else {
             eprintln!("[glass] build failed: CreateColorBrush");
             return;
         };
-        let _ = tint.SetColor(Color {
-            a: TINT_ALPHA,
-            r: 0xFF,
-            g: 0xFF,
-            b: 0xFF,
-        });
+        let scheme = self.state.borrow().scheme;
+        let _ = tint.SetColor(tint_color(scheme.unwrap_or(ColorScheme::Light)));
         if let Ok(tint_brush) = tint.cast::<CompositionBrush>()
             && let Some(visual) = self.filled_sprite(compositor, &tint_brush, w, h, &clip)
         {
@@ -288,6 +338,7 @@ impl GlassObserver {
                 geometry,
                 container,
                 children,
+                tint,
             });
         } else {
             eprintln!("[glass] set child visual request not accepted (宿主未实例化)");
@@ -420,9 +471,18 @@ mod tests {
         assert!(capsule::FLOAT_MARGIN > 0.0);
     }
 
-    /// tint 霜面必须半透明白(backdrop 采样可见)。
+    /// tint 霜面必须半透明(backdrop 采样可见)且随主题自适应。
     #[test]
-    fn tint_alpha_keeps_backdrop_visible() {
+    fn tint_color_adapts_to_scheme() {
         assert!(TINT_ALPHA > 0 && TINT_ALPHA < 0xFF);
+        assert!(DARK_TINT_ALPHA > TINT_ALPHA, "深色霜面更实以保证对比");
+        let light = tint_color(ColorScheme::Light);
+        assert_eq!(
+            (light.a, light.r, light.g, light.b),
+            (TINT_ALPHA, 0xFF, 0xFF, 0xFF)
+        );
+        let dark = tint_color(ColorScheme::Dark);
+        assert_eq!(dark.a, DARK_TINT_ALPHA);
+        assert!(dark.r < 0x40, "深色霜面必须近黑以衬托白图标");
     }
 }
