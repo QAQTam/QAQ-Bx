@@ -19,6 +19,10 @@ use crate::wbi::encode_component;
 
 const REPLY_MAIN_URL: &str = "https://api.bilibili.com/x/v2/reply/main";
 const REPLY_SUB_URL: &str = "https://api.bilibili.com/x/v2/reply/reply";
+/// 主楼发评写接口（U1 接线；`csrf` 必须等于 Cookie `bili_jct`）。
+/// 契约锚:inventory §4 只收录了读接口,add 端点参数面为社区通行契约,
+/// 真机验证挂起(见 docs/dev-notes/long-run.md U1 行)。
+const REPLY_ADD_URL: &str = "https://api.bilibili.com/x/v2/reply/add";
 
 /// 评论排序方式（对齐 `/x/v2/reply/main` `mode` 参数）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -263,7 +267,11 @@ impl ReplyClient {
         creds: Arc<dyn CredentialProvider>,
         ticket: Option<Arc<TicketManager>>,
     ) -> Self {
-        Self { http, creds, ticket }
+        Self {
+            http,
+            creds,
+            ticket,
+        }
     }
 
     /// 拉取视频主楼评论一页（`cursor = None` 为首页）。
@@ -300,6 +308,49 @@ impl ReplyClient {
             get_json_with_ticket(&self.http, &self.creds, self.ticket.as_deref(), &url).await?;
         Ok(parse_sub_page(raw, pn, ps))
     }
+
+    /// 发布主楼评论（U1）：成功返回新 `rpid`。登录态必需（csrf=bili_jct）。
+    pub async fn add(&self, aid: u64, message: &str) -> Result<u64> {
+        let trimmed = message.trim();
+        if aid == 0 {
+            return Err(BiliError::InvalidData("缺少稿件 aid".into()));
+        }
+        if trimmed.is_empty() {
+            return Err(BiliError::InvalidData("评论内容为空".into()));
+        }
+        if trimmed.chars().count() > 1000 {
+            return Err(BiliError::InvalidData("评论过长(上限 1000 字)".into()));
+        }
+        let csrf = self.creds.get().await?.bili_jct;
+        let form = reply_add_params(aid, trimmed, &csrf);
+        #[derive(serde::Deserialize)]
+        struct RawAddData {
+            #[serde(default, deserialize_with = "u64_any_or_zero")]
+            rpid: u64,
+        }
+        let data: RawAddData = crate::httpx::post_form_with_ticket(
+            &self.http,
+            &self.creds,
+            self.ticket.as_deref(),
+            REPLY_ADD_URL,
+            "https://www.bilibili.com/",
+            &form,
+        )
+        .await?;
+        Ok(data.rpid)
+    }
+}
+
+/// 发评表单参数（纯函数;单测锁字段面;消息先去首尾空白防服务端 422）。
+fn reply_add_params(aid: u64, message: &str, csrf: &str) -> Vec<(String, String)> {
+    vec![
+        ("type".into(), "1".into()),
+        ("oid".into(), aid.to_string()),
+        ("root".into(), "0".into()),
+        ("parent".into(), "0".into()),
+        ("message".into(), message.trim().to_string()),
+        ("csrf".into(), csrf.to_string()),
+    ]
 }
 
 fn build_main_url(aid: u64, sort: ReplySort, cursor: Option<&ReplyCursor>) -> String {
@@ -369,10 +420,7 @@ fn convert_reply(raw: RawReply, force_top: bool, include_children: bool) -> Opti
     let level = member
         .level_info
         .map_or(0, |l| l.current_level.min(u64::from(u8::MAX)) as u8);
-    let message = raw
-        .content
-        .and_then(|c| c.message)
-        .unwrap_or_default();
+    let message = raw.content.and_then(|c| c.message).unwrap_or_default();
     let up_action = raw.up_action.unwrap_or_default();
     let ctrl = raw.reply_control.unwrap_or_default();
     let replies = if include_children {
@@ -398,8 +446,16 @@ fn convert_reply(raw: RawReply, force_top: bool, include_children: bool) -> Opti
         ctime: raw.ctime,
         like: raw.like,
         rcount: raw.rcount,
-        time_desc: ctrl.time_desc.as_deref().map(normalize_time_desc).unwrap_or_default(),
-        location: ctrl.location.as_deref().map(normalize_location).unwrap_or_default(),
+        time_desc: ctrl
+            .time_desc
+            .as_deref()
+            .map(normalize_time_desc)
+            .unwrap_or_default(),
+        location: ctrl
+            .location
+            .as_deref()
+            .map(normalize_location)
+            .unwrap_or_default(),
         is_up_top: force_top || ctrl.is_up_top,
         up_liked: up_action.like,
         up_replied: up_action.reply || ctrl.up_reply,
@@ -449,8 +505,14 @@ fn parse_sub_page(raw: RawSubData, fallback_pn: u32, fallback_ps: u32) -> SubRep
         .filter_map(|r| convert_reply(r, false, false))
         .collect();
     let page = raw.page.unwrap_or_default();
-    let page_num = u32::try_from(page.num).ok().filter(|&n| n > 0).unwrap_or(fallback_pn);
-    let page_size = u32::try_from(page.size).ok().filter(|&s| s > 0).unwrap_or(fallback_ps);
+    let page_num = u32::try_from(page.num)
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or(fallback_pn);
+    let page_size = u32::try_from(page.size)
+        .ok()
+        .filter(|&s| s > 0)
+        .unwrap_or(fallback_ps);
     let total_count = page.count;
     let has_more = !replies.is_empty()
         && u64::from(page_num).saturating_mul(u64::from(page_size)) < total_count;
@@ -468,6 +530,47 @@ fn parse_sub_page(raw: RawSubData, fallback_pn: u32, fallback_ps: u32) -> SubRep
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reply_add_params_locks_the_write_contract() {
+        let form = reply_add_params(80433022, "  一条评论  ", "SECRET");
+        assert_eq!(form[0], ("type".into(), "1".into()));
+        assert_eq!(form[1], ("oid".into(), "80433022".into()));
+        assert_eq!(form[2], ("root".into(), "0".into()));
+        assert_eq!(form[4], ("message".into(), "一条评论".into()));
+        assert_eq!(form[5], ("csrf".into(), "SECRET".into()));
+    }
+
+    /// 发评输入校验(空/超长在客户端先拒,不发网络)。
+    #[test]
+    fn reply_add_rejects_empty_and_oversized_messages() {
+        let client = ReplyClient::new(
+            reqwest::Client::new(),
+            std::sync::Arc::new(AnonymousCreds),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let err = client.add(80433022, "   ").await.unwrap_err().to_string();
+            assert!(err.contains("为空"), "{err}");
+            let long = "弹".repeat(1001);
+            let err = client.add(80433022, &long).await.unwrap_err().to_string();
+            assert!(err.contains("过长"), "{err}");
+        });
+    }
+
+    struct AnonymousCreds;
+    #[async_trait::async_trait]
+    impl crate::credentials::CredentialProvider for AnonymousCreds {
+        async fn get(&self) -> Result<crate::credentials::Credentials> {
+            Err(BiliError::NotLoggedIn)
+        }
+        fn cached(&self) -> Option<crate::credentials::Credentials> {
+            None
+        }
+    }
 
     #[test]
     fn builds_main_and_sub_urls_with_optional_cursor() {
@@ -646,12 +749,21 @@ mod tests {
             .unwrap();
         let creds: Arc<dyn CredentialProvider> = Arc::new(NoopCreds);
         let client = ReplyClient::new(http, creds);
-        let p1 = client.fetch_main(80433022, ReplySort::Hot, None).await.unwrap();
+        let p1 = client
+            .fetch_main(80433022, ReplySort::Hot, None)
+            .await
+            .unwrap();
         assert!(!p1.replies.is_empty());
         assert!(p1.cursor.all_count > 0);
-        let sub = client.fetch_sub(80433022, p1.replies[0].rpid, 1, 5).await.unwrap();
+        let sub = client
+            .fetch_sub(80433022, p1.replies[0].rpid, 1, 5)
+            .await
+            .unwrap();
         assert!(!sub.replies.is_empty());
-        let p2 = client.fetch_main(80433022, ReplySort::Hot, Some(&p1.cursor)).await.unwrap();
+        let p2 = client
+            .fetch_main(80433022, ReplySort::Hot, Some(&p1.cursor))
+            .await
+            .unwrap();
         assert!(!p2.replies.is_empty());
         assert_ne!(p1.replies[0].rpid, p2.replies[0].rpid);
     }

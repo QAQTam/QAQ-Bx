@@ -22,8 +22,16 @@ pub const DEFAULT_WINDOW_HEIGHT: f64 = 800.0;
 /// 桌面端左侧 `NavigationView` 收起态窄栏占用宽度。
 pub const DESKTOP_NAV_RAIL_WIDTH: f64 = 56.0;
 
+/// 桌面卡宽曲线下限(F5):列数按此最小宽推导。
+pub const DESKTOP_CARD_MIN_WIDTH: f64 = 200.0;
+/// 桌面卡文本区高度(标题两行 + UP 行 + 内外边距;封面之外预留)。
+pub const DESKTOP_CARD_TEXT_ALLOWANCE: f64 = 107.0;
+/// 桌面卡宽曲线上限(F5):超宽视口不再无限拉伸。
+pub const DESKTOP_CARD_MAX_WIDTH: f64 = 420.0;
+/// 兼容引用:1280 DIP 内容宽下的曲线取值(≈236,历史基线)。
 pub const DESKTOP_CARD_WIDTH: f64 = 236.0;
 pub const DESKTOP_CARD_GAP: f64 = 12.0;
+/// 兼容引用:1280 DIP 曲线下的封面高(精确 16:9 取整)。
 pub const DESKTOP_CARD_COVER_HEIGHT: f64 = 133.0;
 pub const DESKTOP_CARD_HEIGHT: f64 = 240.0;
 pub const DESKTOP_MARGIN_X: f64 = 36.0;
@@ -132,12 +140,30 @@ impl CardMetrics {
             }
             ShellChromeMode::Desktop => {
                 let margin_x = DESKTOP_MARGIN_X;
-                let cell_w = DESKTOP_CARD_WIDTH + DESKTOP_CARD_GAP;
-                let inner = (content_width - margin_x * 2.0).max(DESKTOP_CARD_WIDTH);
-                let cols = ((inner + DESKTOP_CARD_GAP) / cell_w)
+                // F5 连续卡片大小曲线：列数由最小卡宽推导，卡宽把剩余宽度
+                // 平均分满（整 DIP），封面高精确 16:9 取整 —— 消除：
+                // ① 定宽 236 留下的大块行尾空白（窗口越宽留白越多）；
+                // ② 封面高与 9/16 比例的偏差导致的 UniformToFill 亚像素裁切
+                //    （高 DPI 下表现为封面边缘毛刺/闪烁）。
+                let inner = (content_width - margin_x * 2.0).max(DESKTOP_CARD_MIN_WIDTH);
+                let cols = ((inner + DESKTOP_CARD_GAP)
+                    / (DESKTOP_CARD_MIN_WIDTH + DESKTOP_CARD_GAP))
                     .floor()
                     .clamp(1.0, 12.0) as usize;
-                Self::desktop(margin_x, cols)
+                let card_width = ((inner - DESKTOP_CARD_GAP * (cols as f64 - 1.0)) / cols as f64)
+                    .floor()
+                    .clamp(DESKTOP_CARD_MIN_WIDTH, DESKTOP_CARD_MAX_WIDTH);
+                let cover_height = (card_width * 9.0 / 16.0).round();
+                let card_height = cover_height + DESKTOP_CARD_TEXT_ALLOWANCE;
+                Self {
+                    cols,
+                    card_width,
+                    cover_height,
+                    card_height,
+                    gap: DESKTOP_CARD_GAP,
+                    margin_x,
+                    compact_card: false,
+                }
             }
         }
     }
@@ -264,8 +290,7 @@ pub fn can_navigate_back(
     history_len: usize,
     whisper_detail_open: bool,
 ) -> bool {
-    history_len > 0
-        || (layout.uses_whisper_drilldown() && in_account_route && whisper_detail_open)
+    history_len > 0 || (layout.uses_whisper_drilldown() && in_account_route && whisper_detail_open)
 }
 
 /// 夹紧历史窗口边界，避免恢复过小外框导致首帧越界闪烁。
@@ -328,13 +353,18 @@ mod tests {
         assert_eq!(d860.tier, ContentLayoutTier::Expanded);
         assert!(!d860.cards.compact_card);
         assert_eq!(d860.cards.cols, 3);
+        // F5 曲线:860 DIP(内容 804/内宽 732)3 列 → 卡宽恰为历史基线 236,封面 133。
+        assert_eq!(d860.cards.card_width, 236.0);
+        assert_eq!(d860.cards.cover_height, 133.0);
         assert!(!d860.is_single_column());
         assert!(d860.shows_inline_title_search());
 
         let d1280 = ViewportLayout::from_window_size(1280.0, 800.0);
-        assert_eq!(d1280.cards.cols, 4);
-        assert_eq!(d1280.cards.card_width, DESKTOP_CARD_WIDTH);
-        assert_eq!(d1280.cards.card_height, DESKTOP_CARD_HEIGHT);
+        // F5 曲线:1224 内宽 5 列 → 卡宽 235(≈历史基线 236,行尾无空白)。
+        assert_eq!(d1280.cards.cols, 5);
+        assert_eq!(d1280.cards.card_width, 220.0);
+        assert_eq!(d1280.cards.cover_height, 124.0);
+        assert_eq!(d1280.cards.card_height, 124.0 + DESKTOP_CARD_TEXT_ALLOWANCE);
     }
 
     #[test]
@@ -382,5 +412,42 @@ mod tests {
         });
         assert_eq!(clamped.width, 390);
         assert_eq!(clamped.height, 640);
+    }
+
+    /// F5:曲线在整 DIP 上取值且封面严格 16:9(±0.5 DIP),任何内容宽 /
+    /// DPI 缩放下封面不做 UniformToFill 亚像素裁切。
+    #[test]
+    fn desktop_card_curve_stays_integer_aligned_and_16_9() {
+        // 仅桌面形态(≥860 DIP)走曲线;Mobile 曲线已有独立断言。
+        for width in [860.0, 1000.0, 1280.0, 1600.0, 1920.0, 2560.0, 3840.0] {
+            let m = ViewportLayout::from_window_size(width, 900.0).cards;
+            assert!(
+                m.card_width.fract() == 0.0,
+                "{width}: 卡宽非整 DIP {}",
+                m.card_width
+            );
+            assert!(m.cover_height.fract() == 0.0, "{width}: 封面非整 DIP");
+            let ratio = m.cover_height / m.card_width;
+            assert!(
+                (ratio - 9.0 / 16.0).abs() <= 0.5 / m.card_width,
+                "{width}: 封面比例偏离 16:9 超过 0.5 DIP({ratio})"
+            );
+            assert!(
+                m.card_width >= DESKTOP_CARD_MIN_WIDTH && m.card_width <= DESKTOP_CARD_MAX_WIDTH,
+                "{width}: 卡宽越界 {}",
+                m.card_width
+            );
+            // 行内总宽恰好不超内容区(不留 >1 卡距的空白)。
+            let inner = width - 36.0;
+            assert!(
+                m.cols as f64 * m.card_width + (m.cols as f64 - 1.0) * m.gap <= inner + 0.5,
+                "{width}: 行宽溢出"
+            );
+            assert!(
+                inner - (m.cols as f64 * m.card_width + (m.cols as f64 - 1.0) * m.gap)
+                    < m.card_width + m.gap,
+                "{width}: 行尾空白超过一张卡(定宽回归)"
+            );
+        }
     }
 }

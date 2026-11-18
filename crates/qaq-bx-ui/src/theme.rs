@@ -198,9 +198,18 @@ mod tests {
         // 1700000000 = 2023-11-15 06:13:20 +08:00
         assert_eq!(fmt_date_ms(1_700_000_000_000), "2023-11-15");
         assert_eq!(fmt_date_ms(0), "");
-        assert_eq!(fmt_time_with_now(1_700_000_000, 1_700_003_600), "今天 06:13");
-        assert_eq!(fmt_time_with_now(1_700_000_000, 1_700_200_000), "11-15 06:13");
-        assert_eq!(fmt_time_with_now(1_700_000_000, 1_795_000_000), "2023-11-15 06:13");
+        assert_eq!(
+            fmt_time_with_now(1_700_000_000, 1_700_003_600),
+            "今天 06:13"
+        );
+        assert_eq!(
+            fmt_time_with_now(1_700_000_000, 1_700_200_000),
+            "11-15 06:13"
+        );
+        assert_eq!(
+            fmt_time_with_now(1_700_000_000, 1_795_000_000),
+            "2023-11-15 06:13"
+        );
         assert_eq!(fmt_sys_time("2026-11-15 15:43:07"), "2026-11-15 15:43");
         assert_eq!(fmt_coins(125.1), "125.1");
         assert_eq!(fmt_coins(42.0), "42");

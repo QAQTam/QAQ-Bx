@@ -29,7 +29,9 @@ pub struct WbiSigner {
 impl WbiSigner {
     /// 独立构造：内部自建匿名 NavClient（CLI / 单测等只需签名的场景）。
     pub fn new(http: reqwest::Client) -> Self {
-        Self { nav: Arc::new(NavClient::new_anonymous(http)) }
+        Self {
+            nav: Arc::new(NavClient::new_anonymous(http)),
+        }
     }
 
     /// 复用共享 NavClient：feed/播放/弹幕与 UI 账号展示共用同一份 nav 缓存。
@@ -41,20 +43,22 @@ impl WbiSigner {
     async fn mixin_key(&self) -> Result<String> {
         let (img_url, sub_url) = match self.nav.snapshot().await {
             Ok(snap) => (snap.wbi_img_url, snap.wbi_sub_url),
-            Err(err) => self
-                .nav
-                .ticket()
-                .and_then(|t| t.wbi_urls())
-                .ok_or(err)?,
+            Err(err) => self.nav.ticket().and_then(|t| t.wbi_urls()).ok_or(err)?,
         };
         let file_name = |url: &str| -> Result<String> {
-            url.rsplit('/').next().and_then(|n| n.split('.').next()).map(String::from)
+            url.rsplit('/')
+                .next()
+                .and_then(|n| n.split('.').next())
+                .map(String::from)
                 .ok_or_else(|| BiliError::InvalidData(format!("wbi_img 非法 URL: {url}")))
         };
         let img = file_name(&img_url)?;
         let sub = file_name(&sub_url)?;
         let combined = format!("{img}{sub}");
-        let mixin: String = MIXIN_TABLE.iter().filter_map(|&i| combined.chars().nth(i)).collect();
+        let mixin: String = MIXIN_TABLE
+            .iter()
+            .filter_map(|&i| combined.chars().nth(i))
+            .collect();
         Ok(mixin[..32.min(mixin.len())].to_string())
     }
 
@@ -67,7 +71,12 @@ impl WbiSigner {
 
         let mut pairs: Vec<(String, String)> = params
             .iter()
-            .map(|(k, v)| (encode_component(&filter_chars(k)), encode_component(&filter_chars(v))))
+            .map(|(k, v)| {
+                (
+                    encode_component(&filter_chars(k)),
+                    encode_component(&filter_chars(v)),
+                )
+            })
             .collect();
         pairs.push(("wts".to_string(), wts.to_string()));
         // JS Array#sort 默认按 UTF-16 码元；参数名全 ASCII 时与字节序一致。
@@ -86,7 +95,9 @@ impl WbiSigner {
 
 /// 服务器语义：值过滤 `!'()*`。
 fn filter_chars(s: &str) -> String {
-    s.chars().filter(|c| !matches!(c, '!' | '\'' | '(' | ')' | '*')).collect()
+    s.chars()
+        .filter(|c| !matches!(c, '!' | '\'' | '(' | ')' | '*'))
+        .collect()
 }
 
 /// 与 JS `encodeURIComponent` 一致的编码（unreserved: A-Za-z0-9-_.!~*'()；

@@ -9,8 +9,8 @@
 //!   + `api.vc.bilibili.com/svr_sync/v1/svr_sync/fetch_session_msgs`（WBI 签名）
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::Deserialize;
 
@@ -26,15 +26,12 @@ const MESSAGE_REFERER: &str = "https://message.bilibili.com/";
 
 const MSGFEED_UNREAD_URL: &str =
     "https://api.vc.bilibili.com/x/im/web/msgfeed/unread?build=0&mobi_app=web";
-const SINGLE_UNREAD_URL: &str =
-    "https://api.vc.bilibili.com/session_svr/v1/session_svr/single_unread?build=0&mobi_app=web&unread_type=0";
-const LINK_SETTING_URL: &str =
-    "https://api.vc.bilibili.com/link_setting/v1/link_setting/get?build=0&mobi_app=web&msg_notify=1&show_unfollowed_msg=1";
+const SINGLE_UNREAD_URL: &str = "https://api.vc.bilibili.com/session_svr/v1/session_svr/single_unread?build=0&mobi_app=web&unread_type=0";
+const LINK_SETTING_URL: &str = "https://api.vc.bilibili.com/link_setting/v1/link_setting/get?build=0&mobi_app=web&msg_notify=1&show_unfollowed_msg=1";
 
 const REPLY_FEED_URL: &str =
     "https://api.bilibili.com/x/msgfeed/reply?platform=web&build=0&mobi_app=web";
-const AT_FEED_URL: &str =
-    "https://api.bilibili.com/x/msgfeed/at?platform=web&build=0&mobi_app=web";
+const AT_FEED_URL: &str = "https://api.bilibili.com/x/msgfeed/at?platform=web&build=0&mobi_app=web";
 const LIKE_FEED_URL: &str =
     "https://api.bilibili.com/x/msgfeed/like?platform=web&build=0&mobi_app=web";
 
@@ -47,8 +44,7 @@ const NOTIFY_LIST_URL: &str =
 
 const GET_SESSIONS_URL: &str =
     "https://api.vc.bilibili.com/session_svr/v1/session_svr/get_sessions";
-const USER_CARDS_URL: &str =
-    "https://api.bilibili.com/x/polymer/pc-electron/v1/user/cards";
+const USER_CARDS_URL: &str = "https://api.bilibili.com/x/polymer/pc-electron/v1/user/cards";
 const FETCH_SESSION_MSGS_URL: &str =
     "https://api.vc.bilibili.com/svr_sync/v1/svr_sync/fetch_session_msgs";
 
@@ -615,7 +611,10 @@ impl NotifyClient {
                 .collect::<Vec<_>>()
                 .join(",");
             let cards_url = format!("{USER_CARDS_URL}?uids={uids_param}&build=0&mobi_app=web");
-            if let Ok(map) = self.get_msg::<HashMap<String, RawUserCard>>(&cards_url).await {
+            if let Ok(map) = self
+                .get_msg::<HashMap<String, RawUserCard>>(&cards_url)
+                .await
+            {
                 user_map.extend(map);
             }
         }
@@ -1057,12 +1056,19 @@ pub fn format_whisper_content(
         5 => ("[已撤回]".to_string(), None),
         6 => ("[表情]".to_string(), None),
         7 | 14 => {
-            let tag = if parsed.headline.is_empty() { "分享" } else { "转发" };
+            let tag = if parsed.headline.is_empty() {
+                "分享"
+            } else {
+                "转发"
+            };
             let title = non_empty(&parsed.title).unwrap_or_default();
             let link = if !parsed.url.is_empty() || !parsed.bvid.is_empty() {
                 link_from_url("打开", &parsed.url, &parsed.bvid)
             } else if parsed.source == 5 {
-                let aid = parsed.id.as_u64().or_else(|| parsed.id.as_str()?.parse().ok());
+                let aid = parsed
+                    .id
+                    .as_u64()
+                    .or_else(|| parsed.id.as_str()?.parse().ok());
                 aid.map(|a| NoticeLink {
                     label: "打开".to_string(),
                     url: format!("https://www.bilibili.com/video/av{a}"),
@@ -1177,7 +1183,10 @@ mod tests {
             extract_bvid("https://www.bilibili.com/video/BV1i24P6rEmt?p=1"),
             Some("BV1i24P6rEmt".into())
         );
-        assert_eq!(extract_bvid("//www.bilibili.com/video/BV1GJ411x7h7/"), Some("BV1GJ411x7h7".into()));
+        assert_eq!(
+            extract_bvid("//www.bilibili.com/video/BV1GJ411x7h7/"),
+            Some("BV1GJ411x7h7".into())
+        );
         assert_eq!(extract_bvid("https://space.bilibili.com/100000000"), None);
         assert_eq!(extract_bvid("BV1234567890EXTRA"), None);
 
@@ -1239,7 +1248,13 @@ mod tests {
         assert!(!page.items[1].is_latest);
         assert_eq!(page.items[1].total_count, 3);
         assert!(page.has_more);
-        assert_eq!(page.next_cursor, Some(FeedCursor { id: 99, time: 1789999000 }));
+        assert_eq!(
+            page.next_cursor,
+            Some(FeedCursor {
+                id: 99,
+                time: 1789999000
+            })
+        );
     }
 
     #[test]
@@ -1256,7 +1271,8 @@ mod tests {
         assert!(t10.contains("UP主荣誉周报"));
         assert_eq!(l10.unwrap().label, "查看周报");
 
-        let (t11, l11) = format_whisper_content(11, 0, r#"{"title":"Rust教程","bvid":"BV1GJ411x7h7"}"#);
+        let (t11, l11) =
+            format_whisper_content(11, 0, r#"{"title":"Rust教程","bvid":"BV1GJ411x7h7"}"#);
         assert_eq!(t11, "[视频] Rust教程");
         assert_eq!(l11.unwrap().bvid.as_deref(), Some("BV1GJ411x7h7"));
 
@@ -1305,15 +1321,27 @@ mod tests {
         let unread = client.fetch_unread().await.expect("unread");
         println!("unread={unread:?}");
         let replies = client.fetch_replies(None).await.expect("replies");
-        println!("replies={} has_more={}", replies.items.len(), replies.has_more);
+        println!(
+            "replies={} has_more={}",
+            replies.items.len(),
+            replies.has_more
+        );
         let ats = client.fetch_ats(None).await.expect("ats");
         println!("ats={} has_more={}", ats.items.len(), ats.has_more);
         let likes = client.fetch_likes(None).await.expect("likes");
         println!("likes={} has_more={}", likes.items.len(), likes.has_more);
         let systems = client.fetch_system_notifies(None).await.expect("systems");
-        println!("systems={} has_more={}", systems.items.len(), systems.has_more);
+        println!(
+            "systems={} has_more={}",
+            systems.items.len(),
+            systems.has_more
+        );
         let sessions = client.fetch_sessions(None).await.expect("sessions");
-        println!("sessions={} has_more={}", sessions.sessions.len(), sessions.has_more);
+        println!(
+            "sessions={} has_more={}",
+            sessions.sessions.len(),
+            sessions.has_more
+        );
         if let Some(first) = sessions.sessions.first() {
             let msgs = client
                 .fetch_session_messages(first.talker_id, first.session_type)

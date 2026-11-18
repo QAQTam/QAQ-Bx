@@ -2,7 +2,13 @@
 //! - 全局默认字体设置（`Application.Resources["ContentControlThemeFontFamily"]`）；
 //! - `ScrollViewer::ChangeView` 精确滚动支持。
 
-#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code, clippy::all)]
+#![allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code,
+    clippy::all
+)]
 
 include!(concat!(env!("OUT_DIR"), "/winrt_bindings.rs"));
 
@@ -56,6 +62,62 @@ pub fn scroll_focused_viewer_by(delta_y: f64) -> bool {
     false
 }
 
+/// 切换指定 WinUI 窗口的全屏/常规呈现模式（需在 UI 线程调用）。
+pub fn set_window_fullscreen(hwnd_raw: *mut core::ffi::c_void, fullscreen: bool) -> bool {
+    if hwnd_raw.is_null() {
+        return false;
+    }
+    let id = WindowId {
+        value: hwnd_raw as usize as u64,
+    };
+    let Ok(app_window) = AppWindow::GetFromWindowId(id) else {
+        return false;
+    };
+    let kind = if fullscreen {
+        AppWindowPresenterKind::FullScreen
+    } else {
+        AppWindowPresenterKind::Default
+    };
+    app_window.SetPresenterByKind(kind).is_ok()
+}
+
+/// 查询指定 WinUI 窗口当前是否处于系统全屏呈现模式（需在 UI 线程调用）。
+pub fn is_window_fullscreen(hwnd_raw: *mut core::ffi::c_void) -> Option<bool> {
+    if hwnd_raw.is_null() {
+        return None;
+    }
+    let id = WindowId {
+        value: hwnd_raw as usize as u64,
+    };
+    let app_window = AppWindow::GetFromWindowId(id).ok()?;
+    let presenter = app_window.Presenter().ok()?;
+    let kind = presenter.Kind().ok()?;
+    Some(kind == AppWindowPresenterKind::FullScreen)
+}
+
+/// 当前焦点是否位于文本输入框（或其模板子元素）内，防止单键播放器快捷键劫持打字。
+pub fn is_text_input_focused() -> bool {
+    let Ok(focused) = FocusManager::GetFocusedElement() else {
+        return false;
+    };
+    if focused.cast::<TextBox>().is_ok() {
+        return true;
+    }
+    let Ok(mut current) = focused.cast::<DependencyObject>() else {
+        return false;
+    };
+    for _ in 0..16 {
+        if current.cast::<TextBox>().is_ok() {
+            return true;
+        }
+        let Ok(parent) = VisualTreeHelper::GetParent(&current) else {
+            break;
+        };
+        current = parent;
+    }
+    false
+}
+
 /// 持有已向 Windows App SDK `AppNotificationManager` 注册的通知激活会话。
 pub struct AppNotificationGuard {
     manager: AppNotificationManager,
@@ -85,4 +147,16 @@ pub fn register_app_notifications(
         manager,
         _revoker: revoker,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fullscreen_helpers_handle_null_hwnd_without_panic() {
+        assert!(!set_window_fullscreen(std::ptr::null_mut(), true));
+        assert!(!set_window_fullscreen(std::ptr::null_mut(), false));
+        assert_eq!(is_window_fullscreen(std::ptr::null_mut()), None);
+    }
 }

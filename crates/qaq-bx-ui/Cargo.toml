@@ -13,6 +13,8 @@ windows-reactor.workspace = true
 windows-core = { path = "D:/Projects/qaq-winui-reactor/crates/libs/core" }
 windows-collections = { path = "D:/Projects/qaq-winui-reactor/crates/libs/collections" }
 windows-reference = { path = "D:/Projects/qaq-winui-reactor/crates/libs/reference" }
+# xamlroot-probe:生成的 winrt bindings 引用 windows_time::TimeSpan。
+windows-time = { path = "D:/Projects/qaq-winui-reactor/crates/libs/time" }
 windows.workspace = true
 # 弹幕覆盖层:D2D Canvas(reactor 集成)+ DWrite 文本格式。
 windows-canvas = { path = "D:/Projects/qaq-winui-reactor/crates/libs/canvas", features = ["reactor", "composition"] }
@@ -28,6 +30,9 @@ serde = { workspace = true, features = ["derive"] }
 # 不开窗口、直接派发 Message)。生产构建不带此 feature。
 [features]
 selftest = ["windows-reactor/test"]
+# xamlroot 崩溃探针(--probe-xamlroot):真实窗口下分阶段实测 QI 行为,
+# 定位 Microsoft.UI.Xaml.Controls.dll +0x359595 的触发条件。诊断专用。
+probe = []
 
 [build-dependencies]
 windows-bindgen = { path = "D:/Projects/qaq-winui-reactor/crates/libs/bindgen" }

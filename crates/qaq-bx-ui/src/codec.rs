@@ -25,11 +25,14 @@ fn detect_webp() -> bool {
     // 已初始化为 STA 时返回 RPC_E_CHANGED_MODE,直接忽略(dwcoinit = COINIT_MULTITHREADED)。
     unsafe {
         let _ = CoInitializeEx(None, 0);
-        let factory: IWICImagingFactory =
-            match CoCreateInstance(&CLSID_WICImagingFactory, None, 1 /* CLSCTX_INPROC_SERVER */) {
-                Ok(factory) => factory,
-                Err(_) => return false,
-            };
+        let factory: IWICImagingFactory = match CoCreateInstance(
+            &CLSID_WICImagingFactory,
+            None,
+            1, /* CLSCTX_INPROC_SERVER */
+        ) {
+            Ok(factory) => factory,
+            Err(_) => return false,
+        };
         factory
             .CreateDecoder(&GUID_CONTAINER_FORMAT_WEBP, None)
             .is_ok()
@@ -38,11 +41,7 @@ fn detect_webp() -> bool {
 
 /// 图片 URL 的格式后缀("webp" / "jpg"),拼在 `@w_h_1c.` 之后。
 pub fn raster_suffix() -> &'static str {
-    if webp_supported() {
-        "webp"
-    } else {
-        "jpg"
-    }
+    if webp_supported() { "webp" } else { "jpg" }
 }
 
 /// 用真实 WebP 文件交叉验证 GUID 探测(仅 selftest 调试用):
@@ -59,11 +58,11 @@ pub(crate) fn probe_webp_file(path: &std::path::Path) -> bool {
     let wide = HSTRING::from(path.as_os_str().to_string_lossy().as_ref());
     unsafe {
         let _ = CoInitializeEx(None, 0);
-        let factory: IWICImagingFactory =
-            match CoCreateInstance(&CLSID_WICImagingFactory, None, 1) {
-                Ok(factory) => factory,
-                Err(_) => return false,
-            };
+        let factory: IWICImagingFactory = match CoCreateInstance(&CLSID_WICImagingFactory, None, 1)
+        {
+            Ok(factory) => factory,
+            Err(_) => return false,
+        };
         factory.CreateDecoderFromFilename(&wide, None, 0, 0).is_ok()
     }
 }
@@ -81,12 +80,7 @@ pub fn show_webp_hint_dialog() {
     );
     let caption = HSTRING::from("QAQ-Bx 图片格式提示");
     unsafe {
-        let _ = MessageBoxW(
-            None,
-            &text,
-            &caption,
-            (MB_ICONINFORMATION | MB_OK) as u32,
-        );
+        let _ = MessageBoxW(None, &text, &caption, (MB_ICONINFORMATION | MB_OK) as u32);
     }
 }
 

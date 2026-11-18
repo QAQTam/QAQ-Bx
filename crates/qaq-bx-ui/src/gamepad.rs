@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::processthreadsapi::GetCurrentProcessId;
 use windows::Win32::winuser::{
-    GetForegroundWindow, GetWindowThreadProcessId, INPUT, INPUT_0, INPUT_MOUSE,
-    MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
+    GetForegroundWindow, GetWindowThreadProcessId, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_WHEEL,
+    MOUSEINPUT, SendInput,
 };
 use windows::Win32::xinput::{
     XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT,
@@ -108,8 +108,14 @@ fn poll_loop(tx: Sender<GamepadEvent>) {
             }
         }
 
-        let lx = apply_deadzone(pad.Gamepad.sThumbLX, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE as i16);
-        let ly = apply_deadzone(pad.Gamepad.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE as i16);
+        let lx = apply_deadzone(
+            pad.Gamepad.sThumbLX,
+            XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE as i16,
+        );
+        let ly = apply_deadzone(
+            pad.Gamepad.sThumbLY,
+            XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE as i16,
+        );
         let lt = pad.Gamepad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD as u8;
         let rt = pad.Gamepad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD as u8;
 
@@ -137,7 +143,10 @@ fn poll_loop(tx: Sender<GamepadEvent>) {
         }
 
         // 右摇杆 Y 轴平滑滚轮滚动（支持首页/热门/设置等任意滚动视图）。
-        let ry = apply_deadzone(pad.Gamepad.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE as i16);
+        let ry = apply_deadzone(
+            pad.Gamepad.sThumbRY,
+            XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE as i16,
+        );
         if ry != 0 {
             let delta = ((f32::from(ry) / 32767.0) * 96.0).round() as i32;
             if delta != 0 {
@@ -248,7 +257,11 @@ pub fn gamepad_hint_bar(route: Route, focus_title: Option<&str>, compact: bool) 
                 "A",
                 Color::rgb(16, 124, 16),
                 Color::rgb(255, 255, 255),
-                if route == Route::Player { "播停" } else { "打开" },
+                if route == Route::Player {
+                    "播停"
+                } else {
+                    "打开"
+                },
             ));
         }
         chips.push(abxy_chip(
@@ -277,23 +290,69 @@ pub fn gamepad_hint_bar(route: Route, focus_title: Option<&str>, compact: bool) 
 
     let mut items: Vec<View> = match route {
         Route::Player => vec![
-            abxy_chip("A", Color::rgb(16, 124, 16), Color::rgb(255, 255, 255), "播放/暂停"),
-            abxy_chip("B", Color::rgb(232, 17, 35), Color::rgb(255, 255, 255), "返回"),
+            abxy_chip(
+                "A",
+                Color::rgb(16, 124, 16),
+                Color::rgb(255, 255, 255),
+                "播放/暂停",
+            ),
+            abxy_chip(
+                "B",
+                Color::rgb(232, 17, 35),
+                Color::rgb(255, 255, 255),
+                "返回",
+            ),
+            abxy_chip(
+                "X",
+                Color::rgb(0, 120, 212),
+                Color::rgb(255, 255, 255),
+                "全屏",
+            ),
             key_chip("◀▶ / LT·RT", "快退/快进 10s"),
             key_chip("▲▼", "音量"),
             key_chip("LB/RB", "切页"),
         ],
         Route::Home => vec![
-            abxy_chip("A", Color::rgb(16, 124, 16), Color::rgb(255, 255, 255), "打开选中"),
-            abxy_chip("X", Color::rgb(0, 120, 212), Color::rgb(255, 255, 255), "换一换"),
-            abxy_chip("Y", Color::rgb(255, 185, 0), Color::rgb(20, 20, 20), "暂停/续播"),
-            abxy_chip("B", Color::rgb(232, 17, 35), Color::rgb(255, 255, 255), "返回"),
+            abxy_chip(
+                "A",
+                Color::rgb(16, 124, 16),
+                Color::rgb(255, 255, 255),
+                "打开选中",
+            ),
+            abxy_chip(
+                "X",
+                Color::rgb(0, 120, 212),
+                Color::rgb(255, 255, 255),
+                "换一换",
+            ),
+            abxy_chip(
+                "Y",
+                Color::rgb(255, 185, 0),
+                Color::rgb(20, 20, 20),
+                "暂停/续播",
+            ),
+            abxy_chip(
+                "B",
+                Color::rgb(232, 17, 35),
+                Color::rgb(255, 255, 255),
+                "返回",
+            ),
             key_chip("RS", "滚动"),
             key_chip("LB/RB", "切页"),
         ],
         _ => vec![
-            abxy_chip("B", Color::rgb(232, 17, 35), Color::rgb(255, 255, 255), "返回"),
-            abxy_chip("Y", Color::rgb(255, 185, 0), Color::rgb(20, 20, 20), "暂停/续播"),
+            abxy_chip(
+                "B",
+                Color::rgb(232, 17, 35),
+                Color::rgb(255, 255, 255),
+                "返回",
+            ),
+            abxy_chip(
+                "Y",
+                Color::rgb(255, 185, 0),
+                Color::rgb(20, 20, 20),
+                "暂停/续播",
+            ),
             key_chip("LB/RB", "切页"),
         ],
     };
@@ -424,7 +483,10 @@ mod tests {
     fn repeat_tracker_fires_initial_then_waits_for_delay() {
         let mut tracker = RepeatTracker::default();
         let t0 = Instant::now();
-        assert_eq!(tracker.update(Some(GamepadAction::Right), t0), Some(GamepadAction::Right));
+        assert_eq!(
+            tracker.update(Some(GamepadAction::Right), t0),
+            Some(GamepadAction::Right)
+        );
         assert_eq!(
             tracker.update(Some(GamepadAction::Right), t0 + Duration::from_millis(100)),
             None

@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::account::NavClient;
 use crate::credentials::CredentialProvider;
@@ -465,7 +465,12 @@ impl FeedClient {
         nav: Arc<NavClient>,
     ) -> Self {
         let ticket = nav.ticket().cloned();
-        Self { wbi: WbiSigner::with_nav(nav), http, creds, ticket }
+        Self {
+            wbi: WbiSigner::with_nav(nav),
+            http,
+            creds,
+            ticket,
+        }
     }
 
     async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
@@ -517,7 +522,9 @@ impl FeedClient {
         }
         let signed = self.wbi.sign_query(&params).await?;
         let data: RcmdData = self
-            .get_json(&format!("https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd?{signed}"))
+            .get_json(&format!(
+                "https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd?{signed}"
+            ))
             .await?;
         Ok(data.item)
     }
@@ -525,7 +532,9 @@ impl FeedClient {
     /// 综合热门（无签名，pn/ps 分页）。
     pub async fn popular(&self, pn: u32, ps: u32) -> Result<Vec<ArchiveCard>> {
         let data: ArchiveListData = self
-            .get_json(&format!("https://api.bilibili.com/x/web-interface/popular?ps={ps}&pn={pn}"))
+            .get_json(&format!(
+                "https://api.bilibili.com/x/web-interface/popular?ps={ps}&pn={pn}"
+            ))
             .await?;
         Ok(data.list)
     }
@@ -533,7 +542,9 @@ impl FeedClient {
     /// 入站必刷（一次全量，实测 98 条）。
     pub async fn precious(&self, page: u32) -> Result<Vec<ArchiveCard>> {
         let data: ArchiveListData = self
-            .get_json(&format!("https://api.bilibili.com/x/web-interface/popular/precious?page={page}"))
+            .get_json(&format!(
+                "https://api.bilibili.com/x/web-interface/popular/precious?page={page}"
+            ))
             .await?;
         Ok(data.list)
     }
@@ -585,7 +596,10 @@ mod session_tests {
     }
 
     fn ad() -> FeedCard {
-        FeedCard { goto: Some("ad".into()), ..FeedCard::default() }
+        FeedCard {
+            goto: Some("ad".into()),
+            ..FeedCard::default()
+        }
     }
 
     #[test]
@@ -728,9 +742,7 @@ mod related_tests {
         // 防回归：端点必须是 `archive/related`（`wbi/related/all` 实测返回 HTML，见
         // docs/bilibili-api-inventory.md §6）。此处锚定 URL 构造唯一来源。
         let bvid = "BV1GJ411x7h7";
-        let url = format!(
-            "https://api.bilibili.com/x/web-interface/archive/related?bvid={bvid}"
-        );
+        let url = format!("https://api.bilibili.com/x/web-interface/archive/related?bvid={bvid}");
         assert!(url.contains("/x/web-interface/archive/related?"));
         assert!(!url.contains("wbi/related"));
     }

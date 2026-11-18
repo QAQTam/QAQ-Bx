@@ -15,6 +15,12 @@ fn main() {
         .flat()
         .minimal()
         .filters([
+            "Microsoft.UI.WindowId",
+            "Microsoft.UI.Windowing.AppWindow.GetFromWindowId",
+            "Microsoft.UI.Windowing.AppWindow.Presenter",
+            "Microsoft.UI.Windowing.AppWindow.SetPresenterByKind",
+            "Microsoft.UI.Windowing.AppWindowPresenter.Kind",
+            "Microsoft.UI.Windowing.AppWindowPresenterKind",
             "Microsoft.UI.Xaml.Application.Current",
             "Microsoft.UI.Xaml.Application.Resources",
             "Microsoft.UI.Xaml.ResourceDictionary",
@@ -24,10 +30,22 @@ fn main() {
             "Microsoft.UI.Xaml.Controls.ScrollViewer.ChangeView",
             "Microsoft.UI.Xaml.Controls.ScrollViewer.VerticalOffset",
             "Microsoft.UI.Xaml.Controls.ScrollViewer.ViewportHeight",
+            "Microsoft.UI.Xaml.Controls.TextBox",
             "Microsoft.UI.Xaml.Media.VisualTreeHelper.GetParent",
             "Microsoft.UI.Xaml.Input.FocusManager.GetFocusedElement",
             "Microsoft.UI.Xaml.UIElement.XamlRoot",
             "Microsoft.UI.Xaml.DependencyObject",
+            // xamlroot-probe(诊断构建,--probe-xamlroot):可视树遍历 + 标题栏属性驱动
+            "Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChildrenCount",
+            "Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChild",
+            "Microsoft.UI.Xaml.Controls.TitleBar.Title",
+            "Microsoft.UI.Xaml.Controls.Panel.Children",
+            "Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread",
+            "Microsoft.UI.Dispatching.DispatcherQueue.CreateTimer",
+            "Microsoft.UI.Dispatching.DispatcherQueueTimer",
+            "Microsoft.UI.Dispatching.DispatcherQueueTimer.Interval",
+            "Microsoft.UI.Dispatching.DispatcherQueueTimer.Tick",
+            "Microsoft.UI.Dispatching.DispatcherQueueTimer.Start",
             "Microsoft.Windows.AppNotifications.AppNotificationManager.Default",
             "Microsoft.Windows.AppNotifications.AppNotificationManager.Register",
             "Microsoft.Windows.AppNotifications.AppNotificationManager.Unregister",
@@ -56,8 +74,7 @@ fn embed_app_icon(out_dir: &Path) {
         .replace('\\', "/");
     let rc_path = out_dir.join("qaq_bx_icon.rc");
     let res_path = out_dir.join("qaq_bx_icon.res");
-    std::fs::write(&rc_path, format!("1 ICON \"{ico_clean}\"\n"))
-        .expect("write qaq_bx_icon.rc");
+    std::fs::write(&rc_path, format!("1 ICON \"{ico_clean}\"\n")).expect("write qaq_bx_icon.rc");
 
     let status = Command::new(rc_exe)
         .args([
@@ -88,8 +105,7 @@ fn find_rc_exe() -> Option<PathBuf> {
         _ => "x64",
     };
     let kits = PathBuf::from(
-        std::env::var_os("ProgramFiles(x86)")
-            .unwrap_or_else(|| r"C:\Program Files (x86)".into()),
+        std::env::var_os("ProgramFiles(x86)").unwrap_or_else(|| r"C:\Program Files (x86)".into()),
     )
     .join(r"Windows Kits\10\bin");
     let entries = std::fs::read_dir(kits).ok()?;

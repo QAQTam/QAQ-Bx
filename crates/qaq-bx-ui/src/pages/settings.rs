@@ -1,6 +1,8 @@
 //! 设置页：由 AppShell 单源持有并实时持久化到 `data/settings.json`。
 
-use qaq_bx_core::settings::{AppSettings, CodecPref, HomeOpenMode, QualityPref};
+use std::rc::Rc;
+
+use qaq_bx_core::settings::{AppSettings, CodecPref, DANMAKU_FONTS, HomeOpenMode, QualityPref};
 use windows_reactor::*;
 
 use crate::layout::ViewportLayout;
@@ -16,7 +18,12 @@ pub fn settings_page(
     let quality_labels: Vec<&'static str> = QualityPref::ALL.iter().map(|q| q.label()).collect();
     let codec_labels: Vec<&'static str> = CodecPref::ALL.iter().map(|c| c.label()).collect();
     let open_mode_labels: Vec<&'static str> = HomeOpenMode::ALL.iter().map(|m| m.label()).collect();
-    let opacity_pct = (settings.danmaku_opacity * 100.0).round().clamp(10.0, 100.0) as i32;
+    let opacity_pct = (settings.danmaku_opacity * 100.0)
+        .round()
+        .clamp(10.0, 100.0) as i32;
+    let font_scale_pct = (settings.danmaku_font_scale * 100.0)
+        .round()
+        .clamp(50.0, 200.0) as i32;
 
     let effective_qn = settings.quality.effective_max_qn(is_vip);
     let qn_hint = if settings.quality.qn() > effective_qn {
@@ -91,6 +98,93 @@ pub fn settings_page(
                     next.danmaku_max_lanes = lanes;
                     cb.call(next);
                 }
+            }
+        }
+    };
+
+    let on_font = {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |index: Option<usize>| {
+            if let Some((family, _)) = index.and_then(|idx| DANMAKU_FONTS.get(idx))
+                && *family != base.danmaku_font_family
+            {
+                let mut next = base.clone();
+                next.danmaku_font_family = (*family).to_string();
+                cb.call(next);
+            }
+        }
+    };
+
+    let on_font_scale = {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |val: f64| {
+            let scale = (val / 100.0).clamp(0.5, 2.0) as f32;
+            if (scale - base.danmaku_font_scale).abs() > f32::EPSILON {
+                let mut next = base.clone();
+                next.danmaku_font_scale = scale;
+                cb.call(next);
+            }
+        }
+    };
+
+    // 弹幕屏蔽类型四选(网页版弹幕设置对齐):get/set 函数对生成回调。
+    let mk_block_cb = |get: fn(&AppSettings) -> bool, set: fn(&mut AppSettings, bool)| {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |checked: Option<bool>| {
+            let Some(on) = checked else {
+                return;
+            };
+            if on != get(&base) {
+                let mut next = base.clone();
+                set(&mut next, on);
+                cb.call(next);
+            }
+        }
+    };
+    let on_block_scroll =
+        mk_block_cb(|s| s.danmaku_block_scroll, |s, v| s.danmaku_block_scroll = v);
+    let on_block_bottom =
+        mk_block_cb(|s| s.danmaku_block_bottom, |s, v| s.danmaku_block_bottom = v);
+    let on_block_top = mk_block_cb(|s| s.danmaku_block_top, |s, v| s.danmaku_block_top = v);
+    let on_block_color =
+        mk_block_cb(|s| s.danmaku_block_color, |s, v| s.danmaku_block_color = v);
+
+    let on_filter_rules = {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |text: Rc<str>| {
+            if text.as_ref() != base.danmaku_filter_rules {
+                let mut next = base.clone();
+                next.danmaku_filter_rules = text.to_string();
+                cb.call(next);
+            }
+        }
+    };
+
+    let on_repeat = {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |on: bool| {
+            if on != base.danmaku_block_repeat {
+                let mut next = base.clone();
+                next.danmaku_block_repeat = on;
+                cb.call(next);
+            }
+        }
+    };
+
+    let on_weight = {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |val: f64| {
+            let level = val.round().clamp(0.0, 10.0) as u32;
+            if level != base.danmaku_weight_min {
+                let mut next = base.clone();
+                next.danmaku_weight_min = level;
+                cb.call(next);
             }
         }
     };
@@ -212,6 +306,25 @@ pub fn settings_page(
             .value(f64::from(opacity_pct))
             .on_value_changed(on_opacity)
             .into(),
+        ComboBox::new()
+            .header("弹幕字体")
+            .items_source(DANMAKU_FONTS.iter().map(|(_, label)| (*label).to_string()))
+            .selected_index(
+                DANMAKU_FONTS
+                    .iter()
+                    .position(|(family, _)| *family == settings.danmaku_font_family)
+                    .unwrap_or(0),
+            )
+            .on_selection_changed(on_font)
+            .into(),
+        Slider::new()
+            .header(format!("弹幕字号 {}%", font_scale_pct))
+            .minimum(50.0)
+            .maximum(200.0)
+            .step_frequency(10.0)
+            .value(f64::from(font_scale_pct))
+            .on_value_changed(on_font_scale)
+            .into(),
         NumberBox::new()
             .header("弹幕轨道上限")
             .minimum(1.0)
@@ -220,6 +333,59 @@ pub fn settings_page(
             .spin_button_placement_mode(NumberBoxSpinButtonPlacementMode::Inline)
             .value(settings.danmaku_max_lanes as f64)
             .on_value_changed(on_lanes)
+            .into(),
+        // 弹幕屏蔽(网页版弹幕设置对齐):类型四选 + 规则 + 去重 + 智能权重。
+        StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(16.0)
+            .children([
+                CheckBox::new()
+                    .content("滚动")
+                    .is_checked(settings.danmaku_block_scroll)
+                    .on_is_checked_changed(on_block_scroll.clone())
+                    .into(),
+                CheckBox::new()
+                    .content("顶部")
+                    .is_checked(settings.danmaku_block_top)
+                    .on_is_checked_changed(on_block_top.clone())
+                    .into(),
+                CheckBox::new()
+                    .content("底部")
+                    .is_checked(settings.danmaku_block_bottom)
+                    .on_is_checked_changed(on_block_bottom.clone())
+                    .into(),
+                CheckBox::new()
+                    .content("彩色")
+                    .is_checked(settings.danmaku_block_color)
+                    .on_is_checked_changed(on_block_color.clone())
+                    .into(),
+            ])
+            .into(),
+        TextBox::new()
+            .header("弹幕屏蔽词(每行一条;re: 前缀=正则,u: 前缀=用户)")
+            .accepts_return(true)
+            .placeholder_text("前方高能\nre:^\\d+$\nu:abcd1234")
+            .text(settings.danmaku_filter_rules.as_str())
+            .height(96.0)
+            .on_text_changed(on_filter_rules)
+            .into(),
+        ToggleSwitch::new()
+            .header("过滤重复弹幕")
+            .on_content("开")
+            .off_content("关")
+            .is_on(settings.danmaku_block_repeat)
+            .on_toggled(on_repeat)
+            .into(),
+        Slider::new()
+            .header(format!(
+                "智能屏蔽等级 {}(0=关)",
+                settings.danmaku_weight_min
+            ))
+            .minimum(0.0)
+            .maximum(10.0)
+            .step_frequency(1.0)
+            .value(f64::from(settings.danmaku_weight_min))
+            .on_value_changed(on_weight)
             .into(),
         Button::new()
             .content("Panic!")
@@ -258,12 +424,10 @@ pub fn settings_page(
         .content(
             Border::new()
                 .padding(Thickness::new(pad_x, pad_top, pad_x, 36.0))
-                .content(
-                    StackPanel::new().spacing(16.0).children((
-                        theme::page_header_sized("设置", qn_hint, layout.page_title_size()),
-                        cards_body,
-                    )),
-                ),
+                .content(StackPanel::new().spacing(16.0).children((
+                    theme::page_header_sized("设置", qn_hint, layout.page_title_size()),
+                    cards_body,
+                ))),
         )
         .into()
 }

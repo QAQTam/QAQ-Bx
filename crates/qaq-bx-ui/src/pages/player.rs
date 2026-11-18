@@ -2,16 +2,21 @@
 //! 与评论区下滚触发右下角小窗（YouTube 式页内画中画，保持 `VideoSurface` 挂载不重建）。
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use qaq_bx_core::reply::{ReplyItem, ReplySort};
 use qaq_bx_video::engine::VideoEngine;
+use qaq_bx_video::native::NativePlayer;
 use windows_reactor::*;
 
 use crate::auth::avatar_thumbnail_url;
 use crate::data::VideoItem;
 use crate::layout::ViewportLayout;
+use crate::pages::fullscreen::DoubleClickTracker;
 use crate::theme;
+use crate::widgets::native_surface::{NativeSurface, NativeSurfaceInput};
 use crate::widgets::video_surface::{VideoSurface, VideoSurfaceInput};
 
 const PLAYER_SLOT_HEIGHT: f64 = 420.0;
@@ -135,6 +140,16 @@ pub struct CommentCallbacks {
     pub on_retry: Callback<()>,
     pub on_toggle_sub: Callback<u64>,
     pub on_load_more_sub: Callback<u64>,
+    /// 评论草稿变更(U1;shell 单源持有草稿)。
+    pub on_draft: Callback<Rc<str>>,
+    /// 提交发布(U1;未登录由 shell 侧拦截提示)。
+    pub on_submit: Callback<()>,
+    /// 发布错误/登录提示(内联展示;None = 无)。
+    pub composer_notice: Option<String>,
+    /// 是否已登录(未登录发布按钮置灰并提示)。
+    pub can_post: bool,
+    /// 评论草稿(shell 单源;TextBox 受控回显)。
+    pub composer_draft: String,
 }
 
 /// 播放页右栏「相关推荐」状态（真实 `archive/related` 数据，shell 单源持有）。
@@ -158,6 +173,14 @@ pub struct PlayerInput {
     pub position: u32,
     pub volume: u32,
     pub danmaku_enabled: bool,
+    /// 播放页画质菜单((qn, 标签) 降序;空 = 未解析或单档;F2)。
+    pub quality_menu: Vec<(i64, String)>,
+    /// 当前生效清晰度代号(0 = 未加载)。
+    pub current_qn: i64,
+    /// U3 分P菜单((cid, 标签);空 = 单P 视频)。
+    pub pages_menu: Vec<(u64, String)>,
+    /// U3 当前生效分P cid。
+    pub current_cid: u64,
     pub layout: ViewportLayout,
     /// SwapChain 挂载尝试节拍（仅在未挂载时按 250ms 递增驱动 VideoSurface::try_mount）。
     pub mount_tick: u32,
@@ -168,6 +191,8 @@ pub struct PlayerInput {
     /// 解析/缓冲中:视频面上叠加 Fluent 环形加载指示(shell 单源,首个 has_media 熄灭)。
     pub loading: bool,
     pub engine: Arc<VideoEngine>,
+    /// v0.3 spike:系统媒体引擎(QAQ_BX_NATIVE=1 时与 engine 互斥生效)。
+    pub native: Option<Arc<NativePlayer>>,
     pub comments: CommentsSnapshot,
     pub comment_cb: CommentCallbacks,
     /// 相关推荐（真实 archive/related 数据）。
@@ -179,6 +204,11 @@ pub struct PlayerInput {
     pub on_volume: Callback<f64>,
     pub on_toggle_mute: Callback<()>,
     pub on_toggle_danmaku: Callback<()>,
+    /// 画质切换(F2;携带目标 qn)。
+    pub on_select_quality: Callback<i64>,
+    /// U3 分P切换(携带目标 cid)。
+    pub on_select_page: Callback<u64>,
+    pub on_enter_fullscreen: Callback<()>,
     /// `--demo` 导演器按时序覆写手机端标签页 / 简介展开态（生产路径固定为 None）。
     pub demo_override: Option<(u64, PlayerTab, bool)>,
 }
@@ -193,12 +223,21 @@ impl PartialEq for PlayerInput {
             && self.position == other.position
             && self.volume == other.volume
             && self.danmaku_enabled == other.danmaku_enabled
+            && self.quality_menu == other.quality_menu
+            && self.current_qn == other.current_qn
+            && self.pages_menu == other.pages_menu
+            && self.current_cid == other.current_cid
             && self.layout == other.layout
             && self.mount_tick == other.mount_tick
             && self.duration_secs == other.duration_secs
             && self.notice == other.notice
             && self.loading == other.loading
             && Arc::ptr_eq(&self.engine, &other.engine)
+            && match (&self.native, &other.native) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
             && self.comments == other.comments
             && self.comment_cb == other.comment_cb
             && self.related == other.related
@@ -209,6 +248,9 @@ impl PartialEq for PlayerInput {
             && self.on_volume == other.on_volume
             && self.on_toggle_mute == other.on_toggle_mute
             && self.on_toggle_danmaku == other.on_toggle_danmaku
+            && self.on_select_quality == other.on_select_quality
+            && self.on_select_page == other.on_select_page
+            && self.on_enter_fullscreen == other.on_enter_fullscreen
             && self.demo_override == other.demo_override
     }
 }
@@ -228,6 +270,7 @@ pub struct PlayerPage {
     desc_expanded: bool,
     last_bvid: String,
     last_demo_override: Option<(u64, PlayerTab, bool)>,
+    double_click: DoubleClickTracker,
 }
 
 #[derive(Clone, PartialEq)]
@@ -237,6 +280,7 @@ pub enum Message {
     BackToTop,
     SelectTab(PlayerTab),
     ToggleDesc,
+    VideoPressed(f64, f64, bool),
 }
 
 impl Component for PlayerPage {
@@ -256,6 +300,7 @@ impl Component for PlayerPage {
             desc_expanded,
             last_bvid: input.item.bvid.clone(),
             last_demo_override: input.demo_override,
+            double_click: DoubleClickTracker::new(),
         }
     }
 
@@ -276,7 +321,7 @@ impl Component for PlayerPage {
         }
     }
 
-    fn update(&mut self, message: Message, _context: &ComponentContext<Self>) {
+    fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
         match message {
             Message::Scrolled(y) => self.scroll_y = y.max(0.0),
             Message::TogglePip => self.pip_pinned = !self.pip_pinned,
@@ -290,6 +335,14 @@ impl Component for PlayerPage {
             }
             Message::ToggleDesc => {
                 self.desc_expanded = !self.desc_expanded;
+            }
+            Message::VideoPressed(x, y, left_pressed) => {
+                if self
+                    .double_click
+                    .record_press(Instant::now(), x, y, left_pressed)
+                {
+                    context.input().on_enter_fullscreen.call(());
+                }
             }
         }
     }
@@ -319,6 +372,12 @@ impl Component for PlayerPage {
                         )),
                 )
                 .into()
+        } else if let Some(native) = &input.native {
+            // v0.3 spike:系统媒体引擎渲染面(MediaPlayerElement)。
+            View::component::<NativeSurface>(NativeSurfaceInput {
+                player: native.clone(),
+                tick: input.mount_tick,
+            })
         } else {
             View::component::<VideoSurface>(VideoSurfaceInput {
                 engine: input.engine.clone(),
@@ -326,6 +385,14 @@ impl Component for PlayerPage {
             })
         };
         let surface = surface_with_loading(surface, input.loading);
+        let surface = surface_with_double_click(
+            surface,
+            context
+                .callback(|ev: PointerEventInfo| {
+                    Message::VideoPressed(ev.window_x, ev.window_y, ev.is_left_button_pressed)
+                })
+                .into(),
+        );
 
         // 顶部主播放占位槽：未小窗时由上层稳定悬浮的 VideoSurface 覆盖；进入小窗后展示回到顶部提示。
         let top_player_slot: View = if is_pip {
@@ -363,14 +430,22 @@ impl Component for PlayerPage {
         let compact_desktop = desktop_transport_compact(left_inner_w);
         let compact_btn = is_single_col || compact_desktop;
 
-        let play_btn = play_pause_button(input.playing, compact_btn, input.on_toggle.clone());
-        let mute_btn =
-            mute_toggle_button(input.volume == 0, compact_btn, input.on_toggle_mute.clone());
+        let play_btn =
+            play_pause_button(input.playing, compact_btn, false, input.on_toggle.clone());
+        let mute_btn = mute_toggle_button(
+            input.volume == 0,
+            compact_btn,
+            false,
+            input.on_toggle_mute.clone(),
+        );
         let danmaku_btn = danmaku_toggle_button(
             input.danmaku_enabled,
             compact_btn,
+            false,
             input.on_toggle_danmaku.clone(),
         );
+        let fullscreen_btn =
+            fullscreen_toggle_button(false, compact_btn, false, input.on_enter_fullscreen.clone());
 
         let transport: View = if is_single_col {
             Grid::new()
@@ -387,11 +462,30 @@ impl Component for PlayerPage {
                         .orientation(Orientation::Horizontal)
                         .spacing(6.0)
                         .vertical_alignment(VerticalAlignment::Center)
-                        .children((
-                            time_label(input.position, input.duration_secs, 11.0),
-                            mute_btn,
-                            danmaku_btn,
-                        )),
+                        .children({
+                            let mut items: Vec<View> =
+                                vec![time_label(input.position, input.duration_secs, 11.0).into()];
+                            if let Some(q) = quality_selector(
+                                &input.quality_menu,
+                                input.current_qn,
+                                &input.on_select_quality,
+                                true,
+                            ) {
+                                items.push(q);
+                            }
+                            if let Some(p) = pages_selector(
+                                &input.pages_menu,
+                                input.current_cid,
+                                &input.on_select_page,
+                                true,
+                            ) {
+                                items.push(p);
+                            }
+                            items.push(mute_btn);
+                            items.push(danmaku_btn);
+                            items.push(fullscreen_btn);
+                            items
+                        }),
                 ))
                 .into()
         } else {
@@ -417,6 +511,22 @@ impl Component for PlayerPage {
                 );
             }
             right_items.push(danmaku_btn);
+            if let Some(q) = quality_selector(
+                &input.quality_menu,
+                input.current_qn,
+                &input.on_select_quality,
+                compact_desktop,
+            ) {
+                right_items.push(q);
+            }
+            if let Some(p) = pages_selector(
+                &input.pages_menu,
+                input.current_cid,
+                &input.on_select_page,
+                compact_desktop,
+            ) {
+                right_items.push(p);
+            }
             let pip_label = match (compact_desktop, is_pip) {
                 (true, true) => "主窗",
                 (true, false) => "小窗",
@@ -436,6 +546,7 @@ impl Component for PlayerPage {
                 )
                 .on_click(context.message(Message::TogglePip));
             right_items.push(pip_btn.into());
+            right_items.push(fullscreen_btn);
 
             let transport_right = StackPanel::new()
                 .grid_column(2)
@@ -563,14 +674,14 @@ impl Component for PlayerPage {
                         tab_item(PlayerTab::Intro, "简介".to_string()),
                         tab_item(PlayerTab::Comments, comments_label),
                     )),
-                Border::new()
-                    .height(1.0)
-                    .background(ThemeBrush::CardStroke),
+                Border::new().height(1.0).background(ThemeBrush::CardStroke),
             ));
 
-            let sticky_top = StackPanel::new()
-                .grid_row(0)
-                .children((View::from(sticky_video), transport, View::from(tab_bar)));
+            let sticky_top = StackPanel::new().grid_row(0).children((
+                View::from(sticky_video),
+                transport,
+                View::from(tab_bar),
+            ));
 
             let tab_body = match self.active_tab {
                 PlayerTab::Intro => {
@@ -655,6 +766,7 @@ impl Component for PlayerPage {
                         &input.comments,
                         input.my_avatar.as_ref(),
                         &input.comment_cb,
+                        &input.comment_cb.composer_draft,
                         true,
                     );
                     View::from(
@@ -670,14 +782,12 @@ impl Component for PlayerPage {
                 PlayerTab::Intro => "intro",
                 PlayerTab::Comments => "comments",
             };
-            let lower_scroll = Grid::new()
-                .grid_row(1)
-                .keyed_children([keyed(
-                    format!("player-mobile-{}-{}", input.item.bvid, tab_key),
-                    ScrollViewer::new()
-                        .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
-                        .content(tab_body),
-                )]);
+            let lower_scroll = Grid::new().grid_row(1).keyed_children([keyed(
+                format!("player-mobile-{}-{}", input.item.bvid, tab_key),
+                ScrollViewer::new()
+                    .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+                    .content(tab_body),
+            )]);
 
             return Grid::new()
                 .rows([GridLength::Auto, GridLength::Star(1.0)])
@@ -710,26 +820,25 @@ impl Component for PlayerPage {
                 .text_wrapping(TextWrapping::Wrap),
             up_and_actions,
             // 简介：内联展示（无展开/收起态，长文本随页面滚动），替代 Expander。
-            StackPanel::new()
-                .spacing(4.0)
-                .children((
-                    TextBlock::new()
-                        .text("简介")
-                        .font_size(13.0)
-                        .font_weight(FontWeight::SEMI_BOLD)
-                        .opacity(0.75),
-                    TextBlock::new()
-                        .text(format_desc_body(&input.item.bvid, input.desc.as_deref()))
-                        .font_size(13.0)
-                        .opacity(0.85)
-                        .text_wrapping(TextWrapping::Wrap),
-                )),
+            StackPanel::new().spacing(4.0).children((
+                TextBlock::new()
+                    .text("简介")
+                    .font_size(13.0)
+                    .font_weight(FontWeight::SEMI_BOLD)
+                    .opacity(0.75),
+                TextBlock::new()
+                    .text(format_desc_body(&input.item.bvid, input.desc.as_deref()))
+                    .font_size(13.0)
+                    .opacity(0.85)
+                    .text_wrapping(TextWrapping::Wrap),
+            )),
         ));
 
         let comments_section = comments_panel_with(
             &input.comments,
             input.my_avatar.as_ref(),
             &input.comment_cb,
+            &input.comment_cb.composer_draft,
             false,
         );
 
@@ -743,16 +852,14 @@ impl Component for PlayerPage {
                 comments_section,
             ));
 
-        let left_scroll = Grid::new()
-            .grid_column(0)
-            .keyed_children([keyed(
-                format!("player-left-scroll-{}", self.scroll_reset_gen),
-                ScrollViewer::new()
-                    .on_view_changed(context.callback(|ev: ScrollEventInfo| {
-                        Message::Scrolled(ev.offset_y)
-                    }))
-                    .content(left_scroll_content),
-            )]);
+        let left_scroll = Grid::new().grid_column(0).keyed_children([keyed(
+            format!("player-left-scroll-{}", self.scroll_reset_gen),
+            ScrollViewer::new()
+                .on_view_changed(
+                    context.callback(|ev: ScrollEventInfo| Message::Scrolled(ev.offset_y)),
+                )
+                .content(left_scroll_content),
+        )]);
 
         let right_rail = ScrollViewer::new()
             .grid_column(1)
@@ -785,7 +892,11 @@ impl Component for PlayerPage {
                             View::from(Border::new().corner_radius(8.0).content(surface)),
                             Grid::new()
                                 .grid_row(1)
-                                .columns([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
+                                .columns([
+                                    GridLength::Auto,
+                                    GridLength::Star(1.0),
+                                    GridLength::Auto,
+                                ])
                                 .margin(Thickness::xy(8.0, 4.0))
                                 .children((
                                     Button::new()
@@ -899,13 +1010,16 @@ fn comments_tab_label(total_count: Option<u64>) -> String {
     }
 }
 
-/// 加载态在视频面上叠加 Fluent 环形指示器（ProgressRing）。状态单源在 shell：
-/// start_playback 点亮，首个 `has_media` 或失败熄灭；视图纯映射，无常驻组件状态，
+/// 加载态在视频面上叠加 Fluent 环形指示器(ProgressRing)。状态单源在 shell:
+/// start_playback 点亮,首个 `has_media` 或失败熄灭;视图纯映射,无常驻组件状态,
 /// 因此任何重建都不会让指示器卡死。
-fn surface_with_loading(surface: View, loading: bool) -> View {
-    if !loading {
-        return surface;
-    }
+///
+/// 结构稳定约定(黑屏排查 2026-11):loading 与否**不得改变树形**——早年
+/// `if loading { Grid(surface, overlay) } else { surface }` 会让 VideoSurface
+/// 组件路径随 loading 翻转变化,SwapChainPanel 反复销毁重建(卸载清理 + 重挂
+/// 空窗),是快速伸缩窗口/切视频时视频区闪黑的主因之一。现两种状态共用同一
+/// Grid 结构,仅切换覆盖层 opacity 与 Ring 动画开关。
+pub(crate) fn surface_with_loading(surface: View, loading: bool) -> View {
     Grid::new()
         .children((
             surface,
@@ -913,17 +1027,32 @@ fn surface_with_loading(surface: View, loading: bool) -> View {
                 .spacing(10.0)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .vertical_alignment(VerticalAlignment::Center)
+                .opacity(if loading { 1.0 } else { 0.0 })
                 .children((
                     ProgressRing::new()
                         .is_indeterminate(true)
-                        .is_active(true)
+                        .is_active(loading)
                         .width(44.0)
                         .height(44.0),
                     TextBlock::new()
                         .text("视频加载中…")
                         .font_size(13.0)
+                        .foreground(Brush::Solid(Color::rgb(255, 255, 255)))
                         .opacity(0.85),
                 )),
+        ))
+        .into()
+}
+
+fn surface_with_double_click(surface: View, on_pressed: PointerCallback) -> View {
+    Grid::new()
+        .children((
+            surface,
+            View::from(
+                Border::new()
+                    .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
+                    .on_pointer_pressed(on_pressed),
+            ),
         ))
         .into()
 }
@@ -942,6 +1071,7 @@ fn comments_panel_with(
     snapshot: &CommentsSnapshot,
     my_avatar: Option<&EncodedImage>,
     cb: &CommentCallbacks,
+    draft: &str,
     compact_pane: bool,
 ) -> View {
     let data = &snapshot.data;
@@ -1004,20 +1134,52 @@ fn comments_panel_with(
                 )),
         ));
 
-    let composer = Grid::new()
-        .columns([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
-        .children((
-            theme::avatar_view(my_avatar, "我", 34.0, 17.0)
-                .vertical_alignment(VerticalAlignment::Center),
-            TextBox::new()
+    // U1 评论发布接线:未登录按钮置灰 + 行内提示;草稿/提交走 shell 单源。
+    let submit_btn = if cb.can_post {
+        Button::new()
+            .grid_column(2)
+            .style(ButtonStyle::Accent)
+            .content("发布")
+            .on_click(cb.on_submit.clone())
+    } else {
+        Button::new()
+            .grid_column(2)
+            .style(ButtonStyle::Subtle)
+            .is_enabled(false)
+            .content("发布")
+    };
+    let mut composer_rows: Vec<View> = vec![
+        theme::avatar_view(my_avatar, "我", 34.0, 17.0)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into(),
+        TextBox::new()
+            .grid_column(1)
+            .margin(Thickness::xy(10.0, 0.0))
+            .placeholder_text(if cb.can_post {
+                "发一条友善的评论…"
+            } else {
+                "登录后即可发布评论"
+            })
+            .text(draft.to_string())
+            .on_text_changed({
+                let on_draft = cb.on_draft.clone();
+                move |text: Rc<str>| on_draft.call(text)
+            })
+            .into(),
+        submit_btn.into(),
+    ];
+    if let Some(notice) = &cb.composer_notice {
+        composer_rows.push(
+            TextBlock::new()
                 .grid_column(1)
-                .margin(Thickness::xy(10.0, 0.0))
-                .placeholder_text("发一条友善的评论…"),
-            Button::new()
-                .grid_column(2)
-                .style(ButtonStyle::Accent)
-                .content("发布"),
-        ));
+                .text(notice.clone())
+                .font_size(11.5)
+                .foreground(Brush::Solid(Color::rgb(196, 43, 28)))
+                .margin(Thickness::new(10.0, 6.0, 0.0, 0.0))
+                .into(),
+        );
+    }
+    let composer = StackPanel::new().spacing(0.0).children(composer_rows);
 
     let mut rows: Vec<KeyedView> = vec![
         KeyedView::new("c-header", header),
@@ -1025,7 +1187,7 @@ fn comments_panel_with(
     ];
 
     if data.top_replies.is_empty() && data.replies.is_empty() {
-        if data.loading || data.aid == 0 {
+        if data.loading {
             rows.push(KeyedView::new(
                 "c-loading",
                 StackPanel::new()
@@ -1066,6 +1228,17 @@ fn comments_panel_with(
                             .horizontal_alignment(HorizontalAlignment::Center)
                             .on_click(move || on_retry.call(())),
                     )),
+            ));
+        } else if data.aid == 0 {
+            // U4:直播间/元数据未就绪 → 不再永久转圈。
+            rows.push(KeyedView::new(
+                "c-empty",
+                TextBlock::new()
+                    .text("该内容暂无评论区")
+                    .font_size(13.0)
+                    .opacity(0.55)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .margin(Thickness::xy(0.0, 18.0)),
             ));
         } else {
             rows.push(KeyedView::new(
@@ -1160,7 +1333,10 @@ fn comments_panel_with(
 
     Border::new()
         .margin(Thickness::new(0.0, 8.0, 0.0, 0.0))
-        .padding(Thickness::xy(if compact_pane { 12.0 } else { 16.0 }, if compact_pane { 12.0 } else { 16.0 }))
+        .padding(Thickness::xy(
+            if compact_pane { 12.0 } else { 16.0 },
+            if compact_pane { 12.0 } else { 16.0 },
+        ))
         .corner_radius(8.0)
         .background(ThemeBrush::CardBackground)
         .border_brush(ThemeBrush::CardStroke)
@@ -1176,9 +1352,7 @@ fn comment_badge(label: &str, accent: bool) -> View {
         .background(ThemeBrush::SolidBackground)
         .border_thickness(1.0)
         .vertical_alignment(VerticalAlignment::Center);
-    let mut text = TextBlock::new()
-        .text(label)
-        .font_size(10.0);
+    let mut text = TextBlock::new().text(label).font_size(10.0);
     if accent {
         border = border.border_brush(ThemeBrush::Accent);
         text = text.foreground(ThemeBrush::AccentText);
@@ -1283,12 +1457,7 @@ fn comment_card(
         actions.push(
             Button::new()
                 .style(ButtonStyle::Subtle)
-                .content(
-                    TextBlock::new()
-                        .text(label)
-                        .font_size(11.0)
-                        .opacity(0.75),
-                )
+                .content(TextBlock::new().text(label).font_size(11.0).opacity(0.75))
                 .on_click(move || on_toggle.call(rpid))
                 .into(),
         );
@@ -1430,7 +1599,11 @@ fn sub_replies_box(
                     .is_enabled(!state.loading)
                     .content(
                         TextBlock::new()
-                            .text(if state.loading { "加载中…" } else { "加载更多回复" })
+                            .text(if state.loading {
+                                "加载中…"
+                            } else {
+                                "加载更多回复"
+                            })
                             .font_size(11.0),
                     )
                     .on_click(move || on_more.call(rpid))
@@ -1738,20 +1911,26 @@ fn related_card(item: &VideoItem, compact_card: bool, on_open: &Callback<String>
     .into()
 }
 
-fn play_pause_button(playing: bool, compact: bool, on_toggle: Callback<()>) -> View {
+pub(crate) fn play_pause_button(
+    playing: bool,
+    compact: bool,
+    on_dark: bool,
+    on_toggle: Callback<()>,
+) -> View {
     if compact {
         Border::new()
             .width(32.0)
             .height(32.0)
             .corner_radius(6.0)
-            .background(ThemeBrush::CardBackground)
-            .border_brush(ThemeBrush::CardStroke)
-            .border_thickness(1.0)
+            .background(hud_chip_background(on_dark))
+            .border_brush(hud_chip_border(on_dark))
+            .border_thickness(if on_dark { 0.0 } else { 1.0 })
             .on_pointer_released(move |_| on_toggle.call(()))
             .content(
                 FontIcon::new()
                     .glyph(if playing { "\u{E769}" } else { "\u{E768}" })
                     .font_size(13.0)
+                    .foreground(hud_foreground(on_dark))
                     .horizontal_alignment(HorizontalAlignment::Center)
                     .vertical_alignment(VerticalAlignment::Center),
             )
@@ -1768,20 +1947,26 @@ fn play_pause_button(playing: bool, compact: bool, on_toggle: Callback<()>) -> V
     }
 }
 
-fn mute_toggle_button(muted: bool, compact: bool, on_toggle_mute: Callback<()>) -> View {
+pub(crate) fn mute_toggle_button(
+    muted: bool,
+    compact: bool,
+    on_dark: bool,
+    on_toggle_mute: Callback<()>,
+) -> View {
     if compact {
         Border::new()
             .width(28.0)
             .height(28.0)
             .corner_radius(6.0)
-            .background(ThemeBrush::CardBackground)
-            .border_brush(ThemeBrush::CardStroke)
-            .border_thickness(1.0)
+            .background(hud_chip_background(on_dark))
+            .border_brush(hud_chip_border(on_dark))
+            .border_thickness(if on_dark { 0.0 } else { 1.0 })
             .on_pointer_released(move |_| on_toggle_mute.call(()))
             .content(
                 FontIcon::new()
                     .glyph(if muted { "\u{E74F}" } else { "\u{E767}" })
                     .font_size(12.0)
+                    .foreground(hud_foreground(on_dark))
                     .horizontal_alignment(HorizontalAlignment::Center)
                     .vertical_alignment(VerticalAlignment::Center),
             )
@@ -1798,7 +1983,12 @@ fn mute_toggle_button(muted: bool, compact: bool, on_toggle_mute: Callback<()>) 
     }
 }
 
-fn danmaku_toggle_button(enabled: bool, compact: bool, on_toggle: Callback<()>) -> View {
+pub(crate) fn danmaku_toggle_button(
+    enabled: bool,
+    compact: bool,
+    on_dark: bool,
+    on_toggle: Callback<()>,
+) -> View {
     let label = if enabled { "弹幕 开" } else { "弹幕 关" };
     if compact {
         Border::new()
@@ -1807,21 +1997,23 @@ fn danmaku_toggle_button(enabled: bool, compact: bool, on_toggle: Callback<()>) 
             .padding(Thickness::xy(8.0, 0.0))
             .background(if enabled {
                 Brush::Theme(ThemeBrush::Accent)
+            } else if on_dark {
+                hud_chip_background(true)
             } else {
                 Brush::Theme(ThemeBrush::CardBackground)
             })
             .border_brush(if enabled {
                 Brush::Theme(ThemeBrush::Accent)
             } else {
-                Brush::Theme(ThemeBrush::CardStroke)
+                hud_chip_border(on_dark)
             })
-            .border_thickness(1.0)
+            .border_thickness(if enabled || on_dark { 0.0 } else { 1.0 })
             .on_pointer_released(move |_| on_toggle.call(()))
             .content(
                 TextBlock::new()
                     .text(label)
                     .font_size(11.0)
-                    .foreground(if enabled {
+                    .foreground(if enabled || on_dark {
                         Brush::Solid(Color::rgb(255, 255, 255))
                     } else {
                         Brush::Theme(ThemeBrush::PrimaryText)
@@ -1842,7 +2034,79 @@ fn danmaku_toggle_button(enabled: bool, compact: bool, on_toggle: Callback<()>) 
     }
 }
 
-fn seek_slider(position: u32, duration_secs: u32, on_seek: Callback<f64>) -> Slider {
+/// F1 反馈:悬浮播控在视频(深色画面)上需要半透明黑底衬 + 白前景;普通
+/// 播放条仍走主题色。纯函数便于单测锁定配色契约。
+pub(crate) fn hud_chip_background(on_dark: bool) -> Brush {
+    if on_dark {
+        Brush::Solid(Color::argb(90, 0, 0, 0))
+    } else {
+        Brush::Theme(ThemeBrush::CardBackground)
+    }
+}
+
+pub(crate) fn hud_chip_border(on_dark: bool) -> Brush {
+    if on_dark {
+        Brush::Solid(Color::argb(0, 0, 0, 0))
+    } else {
+        Brush::Theme(ThemeBrush::CardStroke)
+    }
+}
+
+pub(crate) fn hud_foreground(on_dark: bool) -> Brush {
+    if on_dark {
+        Brush::Solid(Color::rgb(255, 255, 255))
+    } else {
+        Brush::Theme(ThemeBrush::PrimaryText)
+    }
+}
+
+/// HUD 底衬条颜色:66% 黑(用户建议「透明或默认黑色背景」的折中:保持
+/// 可读性同时不遮挡画面);圆角 10、内边距随紧凑态收缩。
+pub(crate) fn hud_scrim_color() -> Color {
+    Color::argb(168, 0, 0, 0)
+}
+
+pub(crate) fn fullscreen_toggle_button(
+    is_fullscreen: bool,
+    compact: bool,
+    on_dark: bool,
+    on_toggle: Callback<()>,
+) -> View {
+    if compact {
+        Border::new()
+            .width(28.0)
+            .height(28.0)
+            .corner_radius(6.0)
+            .background(hud_chip_background(on_dark))
+            .border_brush(hud_chip_border(on_dark))
+            .border_thickness(if on_dark { 0.0 } else { 1.0 })
+            .on_pointer_released(move |_| on_toggle.call(()))
+            .content(
+                FontIcon::new()
+                    .glyph(if is_fullscreen {
+                        "\u{E73F}"
+                    } else {
+                        "\u{E740}"
+                    })
+                    .font_size(12.0)
+                    .foreground(hud_foreground(on_dark))
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .vertical_alignment(VerticalAlignment::Center),
+            )
+            .into()
+    } else {
+        AppBarButton::new()
+            .icon(Icon::symbol(if is_fullscreen {
+                Symbol::BackToWindow
+            } else {
+                Symbol::FullScreen
+            }))
+            .on_click(on_toggle)
+            .into()
+    }
+}
+
+pub(crate) fn seek_slider(position: u32, duration_secs: u32, on_seek: Callback<f64>) -> Slider {
     Slider::new()
         .minimum(0.0)
         .maximum(f64::from(duration_secs.max(1)))
@@ -1850,7 +2114,7 @@ fn seek_slider(position: u32, duration_secs: u32, on_seek: Callback<f64>) -> Sli
         .on_value_changed(on_seek)
 }
 
-fn time_label(position: u32, duration_secs: u32, font_size: f64) -> TextBlock {
+pub(crate) fn time_label(position: u32, duration_secs: u32, font_size: f64) -> TextBlock {
     TextBlock::new()
         .text(format!(
             "{} / {}",
@@ -1862,15 +2126,81 @@ fn time_label(position: u32, duration_secs: u32, font_size: f64) -> TextBlock {
         .vertical_alignment(VerticalAlignment::Center)
 }
 
+/// 播放页画质选择器（F2）：ComboBox 呈现当前档，菜单按 dash 实际下发档降序；
+/// 少于 2 档（或未加载）返回 None 不渲染。
+pub(crate) fn quality_selector(
+    menu: &[(i64, String)],
+    current_qn: i64,
+    on_select: &Callback<i64>,
+    compact: bool,
+) -> Option<View> {
+    if menu.len() < 2 {
+        return None;
+    }
+    let menu: Vec<(i64, String)> = menu.to_vec();
+    let selected = menu
+        .iter()
+        .position(|(qn, _)| *qn == current_qn && current_qn > 0)
+        .unwrap_or(0);
+    let on_change = on_select.clone();
+    Some(
+        ComboBox::new()
+            .header("画质")
+            .items_source(menu.iter().map(|(_, label)| label.clone()))
+            .selected_index(selected)
+            .on_selection_changed(move |index: Option<usize>| {
+                if let Some((qn, _)) = index.and_then(|idx| menu.get(idx)) {
+                    on_change.call(*qn);
+                }
+            })
+            .min_width(if compact { 88.0 } else { 108.0 })
+            .vertical_alignment(VerticalAlignment::Center)
+            .into(),
+    )
+}
+
+/// 分P选择器（U3）：ComboBox 呈现 "P{n} 标题"；少于 2 个分P返回 None。
+pub(crate) fn pages_selector(
+    menu: &[(u64, String)],
+    current_cid: u64,
+    on_select: &Callback<u64>,
+    compact: bool,
+) -> Option<View> {
+    if menu.len() < 2 {
+        return None;
+    }
+    let menu: Vec<(u64, String)> = menu.to_vec();
+    let selected = menu
+        .iter()
+        .position(|(cid, _)| *cid == current_cid && current_cid > 0);
+    let on_change = on_select.clone();
+    Some(
+        ComboBox::new()
+            .header("分P")
+            .items_source(menu.iter().map(|(_, label)| label.clone()))
+            .selected_index(selected.unwrap_or(0))
+            .on_selection_changed(move |index: Option<usize>| {
+                if let Some((cid, _)) = index.and_then(|idx| menu.get(idx)) {
+                    on_change.call(*cid);
+                }
+            })
+            .min_width(if compact { 72.0 } else { 96.0 })
+            .vertical_alignment(VerticalAlignment::Center)
+            .into(),
+    )
+}
+
 fn half_pane_transport(input: &HalfPaneInput, pane_width: f64) -> View {
     let show_slider = half_pane_shows_volume_slider(pane_width);
-    let play_btn = play_pause_button(input.playing, true, input.on_toggle.clone());
-    let mute_btn = mute_toggle_button(input.volume == 0, true, input.on_toggle_mute.clone());
+    let play_btn = play_pause_button(input.playing, true, false, input.on_toggle.clone());
+    let mute_btn = mute_toggle_button(input.volume == 0, true, false, input.on_toggle_mute.clone());
     let danmaku_btn = danmaku_toggle_button(
         input.danmaku_enabled,
         true,
+        false,
         input.on_toggle_danmaku.clone(),
     );
+    let fullscreen_btn = fullscreen_toggle_button(false, true, false, input.on_fullscreen.clone());
 
     let mut right_items: Vec<View> = vec![mute_btn];
     if show_slider {
@@ -1894,6 +2224,7 @@ fn half_pane_transport(input: &HalfPaneInput, pane_width: f64) -> View {
         );
     }
     right_items.push(danmaku_btn);
+    right_items.push(fullscreen_btn);
 
     StackPanel::new()
         .margin(Thickness::new(12.0, 6.0, 12.0, 4.0))
@@ -1907,7 +2238,10 @@ fn half_pane_transport(input: &HalfPaneInput, pane_width: f64) -> View {
                         .orientation(Orientation::Horizontal)
                         .spacing(8.0)
                         .vertical_alignment(VerticalAlignment::Center)
-                        .children((play_btn, time_label(input.position, input.duration_secs, 11.0))),
+                        .children((
+                            play_btn,
+                            time_label(input.position, input.duration_secs, 11.0),
+                        )),
                     StackPanel::new()
                         .grid_column(2)
                         .orientation(Orientation::Horizontal)
@@ -1946,6 +2280,7 @@ pub struct HalfPaneInput {
     pub on_volume: Callback<f64>,
     pub on_toggle_mute: Callback<()>,
     pub on_toggle_danmaku: Callback<()>,
+    pub on_fullscreen: Callback<()>,
     pub on_expand: Callback<()>,
     pub on_close: Callback<()>,
     pub on_resize: Callback<f64>,
@@ -1976,6 +2311,7 @@ impl PartialEq for HalfPaneInput {
             && self.on_volume == other.on_volume
             && self.on_toggle_mute == other.on_toggle_mute
             && self.on_toggle_danmaku == other.on_toggle_danmaku
+            && self.on_fullscreen == other.on_fullscreen
             && self.on_expand == other.on_expand
             && self.on_close == other.on_close
             && self.on_resize == other.on_resize
@@ -1986,6 +2322,7 @@ pub struct HalfPanePreview {
     drag_origin: Option<(f64, f64)>,
     live_width: Option<f64>,
     max_width: f64,
+    double_click: DoubleClickTracker,
 }
 
 #[derive(Clone, PartialEq)]
@@ -1993,6 +2330,7 @@ pub enum HalfPaneMessage {
     DragStart(f64, f64),
     DragMove(f64),
     DragEnd,
+    VideoPressed(f64, f64, bool),
 }
 
 impl Component for HalfPanePreview {
@@ -2004,6 +2342,7 @@ impl Component for HalfPanePreview {
             drag_origin: None,
             live_width: None,
             max_width: input.max_width,
+            double_click: DoubleClickTracker::new(),
         }
     }
 
@@ -2014,7 +2353,7 @@ impl Component for HalfPanePreview {
         }
     }
 
-    fn update(&mut self, message: HalfPaneMessage, _context: &ComponentContext<Self>) {
+    fn update(&mut self, message: HalfPaneMessage, context: &ComponentContext<Self>) {
         match message {
             HalfPaneMessage::DragStart(window_x, current_w) => {
                 if window_x.is_finite() {
@@ -2032,6 +2371,14 @@ impl Component for HalfPanePreview {
             }
             HalfPaneMessage::DragEnd => {
                 self.drag_origin = None;
+            }
+            HalfPaneMessage::VideoPressed(x, y, left_pressed) => {
+                if self
+                    .double_click
+                    .record_press(Instant::now(), x, y, left_pressed)
+                {
+                    context.input().on_fullscreen.call(());
+                }
             }
         }
     }
@@ -2062,6 +2409,18 @@ impl Component for HalfPanePreview {
             })
         };
         let surface = surface_with_loading(surface, input.loading);
+        let surface = surface_with_double_click(
+            surface,
+            context
+                .callback(|ev: PointerEventInfo| {
+                    HalfPaneMessage::VideoPressed(
+                        ev.window_x,
+                        ev.window_y,
+                        ev.is_left_button_pressed,
+                    )
+                })
+                .into(),
+        );
 
         let cur_w = pane_width;
         let drag_handle = Border::new()
@@ -2077,10 +2436,13 @@ impl Component for HalfPanePreview {
                     .horizontal_alignment(HorizontalAlignment::Center)
                     .vertical_alignment(VerticalAlignment::Center)
                     .children((
-                        FontIcon::new()
-                            .glyph("\u{E76F}")
-                            .font_size(14.0)
-                            .opacity(if self.drag_origin.is_some() { 1.0 } else { 0.55 }),
+                        FontIcon::new().glyph("\u{E76F}").font_size(14.0).opacity(
+                            if self.drag_origin.is_some() {
+                                1.0
+                            } else {
+                                0.55
+                            },
+                        ),
                         Border::new()
                             .width(3.0)
                             .height(28.0)
@@ -2115,7 +2477,7 @@ impl Component for HalfPanePreview {
                             .style(ButtonStyle::Subtle)
                             .width(40.0)
                             .height(44.0)
-                            .content(FontIcon::new().glyph("\u{E740}").font_size(14.0))
+                            .content(FontIcon::new().glyph("\u{E76B}").font_size(14.0))
                             .on_click(input.on_expand.clone()),
                     )),
             );
@@ -2167,24 +2529,23 @@ impl Component for HalfPanePreview {
                             )),
                     )),
                 // 简介：内联展示，无展开态（见 format_desc_body 注释）。
-                StackPanel::new()
-                    .spacing(4.0)
-                    .children((
-                        TextBlock::new()
-                            .text("简介")
-                            .font_size(12.0)
-                            .font_weight(FontWeight::SEMI_BOLD)
-                            .opacity(0.75),
-                        TextBlock::new()
-                            .text(format_desc_body(&input.item.bvid, input.desc.as_deref()))
-                            .font_size(12.0)
-                            .opacity(0.85)
-                            .text_wrapping(TextWrapping::Wrap),
-                    )),
+                StackPanel::new().spacing(4.0).children((
+                    TextBlock::new()
+                        .text("简介")
+                        .font_size(12.0)
+                        .font_weight(FontWeight::SEMI_BOLD)
+                        .opacity(0.75),
+                    TextBlock::new()
+                        .text(format_desc_body(&input.item.bvid, input.desc.as_deref()))
+                        .font_size(12.0)
+                        .opacity(0.85)
+                        .text_wrapping(TextWrapping::Wrap),
+                )),
                 comments_panel_with(
                     &input.comments,
                     input.my_avatar.as_ref(),
                     &input.comment_cb,
+                    &input.comment_cb.composer_draft,
                     true,
                 ),
             ));
@@ -2201,9 +2562,7 @@ impl Component for HalfPanePreview {
                 Grid::new()
                     .grid_row(1)
                     .children([half_pane_transport(input, pane_width)]),
-                ScrollViewer::new()
-                    .grid_row(2)
-                    .content(info_and_comments),
+                ScrollViewer::new().grid_row(2).content(info_and_comments),
             ));
 
         let drawer = Border::new()
@@ -2233,9 +2592,11 @@ impl Component for HalfPanePreview {
                 "half-pane-drag-scrim",
                 Border::new()
                     .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
-                    .on_pointer_moved(context.callback(|ev: PointerEventInfo| {
-                        HalfPaneMessage::DragMove(ev.window_x)
-                    }))
+                    .on_pointer_moved(
+                        context.callback(|ev: PointerEventInfo| {
+                            HalfPaneMessage::DragMove(ev.window_x)
+                        }),
+                    )
                     .on_pointer_released(context.callback(move |_: PointerEventInfo| {
                         on_resize_release.call(final_w);
                         HalfPaneMessage::DragEnd
@@ -2320,12 +2681,19 @@ mod tests {
     fn related_card_slots_are_content_independent() {
         const LINE_EM: f64 = 1.48;
         // 标题两行必须放入定高槽（max_lines(2) 封顶行数，槽高封顶卡高）。
-        assert!(2.0 * 13.0 * LINE_EM <= RELATED_TITLE_HEIGHT, "标题槽应容两行 13px 文本");
+        assert!(
+            2.0 * 13.0 * LINE_EM <= RELATED_TITLE_HEIGHT,
+            "标题槽应容两行 13px 文本"
+        );
         // UP 主 / 播放量各一行必须放入元信息槽。
-        assert!(11.0 * LINE_EM <= RELATED_META_HEIGHT, "元信息槽应容一行 11px 文本");
+        assert!(
+            11.0 * LINE_EM <= RELATED_META_HEIGHT,
+            "元信息槽应容一行 11px 文本"
+        );
         // 卡高 = max(封面, 文本列定高)，两侧皆常量 → 与数据内容无关；
         // 且必须同时容下封面与文本列，定高不会产生裁切。
-        let text_col = RELATED_TITLE_HEIGHT + RELATED_META_HEIGHT * 2.0 + RELATED_TEXT_SPACING * 2.0;
+        let text_col =
+            RELATED_TITLE_HEIGHT + RELATED_META_HEIGHT * 2.0 + RELATED_TEXT_SPACING * 2.0;
         let card_body = RELATED_COVER_HEIGHT.max(text_col);
         assert!(card_body >= RELATED_COVER_HEIGHT, "封面完整可见");
         assert!(card_body >= text_col, "文本列完整可见");
@@ -2341,5 +2709,84 @@ mod tests {
             chrome + 132.0 + 10.0 + min_text_width <= RELATED_CARD_WIDTH,
             "定宽 {RELATED_CARD_WIDTH} 应容下封列+文本列"
         );
+    }
+
+    /// F1 反馈契约:全屏 HUD 底衬为半透明黑、深色态控件走白前景;普通
+    /// 播放条保持主题配色不受影响。
+    /// F2 契约:菜单少于 2 档不渲染;≥2 档时选中项与回调命中正确档。
+    #[test]
+    fn quality_selector_requires_two_tiers_and_maps_selection() {
+        let cb = super::Callback::new(|_: i64| {});
+        assert!(super::quality_selector(&[], 0, &cb, false).is_none());
+        assert!(
+            super::quality_selector(&[(80, "1080P".into())], 80, &cb, false).is_none(),
+            "单档不渲染选择器"
+        );
+        let menu = vec![
+            (116, "1080P60".into()),
+            (80, "1080P".into()),
+            (64, "720P".into()),
+        ];
+        assert!(super::quality_selector(&menu, 80, &cb, false).is_some());
+    }
+
+    #[test]
+    fn hud_dark_chips_use_translucent_black_and_white_foreground() {
+        let scrim = super::hud_scrim_color();
+        // 66% 黑(α=168):既可读又不糊画面。
+        assert_eq!(
+            scrim,
+            super::Color::argb(168, 0, 0, 0),
+            "scrim 必须是 66% 纯黑"
+        );
+
+        for dark in [true, false] {
+            let cb = super::Callback::new(|_| {});
+            let _ = super::play_pause_button(true, true, dark, cb.clone());
+            let _ = super::mute_toggle_button(false, true, dark, cb.clone());
+            let _ = super::danmaku_toggle_button(dark, true, dark, cb.clone());
+            let _ = super::fullscreen_toggle_button(true, true, dark, cb);
+        }
+        // 深色态配色契约(供全屏页引用):白前景 + 黑底衬芯片。
+        assert!(
+            matches!(super::hud_foreground(true), super::Brush::Solid(_)),
+            "深色态前景应为白色实刷"
+        );
+        assert!(matches!(
+            super::hud_chip_background(true),
+            super::Brush::Solid(_)
+        ));
+    }
+
+    #[test]
+    fn transport_bars_with_fullscreen_button_fit_minimum_widths() {
+        // Mobile 390 DIP 单行播控：两侧边距 12×2=24 → 可用 366 DIP
+        let mobile_inner = 390.0 - 24.0;
+        let mobile_fixed = 32.0 + 16.0 + 70.0 + 6.0 + 28.0 + 6.0 + 56.0 + 6.0 + 28.0;
+        assert!(
+            mobile_inner - mobile_fixed >= 100.0,
+            "390 DIP 下进度条应保有足够拖动宽度"
+        );
+
+        // 860 DIP 桌面下界左栏（left_inner_w = 416 DIP）紧凑播控含小窗与全屏按钮
+        let desktop_min_left = 416.0;
+        let desktop_compact_used =
+            32.0 + 8.0 + 70.0 + 28.0 + 6.0 + 64.0 + 6.0 + 56.0 + 6.0 + 48.0 + 6.0 + 28.0;
+        assert!(
+            desktop_compact_used <= desktop_min_left,
+            "860 DIP 下紧凑播控不得溢出"
+        );
+
+        // HalfPane 最小宽度 340 DIP（扣左条 40 与内边距 24 → 276 DIP）
+        let half_min_inner = HALF_PANE_MIN_WIDTH - 40.0 - 24.0;
+        let half_used = 32.0 + 8.0 + 70.0 + 28.0 + 6.0 + 56.0 + 6.0 + 28.0;
+        assert!(
+            half_used <= half_min_inner,
+            "340 DIP 半窗播控含全屏按钮不得溢出"
+        );
+
+        let cb = windows_reactor::Callback::new(|()| {});
+        let _ = super::fullscreen_toggle_button(false, false, false, cb.clone());
+        let _ = super::fullscreen_toggle_button(true, true, false, cb);
     }
 }

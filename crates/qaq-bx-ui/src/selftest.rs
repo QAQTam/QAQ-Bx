@@ -2,19 +2,22 @@
 //! AppShell 组件树并派发 Message,断言壳层状态。覆盖「鼠标模拟测不到」
 //! 的路径:快速切视频的播放代次取消、评论双桶缓存、导航历史栈。
 //!
-//! 用法:`qaq-bx-ui.exe --selftest [all|boot|nav|comments|rapid-switch|stress|search|popular|half-pane|codec]`
+//! 用法:`qaq-bx-ui.exe --selftest [all|boot|nav|comments|rapid-switch|stress|search|popular|live|unplayable|half-pane|codec]`
 //! 前置:`cargo build -p qaq-bx-ui --features selftest`;需要真实网络与
 //! 本地凭据(nav 探测 / feed / 评论均走真实接口)。
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use windows_reactor::{component, test::{ComponentHost, RecordingAdapter}};
+use windows_reactor::{
+    component,
+    test::{ComponentHost, RecordingAdapter},
+};
 
 use crate::pages::account::NotifyTab;
 use crate::pages::player::CommentSort;
 use crate::router::Route;
-use crate::shell::{AppShell, Message, ShellInput, ShellProbe};
+use crate::shell::{AppShell, Message, ResolveProfileKey, ShellInput, ShellProbe};
 
 /// 可解析真实媒体的测试稿件（open_video 走最小模型 + video_meta 解析管线，不依赖任何种子数据）。
 const TEST_BV: &str = "BV1GJ411x7h7";
@@ -116,9 +119,7 @@ fn nav(s: &mut Scenario) -> Result<(), String> {
 fn comments(s: &mut Scenario) -> Result<(), String> {
     s.send(Message::OpenVideo(TEST_BV.into()))?;
     s.wait_for(Duration::from_secs(60), |p| {
-        p.now_playing_bvid.as_deref() == Some(TEST_BV)
-            && p.hot_loaded
-            && p.hot_replies > 0
+        p.now_playing_bvid.as_deref() == Some(TEST_BV) && p.hot_loaded && p.hot_replies > 0
     })
     .map_err(|err| format!("评论首页未就绪:{err}"))?;
     {
@@ -322,15 +323,18 @@ fn codec(s: &mut Scenario) -> Result<(), String> {
 fn half_pane_pulse(s: &mut Scenario) -> Result<(), String> {
     s.send(Message::OpenVideo(TEST_BV.into()))?;
     s.sync()?;
-    assert!(s.probe.borrow().video_loading, "开播后加载环形指示应点亮(解析/缓冲中)");
+    assert!(
+        s.probe.borrow().video_loading,
+        "开播后加载环形指示应点亮(解析/缓冲中)"
+    );
     s.wait_for(Duration::from_secs(60), |p| {
-        p.route_tag == "home"
-            && p.home_half_pane
-            && p.now_playing_bvid.as_deref() == Some(TEST_BV)
+        p.route_tag == "home" && p.home_half_pane && p.now_playing_bvid.as_deref() == Some(TEST_BV)
     })
     .map_err(|err| format!("半屏抽屉未就绪:{err}"))?;
-    s.wait_for(Duration::from_secs(20), |p| p.engine_attached && p.mount_tick >= 1)
-        .map_err(|err| format!("半屏挂载脉冲未驱动 swapchain 挂载(旧 bug 现场):{err}"))?;
+    s.wait_for(Duration::from_secs(20), |p| {
+        p.engine_attached && p.mount_tick >= 1
+    })
+    .map_err(|err| format!("半屏挂载脉冲未驱动 swapchain 挂载(旧 bug 现场):{err}"))?;
     s.wait_for(Duration::from_secs(60), |p| !p.video_loading)
         .map_err(|err| format!("媒体就绪后加载指示未熄灭:{err}"))?;
 
@@ -338,10 +342,16 @@ fn half_pane_pulse(s: &mut Scenario) -> Result<(), String> {
     assert!(s.probe.borrow().danmaku_enabled, "初始设置应开启弹幕");
     s.send(Message::ToggleDanmaku)?;
     s.sync()?;
-    assert!(!s.probe.borrow().danmaku_enabled, "ToggleDanmaku 应关闭弹幕");
+    assert!(
+        !s.probe.borrow().danmaku_enabled,
+        "ToggleDanmaku 应关闭弹幕"
+    );
     s.send(Message::ToggleDanmaku)?;
     s.sync()?;
-    assert!(s.probe.borrow().danmaku_enabled, "再次 ToggleDanmaku 应开启弹幕");
+    assert!(
+        s.probe.borrow().danmaku_enabled,
+        "再次 ToggleDanmaku 应开启弹幕"
+    );
 
     assert_eq!(s.probe.borrow().volume, 30);
     s.send(Message::ToggleMute)?;
@@ -350,6 +360,18 @@ fn half_pane_pulse(s: &mut Scenario) -> Result<(), String> {
     s.send(Message::ToggleMute)?;
     s.sync()?;
     assert_eq!(s.probe.borrow().volume, 30, "再次 ToggleMute 应恢复原音量");
+
+    // 半屏态直进全屏 → 退出全屏应回到半屏抽屉，再关闭半屏停播
+    s.send(Message::EnterFullscreen)?;
+    s.sync()?;
+    assert!(s.probe.borrow().is_fullscreen, "半屏态应支持进入全屏");
+    s.send(Message::ExitFullscreen)?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(!p.is_fullscreen, "退出全屏应关闭全屏标志");
+        assert!(p.home_half_pane, "半屏态退出全屏应回到半屏抽屉");
+    }
 
     s.send(Message::CloseHalfPane)?;
     s.sync()?;
@@ -367,7 +389,8 @@ fn mobile(s: &mut Scenario) -> Result<(), String> {
     {
         let p = s.probe.borrow();
         assert!(!p.is_mobile, "默认启动应为 Desktop 形态");
-        assert_eq!(p.grid_cols, 4, "1280x800 默认应为 4 列");
+        // F5 卡片曲线:1280x800 → 内容宽 1224 → 5 列(整 DIP 分满,行尾无空白)。
+        assert_eq!(p.grid_cols, 5, "1280x800 曲线应为 5 列");
     }
 
     // 1. 缩放至 390x760：切 Mobile + 2 列
@@ -435,7 +458,10 @@ fn mobile(s: &mut Scenario) -> Result<(), String> {
     assert_eq!(s.probe.borrow().grid_cols, 2, "640px 应铺满 2 列");
     s.send(Message::ToggleSearchOverlay)?;
     s.sync()?;
-    assert!(s.probe.borrow().search_overlay_open, "600..859 半屏下应可呼出悬浮搜索");
+    assert!(
+        s.probe.borrow().search_overlay_open,
+        "600..859 半屏下应可呼出悬浮搜索"
+    );
     s.send(Message::SearchDraftChanged("rust".into()))?;
     s.send(Message::SearchSubmitted)?;
     s.sync()?;
@@ -465,10 +491,157 @@ fn mobile(s: &mut Scenario) -> Result<(), String> {
     {
         let p = s.probe.borrow();
         assert!(!p.is_mobile);
-        assert_eq!(p.grid_cols, 4);
+        // F5 卡片曲线:1280x800 → 5 列(原 4 列,行尾无空白)。
+        assert_eq!(p.grid_cols, 5);
         assert!(!p.whisper_detail_open);
         assert!(!p.search_overlay_open);
     }
+    Ok(())
+}
+
+/// 场景 11:全屏播放状态机与快捷键闭环（无视频守卫 / 全屏进入 / 弹幕·静音·快进·播停热键 / Back 优先退出全屏 / 导航切换自动退全屏）。
+fn fullscreen(s: &mut Scenario) -> Result<(), String> {
+    use crate::pages::fullscreen::PlayerHotkey;
+
+    s.sync()?;
+    // 1. 无视频播放时进入/切换全屏应为安全空操作
+    s.send(Message::EnterFullscreen)?;
+    s.send(Message::ToggleFullscreen)?;
+    s.send(Message::PlayerHotkey(PlayerHotkey::ToggleFullscreen))?;
+    s.sync()?;
+    assert!(!s.probe.borrow().is_fullscreen, "无视频播放时不得进入全屏");
+
+    // 2. 打开真实视频并等待挂载就绪
+    s.send(Message::OpenVideo(TEST_BV.into()))?;
+    s.wait_for(Duration::from_secs(60), |p| {
+        p.route_tag == "player"
+            && p.now_playing_bvid.as_deref() == Some(TEST_BV)
+            && p.engine_attached
+            && !p.video_loading
+    })
+    .map_err(|err| format!("全屏前置视频未就绪:{err}"))?;
+
+    // 3. 进入全屏并驱动全屏快捷键（弹幕 / 静音 / 音量 / 快进 / 播停）
+    s.send(Message::EnterFullscreen)?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(p.is_fullscreen, "EnterFullscreen 应进入全屏态");
+        assert_eq!(p.route_tag, "player");
+    }
+
+    let initial_danmaku = s.probe.borrow().danmaku_enabled;
+    s.send(Message::PlayerHotkey(PlayerHotkey::ToggleDanmaku))?;
+    s.sync()?;
+    assert_ne!(
+        s.probe.borrow().danmaku_enabled,
+        initial_danmaku,
+        "全屏 D 键应切换弹幕"
+    );
+    s.send(Message::PlayerHotkey(PlayerHotkey::ToggleDanmaku))?;
+    s.sync()?;
+
+    s.send(Message::PlayerHotkey(PlayerHotkey::ToggleMute))?;
+    s.sync()?;
+    assert_eq!(s.probe.borrow().volume, 0, "全屏 M 键应静音");
+    s.send(Message::PlayerHotkey(PlayerHotkey::VolumeDelta(15)))?;
+    s.sync()?;
+    assert_eq!(s.probe.borrow().volume, 15, "全屏方向上键应恢复并增加音量");
+    s.send(Message::PlayerHotkey(PlayerHotkey::SeekDelta(5)))?;
+    s.send(Message::PlayerHotkey(PlayerHotkey::TogglePlay))?;
+    s.send(Message::PlayerHotkey(PlayerHotkey::TogglePlay))?;
+    s.sync()?;
+
+    // 4. Back 应优先退出全屏而不直接退出播放页
+    s.send(Message::Back)?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(!p.is_fullscreen, "首次 Back 应先退出全屏");
+        assert_eq!(p.route_tag, "player", "退出全屏后应留在播放页");
+        assert_eq!(p.now_playing_bvid.as_deref(), Some(TEST_BV));
+    }
+
+    // 5. F/F11 再次进入全屏，切换导航应自动退全屏并释放视频
+    s.send(Message::PlayerHotkey(PlayerHotkey::ToggleFullscreen))?;
+    s.sync()?;
+    assert!(
+        s.probe.borrow().is_fullscreen,
+        "ToggleFullscreen 应再次进入全屏"
+    );
+    s.send(Message::NavTagSelected(Some("home".into())))?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(!p.is_fullscreen, "导航离开应自动退出全屏");
+        assert_eq!(p.route_tag, "home");
+        assert!(p.now_playing_bvid.is_none(), "离开播放页后应停播释放资源");
+    }
+
+    Ok(())
+}
+
+/// 场景 12:直播页真实数据(U4;导航进入 → 房间列表落定 → 点首房直链进 Player → Back)。
+fn live(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    s.send(Message::NavTagSelected(Some("live".into())))?;
+    s.wait_for(Duration::from_secs(30), |p| {
+        p.route_tag == "live" && p.live_rooms > 0
+    })
+    .map_err(|err| format!("直播数据未就绪:{err}"))?;
+    let roomid = s.probe.borrow().live_first_roomid;
+    assert!(roomid > 0, "直播首房缺少 roomid");
+    let expect = format!("live:{roomid}");
+    s.send(Message::LiveRoomSelected(roomid, "自测房间".into(), "UP".into()))?;
+    s.wait_for(Duration::from_secs(60), |p| {
+        p.route_tag == "player" && p.now_playing_bvid.as_deref() == Some(expect.as_str())
+    })
+    .map_err(|err| format!("直播首房打开失败:{err}"))?;
+    s.send(Message::Back)?;
+    s.sync()?;
+    assert_eq!(s.probe.borrow().route_tag, "live", "Back 应回到直播页");
+    Ok(())
+}
+
+/// 场景 13:付费稿件过滤(充电/付费未解锁的试看降级)。
+/// 派发 MediaPreResolved 试看降级错误 → unplayable 登记;同 bvid 去重;
+/// 非试看错误(-404 等)不得登记。纯状态断言,不发网络请求。
+fn unplayable(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    let key = ResolveProfileKey {
+        max_qn: 116,
+        codec_idx: 0,
+    };
+    let trial = |bvid: &str| Message::MediaPreResolved {
+        bvid: bvid.into(),
+        key,
+        result: Err("该稿件未解锁（充电专稿/付费专稿），仅提供 180 秒试看片段，不支持播放".into()),
+    };
+    s.send(trial("BV1TEST_TRIAL1"))?;
+    s.sync()?;
+    assert_eq!(
+        s.probe.borrow().unplayable_count,
+        1,
+        "试看降级应登记不可播"
+    );
+    s.send(trial("BV1TEST_TRIAL1"))?;
+    s.sync()?;
+    assert_eq!(
+        s.probe.borrow().unplayable_count,
+        1,
+        "同 bvid 重复登记应去重"
+    );
+    s.send(Message::MediaPreResolved {
+        bvid: "BV1TEST_ERR".into(),
+        key,
+        result: Err("API 错误 -404: 啥都木有".into()),
+    })?;
+    s.sync()?;
+    assert_eq!(
+        s.probe.borrow().unplayable_count,
+        1,
+        "非试看错误不得登记不可播"
+    );
     Ok(())
 }
 
@@ -481,8 +654,11 @@ const SCENARIOS: &[(&str, &str, fn(&mut Scenario) -> Result<(), String>)] = &[
     ("search", "FullPlayer", search),
     ("codec", "FullPlayer", codec),
     ("popular", "FullPlayer", popular),
+    ("live", "FullPlayer", live),
+    ("unplayable", "FullPlayer", unplayable),
     ("half-pane", "HalfPane", half_pane_pulse),
     ("mobile", "HalfPane", mobile),
+    ("fullscreen", "FullPlayer", fullscreen),
 ];
 
 /// 解析 `--selftest [scenario]`;非 selftest 调用返回 `None` 走正常启动。

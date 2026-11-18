@@ -7,7 +7,7 @@ use qaq_bx_core::notify::{
 };
 use windows_reactor::*;
 
-use crate::auth::{avatar_thumbnail_url, UserInfo};
+use crate::auth::{UserInfo, avatar_thumbnail_url};
 use crate::image_cache::ImageCache;
 use crate::layout::ViewportLayout;
 use crate::theme;
@@ -369,7 +369,10 @@ fn profile_section(data: &AccountViewData<'_>, cb: &AccountCallbacks) -> View {
     let profile_card = if compact {
         let top = Grid::new()
             .columns([GridLength::Auto, GridLength::Star(1.0)])
-            .children((avatar.vertical_alignment(VerticalAlignment::Center), identity.grid_column(1)));
+            .children((
+                avatar.vertical_alignment(VerticalAlignment::Center),
+                identity.grid_column(1),
+            ));
         let divider = Border::new().height(1.0).background(ThemeBrush::CardStroke);
         let stats_grid = Grid::new()
             .columns([
@@ -390,11 +393,11 @@ fn profile_section(data: &AccountViewData<'_>, cb: &AccountCallbacks) -> View {
             .border_brush(ThemeBrush::CardStroke)
             .border_thickness(1.0)
             .padding(Thickness::xy(14.0, 14.0))
-            .content(
-                StackPanel::new()
-                    .spacing(12.0)
-                    .children((View::from(top), View::from(divider), View::from(stats_grid))),
-            )
+            .content(StackPanel::new().spacing(12.0).children((
+                View::from(top),
+                View::from(divider),
+                View::from(stats_grid),
+            )))
     } else {
         let stats_strip = StackPanel::new()
             .orientation(Orientation::Horizontal)
@@ -410,11 +413,7 @@ fn profile_section(data: &AccountViewData<'_>, cb: &AccountCallbacks) -> View {
             .content(
                 Grid::new()
                     .columns([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
-                    .children((
-                        avatar,
-                        identity.grid_column(1),
-                        stats_strip.grid_column(2),
-                    )),
+                    .children((avatar, identity.grid_column(1), stats_strip.grid_column(2))),
             )
     };
 
@@ -430,7 +429,10 @@ fn profile_section(data: &AccountViewData<'_>, cb: &AccountCallbacks) -> View {
                 .into(),
         );
     }
-    StackPanel::new().spacing(14.0).children(stack_children).into()
+    StackPanel::new()
+        .spacing(14.0)
+        .children(stack_children)
+        .into()
 }
 
 fn notification_section(
@@ -566,12 +568,8 @@ fn notification_section(
     };
 
     let body: View = match data.active_tab {
-        NotifyTab::Reply => feed_list_view(
-            data.replies,
-            NotifyTab::Reply,
-            nested_scroll,
-            cb,
-            |item| {
+        NotifyTab::Reply => {
+            feed_list_view(data.replies, NotifyTab::Reply, nested_scroll, cb, |item| {
                 interaction_card(
                     item.sender_mid,
                     &item.sender_name,
@@ -586,8 +584,8 @@ fn notification_section(
                     data.avatar_cache,
                     &cb.on_open_video,
                 )
-            },
-        ),
+            })
+        }
         NotifyTab::At => feed_list_view(data.ats, NotifyTab::At, nested_scroll, cb, |item| {
             interaction_card(
                 item.sender_mid,
@@ -604,14 +602,14 @@ fn notification_section(
                 &cb.on_open_video,
             )
         }),
-        NotifyTab::Like => like_list_view(data.likes, data.avatar_cache, nested_scroll, is_mobile, cb),
-        NotifyTab::System => feed_list_view(
-            data.systems,
-            NotifyTab::System,
-            nested_scroll,
-            cb,
-            |item| system_card(item, is_mobile, &cb.on_open_video),
-        ),
+        NotifyTab::Like => {
+            like_list_view(data.likes, data.avatar_cache, nested_scroll, is_mobile, cb)
+        }
+        NotifyTab::System => {
+            feed_list_view(data.systems, NotifyTab::System, nested_scroll, cb, |item| {
+                system_card(item, is_mobile, &cb.on_open_video)
+            })
+        }
         NotifyTab::Whisper => {
             if data.layout.uses_whisper_drilldown() {
                 whisper_session_list_only(data, cb)
@@ -642,7 +640,14 @@ fn feed_list_view<T>(
         return empty_or_error_view(slice.loading, slice.error.as_deref(), tab, cb);
     }
     let mut rows: Vec<View> = slice.items.iter().map(render_item).collect();
-    append_list_footer(&mut rows, slice.loading, slice.has_more, slice.error.as_deref(), tab, cb);
+    append_list_footer(
+        &mut rows,
+        slice.loading,
+        slice.has_more,
+        slice.error.as_deref(),
+        tab,
+        cb,
+    );
     let stack = StackPanel::new().spacing(8.0).children(rows);
     if nested_scroll {
         ScrollViewer::new().content(stack).into()
@@ -918,7 +923,14 @@ fn whisper_session_list_only(data: &AccountViewData<'_>, cb: &AccountCallbacks) 
     let mut session_rows: Vec<View> = sessions
         .items
         .iter()
-        .map(|s| session_row_view(s, data.selected_talker, data.avatar_cache, &cb.on_select_session))
+        .map(|s| {
+            session_row_view(
+                s,
+                data.selected_talker,
+                data.avatar_cache,
+                &cb.on_select_session,
+            )
+        })
         .collect();
     append_list_footer(
         &mut session_rows,
@@ -928,7 +940,10 @@ fn whisper_session_list_only(data: &AccountViewData<'_>, cb: &AccountCallbacks) 
         NotifyTab::Whisper,
         cb,
     );
-    card_box(Thickness::uniform(8.0), StackPanel::new().spacing(4.0).children(session_rows))
+    card_box(
+        Thickness::uniform(8.0),
+        StackPanel::new().spacing(4.0).children(session_rows),
+    )
 }
 
 fn whisper_mobile_detail_page(data: &AccountViewData<'_>, cb: &AccountCallbacks) -> Option<View> {
@@ -948,7 +963,10 @@ fn whisper_mobile_detail_page(data: &AccountViewData<'_>, cb: &AccountCallbacks)
     let mut actions: Vec<View> = Vec::new();
     if !sess.is_system_account && sess.session_type == 1 && sess.talker_id > 0 {
         let space = format!("https://space.bilibili.com/{}", sess.talker_id);
-        if let Ok(link) = HyperlinkButton::new().content("主页").navigate_uri(space.as_str()) {
+        if let Ok(link) = HyperlinkButton::new()
+            .content("主页")
+            .navigate_uri(space.as_str())
+        {
             actions.push(link.into());
         }
     }
@@ -1030,7 +1048,14 @@ fn whisper_split_view(data: &AccountViewData<'_>, cb: &AccountCallbacks) -> View
     let mut session_rows: Vec<View> = sessions
         .items
         .iter()
-        .map(|s| session_row_view(s, data.selected_talker, data.avatar_cache, &cb.on_select_session))
+        .map(|s| {
+            session_row_view(
+                s,
+                data.selected_talker,
+                data.avatar_cache,
+                &cb.on_select_session,
+            )
+        })
         .collect();
     append_list_footer(
         &mut session_rows,
@@ -1048,7 +1073,9 @@ fn whisper_split_view(data: &AccountViewData<'_>, cb: &AccountCallbacks) -> View
         .border_thickness(1.0)
         .padding(8.0)
         .grid_column(0)
-        .content(ScrollViewer::new().content(StackPanel::new().spacing(4.0).children(session_rows)));
+        .content(
+            ScrollViewer::new().content(StackPanel::new().spacing(4.0).children(session_rows)),
+        );
 
     let selected_session = data.selected_talker.and_then(|(tid, stype)| {
         sessions
@@ -1149,24 +1176,22 @@ fn session_row_view(
         vec![GridLength::Star(1.0)]
     };
 
-    let row_body = Border::new()
-        .padding(Thickness::xy(8.0, 6.0))
-        .content(
-            Grid::new()
-                .columns([GridLength::Auto, GridLength::Star(1.0)])
-                .children((
-                    avatar,
-                    StackPanel::new()
-                        .spacing(2.0)
-                        .margin(Thickness::new(10.0, 0.0, 0.0, 0.0))
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .grid_column(1)
-                        .children((
-                            top,
-                            Grid::new().columns(bottom_cols).children(bottom_children),
-                        )),
-                )),
-        );
+    let row_body = Border::new().padding(Thickness::xy(8.0, 6.0)).content(
+        Grid::new()
+            .columns([GridLength::Auto, GridLength::Star(1.0)])
+            .children((
+                avatar,
+                StackPanel::new()
+                    .spacing(2.0)
+                    .margin(Thickness::new(10.0, 0.0, 0.0, 0.0))
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .grid_column(1)
+                    .children((
+                        top,
+                        Grid::new().columns(bottom_cols).children(bottom_children),
+                    )),
+            )),
+    );
 
     let talker_id = sess.talker_id;
     let session_type = sess.session_type;
@@ -1194,7 +1219,10 @@ fn whisper_thread_view(
     let mut actions: Vec<View> = Vec::new();
     if !sess.is_system_account && sess.session_type == 1 && sess.talker_id > 0 {
         let space = format!("https://space.bilibili.com/{}", sess.talker_id);
-        if let Ok(link) = HyperlinkButton::new().content("主页").navigate_uri(space.as_str()) {
+        if let Ok(link) = HyperlinkButton::new()
+            .content("主页")
+            .navigate_uri(space.as_str())
+        {
             actions.push(link.into());
         }
     }
@@ -1331,10 +1359,7 @@ fn whisper_msg_bubble(
                 .spacing(6.0)
                 .horizontal_alignment(align)
                 .children((
-                    TextBlock::new()
-                        .text(sender)
-                        .font_size(11.0)
-                        .opacity(0.6),
+                    TextBlock::new().text(sender).font_size(11.0).opacity(0.6),
                     TextBlock::new()
                         .text(theme::fmt_time(msg.timestamp))
                         .font_size(11.0)
@@ -1398,15 +1423,20 @@ fn stat_tile_content(value: &str, label: &str) -> StackPanel {
 fn stat_tile(value: &str, label: &str, url: Option<&str>, compact: bool) -> View {
     let content = stat_tile_content(value, label);
     if let Some(u) = url
-        && let Ok(btn) = HyperlinkButton::new().content(content.clone()).navigate_uri(u)
+        && let Ok(btn) = HyperlinkButton::new()
+            .content(content.clone())
+            .navigate_uri(u)
     {
         return if compact {
-            btn.horizontal_alignment(HorizontalAlignment::Stretch).into()
+            btn.horizontal_alignment(HorizontalAlignment::Stretch)
+                .into()
         } else {
             btn.into()
         };
     }
-    let b = Border::new().padding(Thickness::xy(6.0, 4.0)).content(content);
+    let b = Border::new()
+        .padding(Thickness::xy(6.0, 4.0))
+        .content(content);
     if compact {
         b.horizontal_alignment(HorizontalAlignment::Stretch).into()
     } else {
@@ -1482,9 +1512,7 @@ fn relation_flyout_content(
                 .on_click(move || on_refresh.call(kind)),
         ));
 
-    let divider = Border::new()
-        .height(1.0)
-        .background(ThemeBrush::CardStroke);
+    let divider = Border::new().height(1.0).background(ThemeBrush::CardStroke);
 
     let on_open = cb.on_open_relations.clone();
     let on_more = cb.on_load_more_relations.clone();
@@ -1493,7 +1521,11 @@ fn relation_flyout_content(
         let inner = empty_or_error_with(
             slice.loading,
             slice.error.as_deref(),
-            if slice.loaded_once { "暂无记录" } else { "加载" },
+            if slice.loaded_once {
+                "暂无记录"
+            } else {
+                "加载"
+            },
             move || on_open.call(kind),
         );
         Border::new().height(120.0).content(inner).into()
@@ -1751,7 +1783,11 @@ fn list_footer_view(
         return Some(
             Button::new()
                 .style(ButtonStyle::Subtle)
-                .content(if loading { "加载中…" } else { "加载更多" })
+                .content(if loading {
+                    "加载中…"
+                } else {
+                    "加载更多"
+                })
                 .is_enabled(!loading)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .margin(Thickness::xy(0.0, 6.0))

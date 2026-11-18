@@ -46,7 +46,9 @@ pub fn init_process_identity() -> ProcessNotificationIdentity {
 }
 
 /// 打包运行态下注册 `AppNotificationManager`（在窗口主循环就绪时调用）。
-pub fn register_if_packaged(on_invoked: Arc<dyn Fn() + Send + Sync>) -> Option<AppNotificationGuard> {
+pub fn register_if_packaged(
+    on_invoked: Arc<dyn Fn() + Send + Sync>,
+) -> Option<AppNotificationGuard> {
     if !qaq_bx_core::is_packaged_app() {
         return None;
     }

@@ -5,7 +5,7 @@
 //! `.qaqh/mpv/mpv-dev/include/mpv/*`(shinchiro 构建 20261111,render_d3d11.h
 //! 自 master 补齐)。**常量值一律以头文件为准,不得凭记忆书写**。
 
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
+use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::sync::Arc;
 
 use crate::error::BiliVideoError;
@@ -111,7 +111,8 @@ type FnRenderContextCreate =
     unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *mut mpv_render_param) -> c_int;
 type FnRenderContextFree = unsafe extern "C" fn(*mut c_void);
 type FnRender = unsafe extern "C" fn(*mut c_void, *mut mpv_render_param) -> c_int;
-type FnSetUpdateCallback = unsafe extern "C" fn(*mut c_void, Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void);
+type FnSetUpdateCallback =
+    unsafe extern "C" fn(*mut c_void, Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void);
 type FnReportSwap = unsafe extern "C" fn(*mut c_void);
 
 /// libmpv-2.dll 的函数表(进程内单份,`Arc` 共享)。
@@ -159,17 +160,14 @@ impl MpvLib {
             ($name:literal, $ty:ty) => {{
                 let cname: &[u8] = concat!($name, "\0").as_bytes();
                 match unsafe {
-                    windows_sys::Win32::libloaderapi::GetProcAddress(
-                        module,
-                        cname.as_ptr(),
-                    )
+                    windows_sys::Win32::libloaderapi::GetProcAddress(module, cname.as_ptr())
                 } {
                     Some(f) => unsafe { std::mem::transmute::<usize, $ty>(f as usize) },
                     None => {
                         return Err(BiliVideoError::LibmpvMissing(format!(
                             "libmpv-2.dll 缺少导出 {}(版本过旧)",
                             $name
-                        )))
+                        )));
                     }
                 }
             }};
@@ -189,7 +187,10 @@ impl MpvLib {
             render_context_create: sym!("mpv_render_context_create", FnRenderContextCreate),
             render_context_free: sym!("mpv_render_context_free", FnRenderContextFree),
             render: sym!("mpv_render_context_render", FnRender),
-            set_update_callback: sym!("mpv_render_context_set_update_callback", FnSetUpdateCallback),
+            set_update_callback: sym!(
+                "mpv_render_context_set_update_callback",
+                FnSetUpdateCallback
+            ),
             report_swap: sym!("mpv_render_context_report_swap", FnReportSwap),
         }))
     }

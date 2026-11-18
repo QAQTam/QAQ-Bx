@@ -19,6 +19,8 @@ use crate::ticket::TicketManager;
 use crate::wbi::WbiSigner;
 
 const SEARCH_ALL_URL: &str = "https://api.bilibili.com/x/web-interface/wbi/search/all/v2";
+/// 搜索框默认词（U2 接线；WBI 签名,契约锚 inventory §5）。
+const SEARCH_DEFAULT_URL: &str = "https://api.bilibili.com/x/web-interface/wbi/search/default";
 
 /// 搜索结果视频卡(仅 `result_type == "video"` 组)。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -69,7 +71,12 @@ impl SearchClient {
         nav: Arc<NavClient>,
     ) -> Self {
         let ticket = nav.ticket().cloned();
-        Self { wbi: WbiSigner::with_nav(nav), http, creds, ticket }
+        Self {
+            wbi: WbiSigner::with_nav(nav),
+            http,
+            creds,
+            ticket,
+        }
     }
 
     /// 综合搜索一页(`page` 从 1 起,`page_size` 实测上限 50)。
@@ -92,6 +99,35 @@ impl SearchClient {
         )
         .await?;
         Ok(parse_search_page(keyword, data))
+    }
+
+    /// 搜索框默认词（U2）：失败返回 `Err`,调用方静默降级到通用占位文案。
+    pub async fn default_word(&self) -> Result<String> {
+        let signed = self.wbi.sign_query(&[]).await?;
+        #[derive(Deserialize)]
+        struct RawDefault {
+            #[serde(default)]
+            name: String,
+            #[serde(default)]
+            show_name: String,
+        }
+        let data: RawDefault = crate::httpx::get_json_with_ticket(
+            &self.http,
+            &self.creds,
+            self.ticket.as_deref(),
+            &format!("{SEARCH_DEFAULT_URL}?{signed}"),
+        )
+        .await?;
+        let word = if data.show_name.trim().is_empty() {
+            data.name
+        } else {
+            data.show_name
+        };
+        let word = word.trim().trim_start_matches('#').trim_end_matches('#').trim().to_string();
+        if word.is_empty() {
+            return Err(crate::error::BiliError::InvalidData("默认词为空".into()));
+        }
+        Ok(word)
     }
 }
 
@@ -204,7 +240,9 @@ fn strip_highlight(title: &str) -> String {
         out.push_str(&rest[..pos]);
         rest = &rest[pos..];
         // 开标记以 '>' 结束;找不到 '>' 视为普通文本,原样保留避免死循环。
-        let Some(open_end) = rest.find('>') else { break };
+        let Some(open_end) = rest.find('>') else {
+            break;
+        };
         rest = &rest[open_end + 1..];
         match rest.find("</em>") {
             Some(close) => {
@@ -300,7 +338,10 @@ mod tests {
             "A & B C <D>"
         );
         // 残缺闭标记:剥除开标记,其后内容按普通文本保留。
-        assert_eq!(strip_highlight("残缺 <em class=\"x\">无闭合"), "残缺 无闭合");
+        assert_eq!(
+            strip_highlight("残缺 <em class=\"x\">无闭合"),
+            "残缺 无闭合"
+        );
     }
 
     #[test]
@@ -331,9 +372,10 @@ mod tests {
         assert!(!page.videos.is_empty(), "搜索应至少命中一条视频卡");
         assert!(page.videos.iter().all(|v| v.bvid.starts_with("BV")));
         assert!(page.videos.iter().all(|v| !v.title.contains("<em")));
-        assert!(page
-            .videos
-            .iter()
-            .all(|v| v.pic_url.as_deref().is_none_or(|u| u.starts_with("https://"))));
+        assert!(page.videos.iter().all(|v| {
+            v.pic_url
+                .as_deref()
+                .is_none_or(|u| u.starts_with("https://"))
+        }));
     }
 }

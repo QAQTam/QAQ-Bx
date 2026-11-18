@@ -9,6 +9,8 @@ license.workspace = true
 thiserror.workspace = true
 windows-sys.workspace = true
 windows.workspace = true
+windows-time = { path = "D:/Projects/qaq-winui-reactor/crates/libs/time" }
+regex.workspace = true
 # D2D overlay:弹幕绘制进视频同帧(canvas fork 的 GpuDevice 互操作 + SwapChain)。
 windows-canvas = { path = "D:/Projects/qaq-winui-reactor/crates/libs/canvas" }
 windows-text = { path = "D:/Projects/qaq-winui-reactor/crates/libs/text" }

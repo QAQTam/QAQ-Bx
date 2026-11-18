@@ -83,7 +83,10 @@ pub(crate) async fn get_json_with_referer<T: DeserializeOwned>(
     match (env.code, env.data) {
         (0, Some(data)) => Ok(data),
         (0, None) => Err(BiliError::InvalidData("响应缺 data".into())),
-        (code, _) => Err(BiliError::Api { code, message: env.message }),
+        (code, _) => Err(BiliError::Api {
+            code,
+            message: env.message,
+        }),
     }
 }
 
@@ -96,6 +99,48 @@ pub(crate) async fn get_bytes_with_ticket(
 ) -> Result<Vec<u8>> {
     let resp = send_get(http, creds, ticket, url, "https://www.bilibili.com/").await?;
     Ok(resp.bytes().await?.to_vec())
+}
+
+/// 带登录态的表单 POST + `Envelope<T>` 解包（写接口统一入口：
+/// reply/add 等；未登录由 `CredentialProvider` 报 `NotLoggedIn`）。
+pub(crate) async fn post_form_with_ticket<T: DeserializeOwned>(
+    http: &reqwest::Client,
+    creds: &Arc<dyn CredentialProvider>,
+    ticket: Option<&TicketManager>,
+    url: &str,
+    referer: &str,
+    form: &[(String, String)],
+) -> Result<T> {
+    // csrf 需要 Cookie 登录态:先取凭据(未登录在此失败,不发请求)。
+    let credentials = creds.get().await?;
+    let cookie = match build_cookie_header(creds, ticket).await {
+        Some(cookie) => cookie,
+        None => credentials.cookie_header(),
+    };
+    let mut builder = http
+        .post(url)
+        .header(reqwest::header::USER_AGENT, BROWSER_UA)
+        .header(reqwest::header::REFERER, referer)
+        .header(reqwest::header::COOKIE, cookie)
+        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    if let Some(origin) = origin_of(referer) {
+        builder = builder.header(reqwest::header::ORIGIN, origin);
+    }
+    let resp = builder
+        .timeout(Duration::from_secs(15))
+        .form(form)
+        .send()
+        .await?
+        .error_for_status()?;
+    let env: Envelope<T> = resp.json().await?;
+    match (env.code, env.data) {
+        (0, Some(data)) => Ok(data),
+        (0, None) => Err(BiliError::InvalidData("响应缺 data".into())),
+        (code, _) => Err(BiliError::Api {
+            code,
+            message: env.message,
+        }),
+    }
 }
 
 fn origin_of(url: &str) -> Option<&str> {
@@ -121,7 +166,10 @@ mod tests {
             origin_of("https://space.bilibili.com/12345/fans/follow"),
             Some("https://space.bilibili.com")
         );
-        assert_eq!(origin_of("https://message.bilibili.com"), Some("https://message.bilibili.com"));
+        assert_eq!(
+            origin_of("https://message.bilibili.com"),
+            Some("https://message.bilibili.com")
+        );
         assert_eq!(origin_of("not-a-url"), None);
     }
 }

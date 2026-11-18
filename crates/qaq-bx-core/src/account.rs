@@ -218,7 +218,11 @@ fn default_official_type() -> i64 {
 
 #[derive(Debug, Deserialize)]
 struct OfficialVerifyRaw {
-    #[serde(default = "default_official_type", rename = "type", deserialize_with = "i64_any")]
+    #[serde(
+        default = "default_official_type",
+        rename = "type",
+        deserialize_with = "i64_any"
+    )]
     kind: i64,
     #[serde(default)]
     desc: String,
@@ -226,7 +230,10 @@ struct OfficialVerifyRaw {
 
 impl Default for OfficialVerifyRaw {
     fn default() -> Self {
-        Self { kind: -1, desc: String::new() }
+        Self {
+            kind: -1,
+            desc: String::new(),
+        }
     }
 }
 
@@ -443,7 +450,9 @@ impl NavClient {
             message: "nav 响应缺 data".into(),
         })?;
         if data.wbi_img.img_url.is_empty() || data.wbi_img.sub_url.is_empty() {
-            return Err(BiliError::InvalidData("nav 响应缺 wbi_img（WBI 密钥不可用）".into()));
+            return Err(BiliError::InvalidData(
+                "nav 响应缺 wbi_img（WBI 密钥不可用）".into(),
+            ));
         }
         let vip = if data.vip_status == 1 {
             match data.vip_type {
@@ -489,7 +498,13 @@ impl NavClient {
 
     /// 拉取当前登录账号的关注/粉丝/动态计数（`/x/web-interface/nav/stat`）。
     pub async fn fetch_stat(&self) -> Result<AccountStat> {
-        get_json_with_ticket(&self.http, &self.creds, self.ticket.as_deref(), NAV_STAT_URL).await
+        get_json_with_ticket(
+            &self.http,
+            &self.creds,
+            self.ticket.as_deref(),
+            NAV_STAT_URL,
+        )
+        .await
     }
 
     /// 分页拉取指定账号的关注或粉丝列表（`pn` 从 1 起，按 `mtime` 降序）。
@@ -513,9 +528,14 @@ impl NavClient {
             ),
         };
         let referer = format!("https://space.bilibili.com/{mid}/fans/{referer_tab}");
-        let raw: RelationData =
-            get_json_with_referer(&self.http, &self.creds, self.ticket.as_deref(), &url, &referer)
-                .await?;
+        let raw: RelationData = get_json_with_referer(
+            &self.http,
+            &self.creds,
+            self.ticket.as_deref(),
+            &url,
+            &referer,
+        )
+        .await?;
         Ok(RelationPage::from_raw(raw, pn, ps))
     }
 
@@ -584,7 +604,10 @@ mod tests {
 
     #[test]
     fn space_url_is_derived_from_mid() {
-        let profile = UserProfile { mid: 80433022, ..Default::default() };
+        let profile = UserProfile {
+            mid: 80433022,
+            ..Default::default()
+        };
         assert_eq!(profile.space_url(), "https://space.bilibili.com/80433022");
     }
 
@@ -699,10 +722,8 @@ mod tests {
         assert_eq!(page.items[1].official_desc, "");
         assert_eq!(page.items[1].vip_label, "");
 
-        let last_raw: RelationData = serde_json::from_str(
-            r#"{"list":[{"mid":1,"uname":"u"}],"total":45}"#,
-        )
-        .unwrap();
+        let last_raw: RelationData =
+            serde_json::from_str(r#"{"list":[{"mid":1,"uname":"u"}],"total":45}"#).unwrap();
         let last_page = RelationPage::from_raw(last_raw, 3, 20);
         assert!(!last_page.has_more);
     }

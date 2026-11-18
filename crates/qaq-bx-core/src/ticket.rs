@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::credentials::{now_unix, CredentialProvider};
+use crate::credentials::{CredentialProvider, now_unix};
 use crate::error::{BiliError, Result};
 use crate::loose::i64_any;
 use crate::storage::{atomic_write_json, load_json_opt, remove_file_if_exists};
@@ -126,7 +126,10 @@ pub(crate) fn parse_ticket_response(body: &[u8], fallback_now: i64) -> Result<Ti
     let env: GenTicketEnvelope = serde_json::from_slice(body)
         .map_err(|e| BiliError::InvalidData(format!("GenWebTicket 响应解析失败: {e}")))?;
     if env.code != 0 {
-        return Err(BiliError::Api { code: env.code, message: env.message });
+        return Err(BiliError::Api {
+            code: env.code,
+            message: env.message,
+        });
     }
     let data = env
         .data
@@ -134,12 +137,13 @@ pub(crate) fn parse_ticket_response(body: &[u8], fallback_now: i64) -> Result<Ti
     if data.ticket.is_empty() {
         return Err(BiliError::InvalidData("GenWebTicket 返回空 ticket".into()));
     }
-    let created_at = if data.created_at > 0 { data.created_at } else { fallback_now };
+    let created_at = if data.created_at > 0 {
+        data.created_at
+    } else {
+        fallback_now
+    };
     let ttl = if data.ttl > 0 { data.ttl } else { 259_200 };
-    let (wbi_img_url, wbi_sub_url) = data
-        .nav
-        .map(|n| (n.img, n.sub))
-        .unwrap_or_default();
+    let (wbi_img_url, wbi_sub_url) = data.nav.map(|n| (n.img, n.sub)).unwrap_or_default();
     Ok(TicketData {
         ticket: data.ticket,
         created_at,
@@ -188,9 +192,7 @@ impl TicketManager {
         creds: Arc<dyn CredentialProvider>,
         store: Option<Arc<FileTicketStore>>,
     ) -> Self {
-        let initial = store
-            .as_ref()
-            .and_then(|s| s.load().ok().flatten());
+        let initial = store.as_ref().and_then(|s| s.load().ok().flatten());
         Self {
             http,
             creds,

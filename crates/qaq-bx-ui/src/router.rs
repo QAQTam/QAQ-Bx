@@ -74,7 +74,7 @@ impl Route {
             Route::Favorites => Symbol::Favorite,
             Route::History => Symbol::Clock,
             Route::WatchLater => Symbol::TwoPage,
-                        Route::Search => Symbol::Find,
+            Route::Search => Symbol::Find,
             Route::Login => Symbol::Account,
             Route::Settings => Symbol::Setting,
             Route::Player => Symbol::Play,
@@ -93,16 +93,16 @@ impl Route {
     }
 }
 
-/// 非播放页分发（Home / Popular / Player / Login / Settings / Search 由 AppShell 直接组装，分支仅为穷尽兜底）。
+/// 非 Player/Home/Popular/Live 页分发（这些由 AppShell 直接组装，分支仅为穷尽兜底）。
 pub fn route(route: Route, layout: ViewportLayout, _on_open: Callback<String>) -> View {
     match route {
         Route::Following => pages::stub::stub_page("关注", "暂无动态", layout),
-        Route::Live => pages::stub::stub_page("直播", "暂无直播", layout),
         Route::Favorites => pages::stub::stub_page("收藏", "暂无收藏", layout),
         Route::History => pages::stub::stub_page("历史", "暂无历史记录", layout),
         Route::WatchLater => pages::stub::stub_page("稍后再看", "暂无内容", layout),
         Route::Home
         | Route::Popular
+        | Route::Live
         | Route::Player
         | Route::Login
         | Route::Settings

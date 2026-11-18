@@ -4,7 +4,7 @@ use windows_reactor::*;
 
 use crate::auth::{AuthState, LoginFlowState};
 use crate::layout::ViewportLayout;
-use crate::pages::account::{account_page, AccountCallbacks, AccountViewData};
+use crate::pages::account::{AccountCallbacks, AccountViewData, account_page};
 
 pub fn login_page(
     auth: &AuthState,
@@ -21,27 +21,8 @@ pub fn login_page(
     let qr_size = if layout.is_mobile() { 196.0 } else { 216.0 };
 
     match auth {
-        AuthState::Unknown => centered(StackPanel::new().spacing(12.0).children((
-            ProgressRing::new()
-                .is_indeterminate(true)
-                .is_active(true)
-                .width(32.0)
-                .height(32.0)
-                .horizontal_alignment(HorizontalAlignment::Center),
-            TextBlock::new()
-                .text("验证中…")
-                .font_size(12.0)
-                .opacity(0.6)
-                .horizontal_alignment(HorizontalAlignment::Center),
-        ))),
-
-        AuthState::LoggedIn(_) => match (account_view, account_cb) {
-            (Some(view), Some(cb)) => account_page(view, cb),
-            _ => centered(TextBlock::new().text("加载中…").opacity(0.6)),
-        },
-
-        AuthState::Guest => match flow {
-            LoginFlowState::Starting => centered(StackPanel::new().spacing(12.0).children((
+        AuthState::Unknown => centered(
+            StackPanel::new().spacing(12.0).children((
                 ProgressRing::new()
                     .is_indeterminate(true)
                     .is_active(true)
@@ -49,11 +30,34 @@ pub fn login_page(
                     .height(32.0)
                     .horizontal_alignment(HorizontalAlignment::Center),
                 TextBlock::new()
-                    .text("正在生成二维码…")
+                    .text("验证中…")
                     .font_size(12.0)
                     .opacity(0.6)
                     .horizontal_alignment(HorizontalAlignment::Center),
-            ))),
+            )),
+        ),
+
+        AuthState::LoggedIn(_) => match (account_view, account_cb) {
+            (Some(view), Some(cb)) => account_page(view, cb),
+            _ => centered(TextBlock::new().text("加载中…").opacity(0.6)),
+        },
+
+        AuthState::Guest => match flow {
+            LoginFlowState::Starting => centered(
+                StackPanel::new().spacing(12.0).children((
+                    ProgressRing::new()
+                        .is_indeterminate(true)
+                        .is_active(true)
+                        .width(32.0)
+                        .height(32.0)
+                        .horizontal_alignment(HorizontalAlignment::Center),
+                    TextBlock::new()
+                        .text("正在生成二维码…")
+                        .font_size(12.0)
+                        .opacity(0.6)
+                        .horizontal_alignment(HorizontalAlignment::Center),
+                )),
+            ),
 
             LoginFlowState::Idle => {
                 let mut card = Border::new()
@@ -104,12 +108,8 @@ pub fn login_page(
                     LoginFlowState::AwaitingScan { qr } => {
                         (Some(qr.clone()), "打开哔哩哔哩 App 扫一扫")
                     }
-                    LoginFlowState::Scanned { qr } => {
-                        (Some(qr.clone()), "已扫码，请在手机确认")
-                    }
-                    LoginFlowState::Expired { qr } => {
-                        (Some(qr.clone()), "二维码已过期")
-                    }
+                    LoginFlowState::Scanned { qr } => (Some(qr.clone()), "已扫码，请在手机确认"),
+                    LoginFlowState::Expired { qr } => (Some(qr.clone()), "二维码已过期"),
                     LoginFlowState::Failed(reason) => (None, reason.as_str()),
                     _ => (None, ""),
                 };

@@ -4,7 +4,7 @@ members = ["crates/qaq-bx-core", "crates/qaq-bx-plugin-login", "crates/qaq-bx-cl
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.2.0"
 license = "MIT"
 
 [workspace.dependencies]
@@ -29,8 +29,13 @@ windows = { path = "D:/Projects/qaq-winui-reactor/crates/libs/windows", features
     "d3dcommon",
     "dxgi",
     "Media",
+    "Media_Core",
+    "Media_Playback",
+    "Media_Streaming_Adaptive",
     "Storage_Streams",
     "systemmediatransportcontrolsinterop",
+    "Web_Http",
+    "Web_Http_Headers",
     "wincodec",
     "winuser",
     "processthreadsapi",
@@ -40,6 +45,8 @@ hex = "0.4"
 qrcode = "0.14"
 url = "2"
 anyhow = "1"
+# 弹幕屏蔽正则(设置页 `re:` 前缀规则;qaq-bx-video 引擎线程编译)。
+regex = "1"
 
 qaq-bx-core = { path = "crates/qaq-bx-core" }
 qaq-bx-plugin-login = { path = "crates/qaq-bx-plugin-login" }

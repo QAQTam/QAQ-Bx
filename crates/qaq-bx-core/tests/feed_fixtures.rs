@@ -31,11 +31,20 @@ fn rcmd_fixture_matches_contract_v1() {
     // av 卡：消费面字段完整（bvid/owner/stat/pic/duration/pubdate）
     let av = items.iter().find(|c| c.is_av()).expect("无有效 av 卡");
     let av = av;
-    assert!(av.bvid.as_deref().is_some_and(|b| b.starts_with("BV")), "av 卡 bvid 缺失");
+    assert!(
+        av.bvid.as_deref().is_some_and(|b| b.starts_with("BV")),
+        "av 卡 bvid 缺失"
+    );
     assert!(av.cid.is_some(), "av 卡 cid 缺失");
-    assert!(av.pic.as_deref().is_some_and(|p| p.starts_with("http")), "av 卡封面缺失");
+    assert!(
+        av.pic.as_deref().is_some_and(|p| p.starts_with("http")),
+        "av 卡封面缺失"
+    );
     assert!(av.duration.is_some_and(|d| d > 0), "av 卡时长缺失");
-    assert!(av.pubdate.is_some_and(|p| p > 1_000_000_000), "av 卡 pubdate 缺失");
+    assert!(
+        av.pubdate.is_some_and(|p| p > 1_000_000_000),
+        "av 卡 pubdate 缺失"
+    );
     let owner = av.owner.as_ref().expect("av 卡 owner 缺失");
     assert!(owner.mid > 0 && !owner.name.is_empty());
     let stat = av.stat.as_ref().expect("av 卡 stat 缺失");
@@ -50,13 +59,20 @@ fn rcmd_fixture_matches_contract_v1() {
 fn archive_fixtures_match_contract_v1() {
     for name in ["feed-popular", "feed-ranking", "feed-precious"] {
         let raw = fixture(name);
-        let list_key = if raw["data"]["list"].is_array() { "list" } else { "item" };
+        let list_key = if raw["data"]["list"].is_array() {
+            "list"
+        } else {
+            "item"
+        };
         let cards: Vec<ArchiveCard> = serde_json::from_value(raw["data"][list_key].clone())
             .unwrap_or_else(|e| panic!("{name} 反序列化失败: {e}"));
         assert!(!cards.is_empty(), "{name} 空");
         let c = &cards[0];
         assert!(c.aid > 0 && c.bvid.starts_with("BV"), "{name} 首卡字段异常");
-        assert!(c.duration > 0 && c.pubdate > 1_000_000_000, "{name} 时间/时长异常");
+        assert!(
+            c.duration > 0 && c.pubdate > 1_000_000_000,
+            "{name} 时间/时长异常"
+        );
         assert!(!c.owner.name.is_empty(), "{name} owner 异常");
         // ranking 独有 score
         if name == "feed-ranking" {
@@ -68,8 +84,8 @@ fn archive_fixtures_match_contract_v1() {
 #[test]
 fn ogv_fixture_matches_contract_v1() {
     let raw = fixture("feed-ogv");
-    let items: Vec<OgvCard> = serde_json::from_value(raw["data"]["items"].clone())
-        .expect("ogv fixture 反序列化失败");
+    let items: Vec<OgvCard> =
+        serde_json::from_value(raw["data"]["items"].clone()).expect("ogv fixture 反序列化失败");
     assert!(!items.is_empty());
     let s = &items[0];
     assert!(s.epid > 0 && s.season_id > 0, "ogv 卡 epid/season_id 异常");
@@ -86,7 +102,10 @@ fn related_fixture_matches_contract_v1() {
     let cards = env.data.expect("related 缺 data 数组");
     assert!(!cards.is_empty(), "related fixture 空");
     let c = &cards[0];
-    assert!(c.aid > 0 && c.bvid.starts_with("BV"), "related 首卡字段异常");
+    assert!(
+        c.aid > 0 && c.bvid.starts_with("BV"),
+        "related 首卡字段异常"
+    );
     assert!(c.cid > 0 && c.duration > 0 && c.pubdate > 1_000_000_000);
     assert!(!c.owner.name.is_empty() && c.pic.starts_with("http"));
 }
@@ -103,8 +122,14 @@ fn stat_required_fields_are_strict() {
         .find(|c| c["goto"] == "av")
         .expect("无 av 卡");
     let stat = av["stat"].as_object().expect("av 卡 stat 缺失");
-    assert!(stat.contains_key("view"), "stat.view 是 required（契约代 1）");
-    assert!(stat.contains_key("danmaku"), "stat.danmaku 是 required（契约代 1）");
+    assert!(
+        stat.contains_key("view"),
+        "stat.view 是 required（契约代 1）"
+    );
+    assert!(
+        stat.contains_key("danmaku"),
+        "stat.danmaku 是 required（契约代 1）"
+    );
 }
 
 /// FeedCard 在缺字段（如手造最小卡）时仍可解析 —— 向下兼容面。

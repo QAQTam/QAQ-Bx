@@ -17,6 +17,25 @@ pub const SETTINGS_FILE: &str = "settings.json";
 pub const MAX_QN_VIP: i64 = 120;
 pub const MAX_QN_GUEST: i64 = 80;
 
+/// 弹幕默认字体族（缺省与 UI 主字体一致；F3）。
+pub const DEFAULT_DANMAKU_FONT: &str = "Noto Sans SC";
+
+/// 弹幕可选字体（设置页顺序；DWrite 系统字体名）。
+pub const DANMAKU_FONTS: [(&str, &str); 4] = [
+    (DEFAULT_DANMAKU_FONT, "默认（Noto Sans SC）"),
+    ("Microsoft YaHei", "微软雅黑"),
+    ("SimHei", "黑体"),
+    ("SimSun", "宋体"),
+];
+
+fn default_danmaku_font() -> String {
+    DEFAULT_DANMAKU_FONT.to_string()
+}
+
+fn default_danmaku_font_scale() -> f32 {
+    1.0
+}
+
 /// 首选清晰度档位（映射 B 站 playurl `qn` 与设置页顺序）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QualityPref {
@@ -179,6 +198,26 @@ pub struct AppSettings {
     pub danmaku_enabled: bool,
     pub danmaku_opacity: f32,
     pub danmaku_max_lanes: usize,
+    /// 弹幕字体族(F3;`#[serde(default)]` 旧配置缺失时按常量补齐)。
+    #[serde(default = "default_danmaku_font")]
+    pub danmaku_font_family: String,
+    /// 弹幕字号缩放(0.5..=2.0;F3)。
+    #[serde(default = "default_danmaku_font_scale")]
+    pub danmaku_font_scale: f32,
+    /// 屏蔽滚动弹幕(网页版弹幕设置对齐;容器 serde default 为旧配置补齐 false)。
+    pub danmaku_block_scroll: bool,
+    /// 屏蔽底部弹幕。
+    pub danmaku_block_bottom: bool,
+    /// 屏蔽顶部弹幕。
+    pub danmaku_block_top: bool,
+    /// 屏蔽彩色弹幕(非 0xFFFFFF)。
+    pub danmaku_block_color: bool,
+    /// 过滤重复弹幕(同文本 4 秒窗口内仅保留首条)。
+    pub danmaku_block_repeat: bool,
+    /// 智能屏蔽权重阈值(0=关,1..=10;仅下发 weight>0 且低于阈值者被屏蔽)。
+    pub danmaku_weight_min: u32,
+    /// 屏蔽词规则(每行一条;`re:` 前缀=正则,`u:` 前缀=用户 midHash,其余=关键词)。
+    pub danmaku_filter_rules: String,
     pub autoplay: bool,
     pub hardware_decode: bool,
     pub volume: u32,
@@ -197,6 +236,15 @@ impl Default for AppSettings {
             danmaku_enabled: true,
             danmaku_opacity: 0.92,
             danmaku_max_lanes: 10,
+            danmaku_font_family: DEFAULT_DANMAKU_FONT.to_string(),
+            danmaku_font_scale: 1.0,
+            danmaku_block_scroll: false,
+            danmaku_block_bottom: false,
+            danmaku_block_top: false,
+            danmaku_block_color: false,
+            danmaku_block_repeat: false,
+            danmaku_weight_min: 0,
+            danmaku_filter_rules: String::new(),
             autoplay: true,
             hardware_decode: true,
             volume: 80,
@@ -215,6 +263,17 @@ impl AppSettings {
             0.92
         };
         self.danmaku_max_lanes = self.danmaku_max_lanes.clamp(1, 20);
+        if !self.danmaku_font_family.trim().is_empty() {
+            self.danmaku_font_family = self.danmaku_font_family.trim().to_string();
+        } else {
+            self.danmaku_font_family = DEFAULT_DANMAKU_FONT.to_string();
+        }
+        self.danmaku_font_scale = if self.danmaku_font_scale.is_finite() {
+            self.danmaku_font_scale.clamp(0.5, 2.0)
+        } else {
+            1.0
+        };
+        self.danmaku_weight_min = self.danmaku_weight_min.clamp(0, 10);
         self.volume = self.volume.min(100);
         self.half_pane_width = if self.half_pane_width.is_finite() {
             self.half_pane_width.clamp(340.0, 820.0)
@@ -297,6 +356,15 @@ mod tests {
             danmaku_enabled: false,
             danmaku_opacity: 0.75,
             danmaku_max_lanes: 8,
+            danmaku_font_family: "Microsoft YaHei".into(),
+            danmaku_font_scale: 1.5,
+            danmaku_block_scroll: true,
+            danmaku_block_bottom: false,
+            danmaku_block_top: true,
+            danmaku_block_color: false,
+            danmaku_block_repeat: true,
+            danmaku_weight_min: 5,
+            danmaku_filter_rules: "前方高能\nre:^\\d+$\nu:abcd1234".into(),
             autoplay: false,
             hardware_decode: false,
             volume: 45,
@@ -362,4 +430,41 @@ mod tests {
         assert_eq!(QualityPref::Q4K.effective_max_qn(true), 120);
         assert_eq!(QualityPref::Q4K.effective_max_qn(false), 80);
     }
+}
+
+/// F3:旧配置缺省弹幕字体字段 → 默认族/1.0;非法值归一化钳位。
+#[test]
+fn danmaku_font_defaults_for_legacy_configs_and_normalizes_extremes() {
+    let legacy: AppSettings = serde_json::from_str("{}").unwrap();
+    assert_eq!(legacy.danmaku_font_family, DEFAULT_DANMAKU_FONT);
+    assert_eq!(legacy.danmaku_font_scale, 1.0);
+
+    let weird: AppSettings = serde_json::from_str::<AppSettings>(
+        r#"{"danmaku_font_family": "  ", "danmaku_font_scale": 9.0}"#,
+    )
+    .unwrap()
+    .normalized();
+    assert_eq!(weird.danmaku_font_family, DEFAULT_DANMAKU_FONT);
+    assert_eq!(weird.danmaku_font_scale, 2.0);
+}
+
+/// 弹幕屏蔽字段:旧配置缺省 → 全关/空规则;权重阈值越界钳位 0..=10。
+#[test]
+fn danmaku_filter_defaults_for_legacy_configs_and_weight_clamped() {
+    let legacy: AppSettings = serde_json::from_str("{}").unwrap();
+    assert!(!legacy.danmaku_block_scroll);
+    assert!(!legacy.danmaku_block_bottom);
+    assert!(!legacy.danmaku_block_top);
+    assert!(!legacy.danmaku_block_color);
+    assert!(!legacy.danmaku_block_repeat);
+    assert_eq!(legacy.danmaku_weight_min, 0);
+    assert_eq!(legacy.danmaku_filter_rules, "");
+
+    let weird: AppSettings = serde_json::from_str::<AppSettings>(
+        r#"{"danmaku_weight_min": 99, "danmaku_filter_rules": "前方高能"}"#,
+    )
+    .unwrap()
+    .normalized();
+    assert_eq!(weird.danmaku_weight_min, 10);
+    assert_eq!(weird.danmaku_filter_rules, "前方高能");
 }

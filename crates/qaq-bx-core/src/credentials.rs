@@ -141,7 +141,10 @@ pub struct DefaultCredentialProvider {
 
 impl DefaultCredentialProvider {
     pub fn new(store: std::sync::Arc<dyn CredentialStore>) -> Self {
-        Self { store, cache: RwLock::new(None) }
+        Self {
+            store,
+            cache: RwLock::new(None),
+        }
     }
 
     /// 登录成功 / 续期后写入（内存 + 落盘）。
@@ -176,6 +179,9 @@ impl CredentialProvider for DefaultCredentialProvider {
     }
 
     fn cached(&self) -> Option<Credentials> {
-        self.cache.read().expect("credential cache poisoned").clone()
+        self.cache
+            .read()
+            .expect("credential cache poisoned")
+            .clone()
     }
 }

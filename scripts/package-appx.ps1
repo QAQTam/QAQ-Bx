@@ -255,7 +255,9 @@ if (-not (Test-Path $exePath)) {
 }
 Copy-Item $exePath $stagingDir
 
-$excludedDirs = @("build", "deps", "examples", "incremental", ".fingerprint", "data")
+# selftest-data 是 selftest 隔离数据目录(运行时生成,绝不该进包);
+# data 是用户真实凭据目录,同样永不打包。
+$excludedDirs = @("build", "deps", "examples", "incremental", ".fingerprint", "data", "selftest-data")
 Get-ChildItem -Path $targetProfileDir -Directory | Where-Object {
     $excludedDirs -notcontains $_.Name
 } | ForEach-Object {

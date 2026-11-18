@@ -78,13 +78,11 @@ pub fn popular_page(
         content_items.push(pill);
     }
 
-    let grid = ScrollViewer::new()
-        .grid_row(1)
-        .content(
-            Border::new()
-                .padding(Thickness::new(margin_x, 4.0, margin_x, 28.0))
-                .content(StackPanel::new().spacing(16.0).children(content_items)),
-        );
+    let grid = ScrollViewer::new().grid_row(1).content(
+        Border::new()
+            .padding(Thickness::new(margin_x, 4.0, margin_x, 28.0))
+            .content(StackPanel::new().spacing(16.0).children(content_items)),
+    );
 
     Grid::new()
         .rows([GridLength::Auto, GridLength::Star(1.0)])

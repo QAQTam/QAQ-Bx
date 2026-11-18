@@ -6,8 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::error::{BiliError, Result};
 
@@ -41,7 +41,10 @@ pub fn is_packaged_app() -> bool {
     const APPMODEL_ERROR_NO_PACKAGE: i32 = 15700;
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn GetCurrentPackageFullName(package_full_name_length: *mut u32, package_full_name: *mut u16) -> i32;
+        fn GetCurrentPackageFullName(
+            package_full_name_length: *mut u32,
+            package_full_name: *mut u16,
+        ) -> i32;
     }
     let mut len: u32 = 0;
     let rc = unsafe { GetCurrentPackageFullName(&mut len, std::ptr::null_mut()) };
@@ -125,11 +128,17 @@ mod tests {
 
         assert_eq!(load_json_opt::<Sample>(&path, "测试").unwrap(), None);
 
-        let v1 = Sample { a: 1, b: "first".into() };
+        let v1 = Sample {
+            a: 1,
+            b: "first".into(),
+        };
         atomic_write_json(&path, &v1, "测试").unwrap();
         assert_eq!(load_json_opt::<Sample>(&path, "测试").unwrap(), Some(v1));
 
-        let v2 = Sample { a: 2, b: "second".into() };
+        let v2 = Sample {
+            a: 2,
+            b: "second".into(),
+        };
         atomic_write_json(&path, &v2, "测试").unwrap();
         assert_eq!(load_json_opt::<Sample>(&path, "测试").unwrap(), Some(v2));
 

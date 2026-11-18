@@ -2,6 +2,7 @@
 //! （`docs/ui-design.md` §1/§5；登录桥接见 `crate::auth`）。
 //! 播放与登录状态在此单源持有，页面组件纯展示 + 回调上报。
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,21 +10,30 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use qaq_bx_core::account::{AccountStat, NavClient, RelationKind, RelationPage, RelationUser};
-use qaq_bx_core::danmaku::{DanmakuClient, DanmakuElem};
-use qaq_bx_core::feed::{ArchiveCard, fetch_rcmd_batch, FeedCard, FeedClient, FeedKind, FeedSession};
+use qaq_bx_core::danmaku::{DanmakuClient, DanmakuElem, SEGMENT_MS};
+use qaq_bx_core::feed::{
+    ArchiveCard, FeedCard, FeedClient, FeedKind, FeedSession, fetch_rcmd_batch,
+};
+use qaq_bx_core::live::LiveClient;
+use crate::pages::live::{LiveCard, LivePageState};
 use qaq_bx_core::notify::{
     AtNotice, FeedCursor, LikeNotice, ReplyNotice, SystemNotice, UnreadSummary, WhisperMessage,
     WhisperSession,
 };
-use qaq_bx_core::player::{PlayerClient, StreamChoice, VideoMeta};
+use qaq_bx_core::player::{
+    Dash, PlayerClient, ResolvedMedia, VideoMeta, VideoPage, is_trial_downgrade_reason,
+    quality_label, quality_menu, select_audio_excluding, select_stream_by_qn,
+    select_stream_excluding,
+};
 use qaq_bx_core::reply::{ReplyClient, ReplyCursor, ReplyItem, ReplyPage, ReplySort, SubReplyPage};
 use qaq_bx_core::search::{SearchClient, SearchVideo};
 use qaq_bx_core::settings::{AppSettings, FileSettingsStore, SETTINGS_FILE};
-use qaq_bx_video::engine::{OverlayDanmaku, VideoConfig, VideoEngine};
+use qaq_bx_video::engine::{DanmakuFilter, OverlayDanmaku, VideoConfig, VideoEngine};
+use qaq_bx_video::native::NativePlayer;
 use windows_reactor::*;
 
 use crate::auth::{
-    avatar_thumbnail_url, Auth, AuthState, FlowCell, LoginFlowState, PollOutcome, ProbeReport,
+    Auth, AuthState, FlowCell, LoginFlowState, PollOutcome, ProbeReport, avatar_thumbnail_url,
 };
 use crate::data::VideoItem;
 use crate::feed_pager;
@@ -37,7 +47,7 @@ use crate::pages::account::{
 use crate::pages::player::{
     CommentCallbacks, CommentSort, CommentsData, CommentsSnapshot, SubReplyState,
 };
-use crate::router::{self, Route, NAV_ROUTES};
+use crate::router::{self, NAV_ROUTES, Route};
 use crate::runtime::{block_on, cover_semaphore};
 use crate::smtc::{SmtcCommand, SmtcController};
 use crate::widgets::chrome;
@@ -65,6 +75,8 @@ const HOME_PREFETCH_LEAD_ROWS: usize = 2;
 const MAX_HOME_SLOTS: usize = 1_200;
 /// 播放状态刷新节拍（引擎快照轮询;0.25s 保证进度条顺滑）。
 const PLAYBACK_TICK: Duration = Duration::from_millis(250);
+/// P1 网格重建去抖:拖拽期间 VirtualSource 重建延迟到窗口静止后 150ms 一次。
+const GRID_REBUILD_DEBOUNCE: Duration = Duration::from_millis(150);
 /// 设置滑块（音量/透明度）去抖落盘窗口。
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -97,24 +109,48 @@ fn video_item(card: &FeedCard) -> VideoItem {
         aid: card.id,
         cid: card.cid.unwrap_or(0),
         title: card.title.clone().unwrap_or_default(),
-        author: card.owner.as_ref().map_or_else(String::new, |owner| owner.name.clone()),
+        author: card
+            .owner
+            .as_ref()
+            .map_or_else(String::new, |owner| owner.name.clone()),
         author_mid: card.owner.as_ref().map_or(0, |owner| owner.mid),
         author_face_url: card
             .owner
             .as_ref()
             .and_then(|owner| owner.face.as_deref())
             .and_then(normalize_face_url),
-        duration_secs: card.duration.unwrap_or_default().clamp(0, i64::from(u32::MAX)) as u32,
-        play_count: card.stat.as_ref().map_or(0, |stat| stat.view.unsigned_abs()),
-        danmaku_count: card.stat.as_ref().map_or(0, |stat| stat.danmaku.unsigned_abs()),
-        like_count: card.stat.as_ref().and_then(|stat| stat.like).map(|v| v.unsigned_abs()),
-        coin_count: card.stat.as_ref().and_then(|stat| stat.coin).map(|v| v.unsigned_abs()),
+        duration_secs: card
+            .duration
+            .unwrap_or_default()
+            .clamp(0, i64::from(u32::MAX)) as u32,
+        play_count: card
+            .stat
+            .as_ref()
+            .map_or(0, |stat| stat.view.unsigned_abs()),
+        danmaku_count: card
+            .stat
+            .as_ref()
+            .map_or(0, |stat| stat.danmaku.unsigned_abs()),
+        like_count: card
+            .stat
+            .as_ref()
+            .and_then(|stat| stat.like)
+            .map(|v| v.unsigned_abs()),
+        coin_count: card
+            .stat
+            .as_ref()
+            .and_then(|stat| stat.coin)
+            .map(|v| v.unsigned_abs()),
         favorite_count: card
             .stat
             .as_ref()
             .and_then(|stat| stat.favorite)
             .map(|v| v.unsigned_abs()),
-        share_count: card.stat.as_ref().and_then(|stat| stat.share).map(|v| v.unsigned_abs()),
+        share_count: card
+            .stat
+            .as_ref()
+            .and_then(|stat| stat.share)
+            .map(|v| v.unsigned_abs()),
         cover: None,
         pic_url: card.pic.as_deref().map(thumbnail_url),
     }
@@ -193,10 +229,9 @@ impl CommentsSessionState {
         }
         self.sub_replies.values().any(|sub| {
             sub.expanded
-                && sub
-                    .items
-                    .iter()
-                    .any(|item| !item.avatar.is_empty() && avatar_thumbnail_url(&item.avatar) == thumb_url)
+                && sub.items.iter().any(|item| {
+                    !item.avatar.is_empty() && avatar_thumbnail_url(&item.avatar) == thumb_url
+                })
         })
     }
 
@@ -225,7 +260,8 @@ impl CommentsSessionState {
             }
         }
         let loading = bucket.loading && bucket.top_replies.is_empty() && bucket.replies.is_empty();
-        let loading_more = bucket.loading && (!bucket.top_replies.is_empty() || !bucket.replies.is_empty());
+        let loading_more =
+            bucket.loading && (!bucket.top_replies.is_empty() || !bucket.replies.is_empty());
         CommentsSnapshot {
             rev,
             data: Arc::new(CommentsData {
@@ -256,17 +292,12 @@ pub struct ResolveProfileKey {
 #[derive(Clone)]
 struct CachedMedia {
     key: ResolveProfileKey,
-    video_url: String,
-    audio_url: String,
-    meta: VideoMeta,
+    media: ResolvedMedia,
     fetched_at: Instant,
 }
 
 /// 结合设置与当前大会员缓存推导请求清晰度上限和编码优先级（不发 IO）。
-fn resolve_params_for(
-    settings: &AppSettings,
-    nav: &NavClient,
-) -> (i64, &'static [&'static str]) {
+fn resolve_params_for(settings: &AppSettings, nav: &NavClient) -> (i64, &'static [&'static str]) {
     let is_vip = nav
         .cached_profile()
         .is_some_and(|profile| profile.vip.is_vip());
@@ -290,6 +321,52 @@ fn video_config_from(settings: &AppSettings) -> VideoConfig {
         danmaku_enabled: settings.danmaku_enabled,
         danmaku_opacity: settings.danmaku_opacity,
         danmaku_max_lanes: settings.danmaku_max_lanes,
+        danmaku_font_family: settings.danmaku_font_family.clone(),
+        danmaku_font_scale: settings.danmaku_font_scale,
+        danmaku_filter: danmaku_filter_from(settings),
+    }
+}
+
+/// 弹幕过滤规则(设置模型 → 引擎规则;每行一条,空行忽略)。
+fn danmaku_filter_from(settings: &AppSettings) -> DanmakuFilter {
+    DanmakuFilter {
+        block_scroll: settings.danmaku_block_scroll,
+        block_bottom: settings.danmaku_block_bottom,
+        block_top: settings.danmaku_block_top,
+        block_color: settings.danmaku_block_color,
+        block_repeat: settings.danmaku_block_repeat,
+        weight_min: settings.danmaku_weight_min,
+        rules: settings
+            .danmaku_filter_rules
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+    }
+}
+
+/// 弹幕分段时长(秒;与 core `danmaku::SEGMENT_MS` 锚,B 站 6 分钟/段)。
+const DANMAKU_SEGMENT_SECS: u64 = SEGMENT_MS / 1000;
+
+/// 弹幕分段数(向上取整,至少 1;duration 缺失按单段兜底)。
+fn danmaku_segment_count(duration_secs: f64) -> u32 {
+    (duration_secs.max(0.0) / DANMAKU_SEGMENT_SECS as f64)
+        .ceil()
+        .max(1.0) as u32
+}
+
+/// 播放头所在分段(index 从 1 起)。
+fn danmaku_segment_at(secs: f64) -> u32 {
+    (secs.max(0.0) / DANMAKU_SEGMENT_SECS as f64).floor() as u32 + 1
+}
+
+/// 预存链的下一分段:优先段(播放头所在段)先到,其余按 1..=total 升序补齐。
+fn next_danmaku_segment(current: u32, first: u32, total: u32) -> Option<u32> {
+    if current == first {
+        (1..=total).find(|&i| i != first)
+    } else {
+        (current + 1..=total).find(|&i| i != first)
     }
 }
 
@@ -346,10 +423,22 @@ pub struct ShellProbe {
     pub whisper_detail_open: bool,
     /// 窄桌面悬浮搜索浮窗是否开启。
     pub search_overlay_open: bool,
+    /// 不可播稿件(充电/付费未解锁)登记条数(付费过滤 selftest 断言用)。
+    pub unplayable_count: usize,
     /// 当前弹幕开关状态。
     pub danmaku_enabled: bool,
     /// 当前音量（0..=100）。
     pub volume: u32,
+    /// 是否处于系统全屏播放状态。
+    pub is_fullscreen: bool,
+    /// 播放页画质菜单档位数(F2)。
+    pub quality_count: usize,
+    /// 当前生效清晰度代号(F2;0 = 未加载)。
+    pub current_qn: i64,
+    /// 直播页已加载房间数(U4)。
+    pub live_rooms: usize,
+    /// 直播页首房 roomid(U4;0 = 未加载)。
+    pub live_first_roomid: u64,
 }
 
 pub struct AppShell {
@@ -408,6 +497,9 @@ pub struct AppShell {
     preresolved_order: VecDeque<String>,
     preresolve_inflight: HashMap<String, ResolveProfileKey>,
     pending_open_preresolve: Option<(String, u64, ResolveProfileKey)>,
+    /// 不可播稿件标记(bvid → 准确原因):预解析/点击解析命中充电/付费未解锁试看降级时登记,
+    /// 首页卡面据此打「充电专稿」角标,后续不再重复请求。
+    unplayable: HashMap<String, String>,
     /// 封面位图缓存（url → 位图；回滚/重复卡复用，换一换清空）。
     image_cache: Arc<ImageCache>,
     /// 登录态（页脚 + 登录页共用）。
@@ -458,8 +550,16 @@ pub struct AppShell {
     search_index: HashMap<String, VideoItem>,
     /// 搜索请求代次(新提交递增,旧结果丢弃)。
     search_seq: u64,
+    /// 搜索默认词(U2;`search/default`,启动后台拉取,失败静默)。
+    search_default: Option<String>,
     /// 热门页单源状态（真实 popular API，pn/ps 分页）。
     popular: pages::popular::PopularFeedState,
+    /// 直播页单源状态(U4;guest 可用 getRoomList)。
+    live: LivePageState,
+    /// 直播列表/房间流客户端(U4)。
+    live_client: Arc<LiveClient>,
+    /// 直播封面在飞集合(url 键)。
+    live_cover_inflight: std::collections::HashSet<String>,
     /// 热门卡索引（bvid → 展示模型；open_video 数据源链一环）。
     popular_index: HashMap<String, VideoItem>,
     /// 播放页右栏相关推荐状态（真实 archive/related API，跟随播放代次）。
@@ -487,8 +587,37 @@ pub struct AppShell {
     video_loading: bool,
     /// 视频引擎(SwapChainPanel 渲染 + mpv;惰性按需创建，关闭迷你条即释放全部解码/D3D 内存)。
     engine: Option<Arc<VideoEngine>>,
+    /// v0.3 spike:系统媒体引擎(QAQ_BX_NATIVE=1 启用;与 mpv 引擎互斥生效,
+    /// 解析/控制路径按 native_active 分流)。
+    native_player: Option<Arc<NativePlayer>>,
+    native_enabled: bool,
     /// 当前播放项的元信息(cid/aid/duration;弹幕拉取参数)。
     current_meta: Option<VideoMeta>,
+    /// 弹幕预存链的优先段(播放头所在段;先拉它,其余段升序补齐)。
+    danmaku_first_seg: u32,
+    /// 当前播放的全量 DASH 分轨(播放页画质菜单数据源;F2)。
+    playback_dash: Option<Dash>,
+    /// 播放页画质菜单(降序清晰度代号;空 = 未解析或 dash 缺失)。
+    quality_qns: Vec<i64>,
+    /// 当前生效清晰度代号(0 = 未加载)。
+    current_qn: i64,
+    /// U1 评论发布:草稿 + 行内提示(登录门控)。
+    comment_draft: String,
+    composer_notice: Option<String>,
+    /// U3 多分P:分P菜单((cid, 标签);单 P 视频为空)。
+    pages_menu: Vec<(u64, String)>,
+    /// U3 当前生效分P cid。
+    current_cid: u64,
+    /// F4 探测:当前载入的视频/音频直链(回退重选对照)。
+    current_video_url: String,
+    current_audio_url: String,
+    /// F4 探测起点(每次载入重置;媒体就绪持续 3s 仍缺解码轨 → 自动回退)。
+    media_probe_at: Option<Instant>,
+    /// F4 已确认失败的视频 codec 桶前缀(解码失败重选排除)。
+    failed_video_prefixes: Vec<String>,
+    /// F4 每代次只自动回退一次,防循环。
+    video_fallback_done: bool,
+    audio_fallback_done: bool,
     /// 播放状态节拍定时器：Drop 即取消投递，必须持有。
     timer: Option<ComponentTimer>,
     /// 登录轮询定时器（2s，独立于播放节拍）。
@@ -504,6 +633,15 @@ pub struct AppShell {
     home_focus_idx: usize,
     /// 首页右侧半窗预览是否展开。
     home_half_pane: bool,
+    /// 全屏播放状态、同步代次与全局键盘隧道上下文。
+    is_fullscreen: bool,
+    fullscreen_gen: u64,
+    fullscreen_sync_in_flight: bool,
+    key_route_ctx: Rc<Cell<(bool, bool)>>,
+    global_key_handler: RoutedCallback<KeyEventInfo>,
+    /// P1 拖拽期间挂起的网格重建(去抖 150ms,静止后一次)。
+    pending_grid_rebuild: bool,
+    grid_rebuild_timer: Option<ComponentTimer>,
     /// 视口布局（壳层形态 / 内容密度 / 卡片度量单源）。
     viewport_layout: ViewportLayout,
     /// Mobile/Medium 下私信会话列表 ↔ 对话详情单页切换开关。
@@ -524,8 +662,7 @@ pub struct AppShell {
 /// (`original_key` 对 NumpadEnter 上报 0x0D)才提交;释放与其余键放行不拦截。
 /// 纯函数便于单测锁行为,视图侧 `on_preview_key_down` 只做「判定→投递→handled」。
 pub(crate) fn search_enter_submits(ev: &KeyEventInfo) -> bool {
-    !ev.status.is_released
-        && (ev.key == VirtualKey::ENTER || ev.original_key == VirtualKey::ENTER)
+    !ev.status.is_released && (ev.key == VirtualKey::ENTER || ev.original_key == VirtualKey::ENTER)
 }
 
 #[derive(Clone)]
@@ -546,7 +683,14 @@ pub enum Message {
         total: Option<u64>,
     },
     /// 搜索失败(seq 失配即丢弃)。
-    SearchFailed { seq: u64, error: String },
+    SearchFailed {
+        seq: u64,
+        error: String,
+    },
+    /// U2:搜索默认词就绪(None = 拉取失败,保持通用占位)。
+    SearchDefaultReady(Option<String>),
+    /// U2:点击默认词 → 填充草稿并提交。
+    SearchPickDefault,
     NavTagSelected(Option<String>),
     PaneOpenChanged(bool),
     TogglePane,
@@ -556,21 +700,67 @@ pub enum Message {
     SetVolume(f64),
     ToggleMute,
     ToggleDanmaku,
+    EnterFullscreen,
+    ExitFullscreen,
+    ToggleFullscreen,
+    FullscreenSynced {
+        gen_id: u64,
+        active: bool,
+    },
+    FullscreenProbeResult {
+        gen_id: u64,
+        active: bool,
+    },
+    PlayerHotkey(pages::fullscreen::PlayerHotkey),
     /// 引擎状态节拍(250ms;读引擎快照刷新 UI 单源)。
     PositionTick,
     /// 后台解析完成(分轨直链)→ 引擎 loadfile + 弹幕拉取（带代次校验防切视频串台）。
     MediaReady {
         seq: u64,
-        video_url: String,
-        audio_url: String,
-        meta: VideoMeta,
+        media: ResolvedMedia,
     },
-    /// 全片弹幕已解析(sort by progress)。
-    DanmakuLoaded { seq: u64, elems: Vec<DanmakuElem> },
-    /// 弹幕拉取失败(静默;播放不受影响)。
-    DanmakuFailed { seq: u64, reason: String },
+    /// 播放页画质切换(F2):同视频换流,记忆进度与播放态。
+    SelectQuality(i64),
+    /// U1:评论草稿变更。
+    CommentDraftChanged(String),
+    /// U1:提交发布评论(未登录在 shell 侧拦截提示)。
+    SubmitComment,
+    /// U1:发布完成(带代次防串台;Ok=新 rpid;Err=行内提示)。
+    CommentSubmitted { gen_id: u64, result: Result<u64, String> },
+    /// U3:切换分P(cid;后台重取 playurl → 定点换流)。
+    SelectPage(u64),
+    /// U3:分P 流就绪(带代次防串台)。
+    PageStreamReady { gen_id: u64, cid: u64, result: Result<ResolvedMedia, String> },
+    /// U4:直播房间列表就绪(page 失配即丢弃)。
+    LiveRoomsLoaded {
+        page: u32,
+        res: Result<Vec<LiveCard>, String>,
+    },
+    /// U4:直播封面就绪(url 键回填)。
+    LiveCoverReady { url: String, image: Option<EncodedImage> },
+    /// U4:点击直播间卡(roomid, title, uname)→ 房间流直链 mpv 播放。
+    LiveRoomSelected(u64, String, String),
+    /// U4:房间流就绪。
+    LiveReady { gen_id: u64, result: Result<String, String> },
+    /// U4:直播页加载更多。
+    LiveMore,
+    /// 弹幕分段到货(预存链;即到即画,引擎侧归并排序)。
+    DanmakuPart {
+        seq: u64,
+        index: u32,
+        elems: Vec<DanmakuElem>,
+    },
+    /// 弹幕分段拉取失败(静默;预存链跳过该段继续,播放不受影响)。
+    DanmakuFailed {
+        seq: u64,
+        index: u32,
+        reason: String,
+    },
     /// 解析/播放准备失败(播放页提示)。
-    MediaFailed { seq: u64, reason: String },
+    MediaFailed {
+        seq: u64,
+        reason: String,
+    },
     /// 首页右侧半窗预览：展开进入完整播放页 / 关闭半窗 / 记忆宽度。
     ExpandHalfPane,
     CloseHalfPane,
@@ -584,6 +774,8 @@ pub enum Message {
     DemoTick,
     /// Windows 控制中心媒体按钮回调（None 表示通道已关闭）。
     SmtcAction(Option<SmtcCommand>),
+    /// P1:窗口尺寸去抖到期(150ms 内无新 resize)→ 应用挂起的网格重建。
+    WindowResizeSettled,
     /// Xbox 手柄事件回调（None 表示通道已关闭）。
     GamepadInput(Option<GamepadEvent>),
     /// Windows Toast 通知激活回调（false 表示通道关闭）。
@@ -593,7 +785,11 @@ pub enum Message {
     /// 换一换（Refresh 语义：清流 + 预分配首批骨架 + 重发）。
     HomeRefresh,
     /// 首页网格某一行被虚拟化容器实际挂载或回收（无感续页 + 离屏封面窗口锚点）。
-    HomeRowActive { rev: u64, row_idx: usize, active: bool },
+    HomeRowActive {
+        rev: u64,
+        row_idx: usize,
+        active: bool,
+    },
     /// 窗口尺寸变化：同步自适应网格列数与每行视口缓冲。
     WindowResized(windows_reactor::WindowSize),
     /// 上次请求失败后的重试（重发上次类别）。
@@ -605,7 +801,10 @@ pub enum Message {
         exhausted: bool,
         replace: bool,
     },
-    HomeFailed { seq: u64, reason: String },
+    HomeFailed {
+        seq: u64,
+        reason: String,
+    },
     /// 封面异步加载完成（先攒进 pending_covers，再定时批量刷入 UI）。
     CoverReady {
         seq: u64,
@@ -618,7 +817,7 @@ pub enum Message {
     MediaPreResolved {
         bvid: String,
         key: ResolveProfileKey,
-        result: Result<(VideoMeta, StreamChoice), String>,
+        result: Result<ResolvedMedia, String>,
     },
 
     // ---- 热门页（真实 popular API，无签名 pn/ps 分页）----
@@ -641,7 +840,10 @@ pub enum Message {
 
     // ---- 登录（桥接 crate::auth）----
     /// 启动/登录成功后的 nav 探测结果（含自动续期状态）。
-    AuthProbed { seq: u64, report: ProbeReport },
+    AuthProbed {
+        seq: u64,
+        report: ProbeReport,
+    },
     AuthStartLogin,
     LoginQrReady(windows_reactor::EncodedImage),
     LoginStartFailed(String),
@@ -837,6 +1039,7 @@ impl AppShell {
         out.route_tag = self.route.tag().to_string();
         out.history_len = self.history.len();
         out.playback_gen = self.playback_gen;
+        out.unplayable_count = self.unplayable.len();
         out.now_playing_bvid = self.now_playing.as_ref().map(|item| item.bvid.clone());
         out.comments_aid = self.comments_session.aid;
         out.comments_sort_latest = self.comments_session.sort == CommentSort::Latest;
@@ -847,7 +1050,11 @@ impl AppShell {
         out.latest_replies = latest.replies.len();
         out.search_query = self.search_state.query.clone();
         out.search_videos = self.search_state.videos.len();
-        out.search_first_bvid = self.search_state.videos.first().map(|item| item.bvid.clone());
+        out.search_first_bvid = self
+            .search_state
+            .videos
+            .first()
+            .map(|item| item.bvid.clone());
         out.popular_items = self.popular.items.len();
         out.popular_first_bvid = self.popular.items.first().map(|item| item.bvid.clone());
         out.related_items = self.related.items.len();
@@ -863,6 +1070,11 @@ impl AppShell {
         out.search_overlay_open = self.search_overlay_open;
         out.danmaku_enabled = self.settings.danmaku_enabled;
         out.volume = self.volume;
+        out.is_fullscreen = self.is_fullscreen;
+        out.quality_count = self.quality_qns.len();
+        out.current_qn = self.current_qn;
+        out.live_rooms = self.live.cards.len();
+        out.live_first_roomid = self.live.cards.first().map_or(0, |c| c.room.roomid);
     }
 
     fn submit_search(&mut self, context: &ComponentContext<Self>) {
@@ -870,6 +1082,7 @@ impl AppShell {
         if query.is_empty() {
             return;
         }
+        self.exit_fullscreen(context);
         self.search_overlay_open = false;
         self.more_menu_open = false;
         self.search_seq += 1;
@@ -877,37 +1090,39 @@ impl AppShell {
         if self.route != Route::Search {
             self.history.push(self.route);
             self.route = Route::Search;
+            crate::trace::note("route->search (搜索提交)");
         }
         self.search_state.query = query.clone();
         self.search_state.loading = true;
         self.search_state.error = None;
         let client = self.search_client.clone();
         let cache = self.image_cache.clone();
-        context.spawn_background(move |_| {
-            match block_on(client.all_v2(&query, 1, 20)) {
-                Ok(page) => {
-                    let items: Vec<VideoItem> = page
-                        .videos
-                        .iter()
-                        .map(|video| {
-                            let mut item = search_video_item(video);
-                            if item.cover.is_none()
-                                && let Some(url) = &item.pic_url
-                            {
-                                item.cover = cache.get(url);
-                            }
-                            item
-                        })
-                        .collect();
-                    Message::SearchResults {
-                        seq,
-                        query: page.query,
-                        items,
-                        total: page.total,
-                    }
+        context.spawn_background(move |_| match block_on(client.all_v2(&query, 1, 20)) {
+            Ok(page) => {
+                let items: Vec<VideoItem> = page
+                    .videos
+                    .iter()
+                    .map(|video| {
+                        let mut item = search_video_item(video);
+                        if item.cover.is_none()
+                            && let Some(url) = &item.pic_url
+                        {
+                            item.cover = cache.get(url);
+                        }
+                        item
+                    })
+                    .collect();
+                Message::SearchResults {
+                    seq,
+                    query: page.query,
+                    items,
+                    total: page.total,
                 }
-                Err(err) => Message::SearchFailed { seq, error: err.to_string() },
             }
+            Err(err) => Message::SearchFailed {
+                seq,
+                error: err.to_string(),
+            },
         });
     }
 
@@ -919,7 +1134,12 @@ impl AppShell {
                 _ => None,
             })
             .or_else(|| self.popular.items.first().map(|item| item.bvid.clone()))
-            .or_else(|| self.search_state.videos.first().map(|item| item.bvid.clone()))
+            .or_else(|| {
+                self.search_state
+                    .videos
+                    .first()
+                    .map(|item| item.bvid.clone())
+            })
             .unwrap_or_else(|| "BV1GJ411x7h7".to_string())
     }
 
@@ -943,6 +1163,7 @@ impl AppShell {
                         self.whisper_detail_open = false;
                         self.history.push(self.route);
                         self.route = Route::Popular;
+                        crate::trace::note("route->popular (半屏详情关闭)");
                         self.ensure_popular(context);
                     }
                 }
@@ -993,10 +1214,9 @@ impl AppShell {
         }
 
         if self.demo.as_ref().is_some_and(|d| !d.is_finished()) {
-            self.demo_timer = Some(context.set_local_timeout(
-                crate::demo::DEMO_TICK_INTERVAL,
-                || Message::DemoTick,
-            ));
+            self.demo_timer = Some(
+                context.set_local_timeout(crate::demo::DEMO_TICK_INTERVAL, || Message::DemoTick),
+            );
         } else {
             self.demo_timer = None;
         }
@@ -1044,6 +1264,57 @@ impl AppShell {
         engine
     }
 
+    /// v0.3 spike:native 引擎是否接管播放控制(QAQ_BX_NATIVE=1)。
+    fn native_active(&self) -> bool {
+        self.native_enabled
+    }
+
+    /// v0.3 spike:确保 NativePlayer 并按选中分轨装载 MPD(系统 DASH 管线)。
+    /// 返回 false = native 未启用,调用方走 mpv 路径。
+    fn native_load_choice(
+        &mut self,
+        choice: &qaq_bx_core::player::StreamChoice,
+        autoplay: bool,
+        start_secs: f64,
+    ) -> bool {
+        if !self.native_enabled {
+            return false;
+        }
+        let player = match &self.native_player {
+            Some(player) => player.clone(),
+            None => {
+                let player = Arc::new(NativePlayer::new());
+                self.native_player = Some(player.clone());
+                player
+            }
+        };
+        let mpd = qaq_bx_core::mpd::build_mpd(&choice.video, Some(&choice.audio));
+        // player 未 attach(UI 尚未交回 MPE 内部 player)时 load 进 pending,
+        // attach 后自动重放;autoplay/start 语义随 pending 一并生效。
+        if let Err(e) = player.load(
+            &mpd,
+            &choice.video.base_url,
+            Some(&choice.audio.base_url),
+            autoplay,
+            start_secs,
+        ) {
+            eprintln!("[qaq-bx-ui] native engine load failed: {e}");
+            self.player_notice = Some(format!("系统媒体引擎装载失败:{e}"));
+            return true;
+        }
+        let _ = player.set_volume(f64::from(self.volume));
+        self.playing = autoplay;
+        true
+    }
+
+    /// v0.3 spike:native 引擎当前进度(无 engine 时的 start 取值)。
+    fn native_position(&self) -> f64 {
+        self.native_player
+            .as_ref()
+            .map(|player| player.status().position_secs)
+            .unwrap_or(0.0)
+    }
+
     fn current_row_revision(&self) -> u64 {
         let cards = self.viewport_layout.cards;
         let cols = cards.cols.max(1) as u64;
@@ -1063,6 +1334,7 @@ impl AppShell {
             &self.home_on_open,
             &self.home_on_hover,
             &self.home_on_row_active,
+            &self.unplayable,
         );
     }
 
@@ -1187,15 +1459,31 @@ impl AppShell {
                 self.history.push(self.route);
             }
             self.route = Route::Player;
+            crate::trace::note("route->player (打开视频)");
         }
         self.advance_playback_gen();
         self.pending_open_preresolve = None;
         self.current_meta = None;
+        self.playback_dash = None;
+        self.quality_qns = Vec::new();
+        self.current_qn = 0;
+        self.current_video_url.clear();
+        self.current_audio_url.clear();
+        self.media_probe_at = None;
+        self.failed_video_prefixes.clear();
+        self.video_fallback_done = false;
+        self.audio_fallback_done = false;
         self.now_playing_desc = None;
         self.meta_fetch_inflight_seq = None;
         self.playback_avatar_dirty = false;
         self.playback_avatar_timer = None;
         self.ensure_engine().set_danmaku(Vec::new());
+        // U1:新视频重置评论输入态。
+        self.comment_draft.clear();
+        self.composer_notice = None;
+        // U3:新视频重置分P态。
+        self.pages_menu.clear();
+        self.current_cid = 0;
         self.now_playing = Some(item.clone());
         self.playing = self.settings.autoplay;
         self.position = 0;
@@ -1215,13 +1503,14 @@ impl AppShell {
         // 1) 命中新鲜 Hover 预解析缓存：直接送入 mpv，0ms 等待解析。
         if let Some(cached) = self.take_fresh_preresolved(&item.bvid, current_key) {
             let seq = self.playback_gen;
-            self.apply_resolved_media(cached.video_url, cached.audio_url, cached.meta, seq, context);
+            self.apply_resolved_media(cached.media, seq, context);
             return;
         }
 
         // 2) 若同名 Hover 预解析正在飞且配置匹配：直接接管在飞请求结果，不重复发 playurl。
         if self.preresolve_inflight.get(&item.bvid).copied() == Some(current_key) {
-            self.pending_open_preresolve = Some((item.bvid.clone(), self.playback_gen, current_key));
+            self.pending_open_preresolve =
+                Some((item.bvid.clone(), self.playback_gen, current_key));
             return;
         }
 
@@ -1239,8 +1528,22 @@ impl AppShell {
         if self.playback_gen == 0 {
             self.playback_gen = 1;
         }
-        self.playback_epoch.store(self.playback_gen, Ordering::SeqCst);
+        self.playback_epoch
+            .store(self.playback_gen, Ordering::SeqCst);
         self.playback_gen
+    }
+
+    /// 播放页画质菜单视图((qn, 标签) 降序;F2)。
+    fn quality_menu_view(&self) -> Vec<(i64, String)> {
+        self.quality_qns
+            .iter()
+            .map(|qn| (*qn, quality_label(*qn)))
+            .collect()
+    }
+
+    /// U3 分P菜单视图。
+    fn pages_menu_view(&self) -> Vec<(u64, String)> {
+        self.pages_menu.clone()
     }
 
     fn refresh_comments_snapshot(&mut self) {
@@ -1360,7 +1663,12 @@ impl AppShell {
         }
     }
 
-    fn fetch_comments(&mut self, sort: CommentSort, append: bool, context: &ComponentContext<Self>) {
+    fn fetch_comments(
+        &mut self,
+        sort: CommentSort,
+        append: bool,
+        context: &ComponentContext<Self>,
+    ) {
         let aid = self.comments_session.aid;
         if aid == 0 {
             return;
@@ -1387,7 +1695,12 @@ impl AppShell {
         });
     }
 
-    fn fetch_sub_replies(&mut self, root_rpid: u64, append: bool, context: &ComponentContext<Self>) {
+    fn fetch_sub_replies(
+        &mut self,
+        root_rpid: u64,
+        append: bool,
+        context: &ComponentContext<Self>,
+    ) {
         let aid = self.comments_session.aid;
         if aid == 0 || root_rpid == 0 {
             return;
@@ -1429,6 +1742,148 @@ impl AppShell {
             return;
         }
         self.fetch_popular(context);
+    }
+
+    /// U4:直播页首屏/加载更多(页号推进与热门同语义)。
+    fn ensure_live(&mut self, context: &ComponentContext<Self>) {
+        if self.live.loaded_once || self.live.loading {
+            return;
+        }
+        self.fetch_live_rooms(context);
+    }
+
+    fn fetch_live_rooms(&mut self, context: &ComponentContext<Self>) {
+        if self.live.loading {
+            return;
+        }
+        self.live.loading = true;
+        self.live.error = None;
+        let client = self.live_client.clone();
+        let cache = self.image_cache.clone();
+        let page = self.live.next_page.max(1);
+        context.spawn_background(move |_| {
+            let res = block_on(client.rooms(page)).map_err(|err| err.to_string());
+            Message::LiveRoomsLoaded {
+                page,
+                res: res.map(|rooms| {
+                    rooms
+                        .into_iter()
+                        .map(|room| LiveCard {
+                            cover: cache.get(&room.cover),
+                            room,
+                        })
+                        .collect()
+                }),
+            }
+        });
+    }
+
+    fn absorb_live_rooms(
+        &mut self,
+        page: u32,
+        res: Result<Vec<LiveCard>, String>,
+        context: &ComponentContext<Self>,
+    ) {
+        if page != self.live.next_page {
+            return;
+        }
+        self.live.loading = false;
+        let cards = match res {
+            Ok(cards) => cards,
+            Err(err) => {
+                self.live.error = Some(err);
+                return;
+            }
+        };
+        self.live.next_page += 1;
+        self.live.reached_end = cards.is_empty();
+        let existing: std::collections::HashSet<u64> =
+            self.live.cards.iter().map(|c| c.room.roomid).collect();
+        for card in cards {
+            if existing.contains(&card.room.roomid) {
+                continue;
+            }
+            if card.cover.is_none() && !card.room.cover.is_empty() {
+                self.spawn_live_cover(card.room.cover.clone(), context);
+            }
+            self.live.cards.push(card);
+        }
+        self.live.loaded_once = true;
+    }
+
+    /// U4:直播间封面补拉(url 键 LRU;与视频封面同一信号量节流)。
+    fn spawn_live_cover(&mut self, url: String, context: &ComponentContext<Self>) {
+        if !self.live_cover_inflight.insert(url.clone()) {
+            return;
+        }
+        let auth = self.auth_service.clone();
+        let cache = self.image_cache.clone();
+        context.spawn_background(move |_| {
+            let image = block_on(async {
+                let _permit = cover_semaphore().acquire().await.ok()?;
+                auth.fetch_image_async(&url).await
+            });
+            if image.is_some() {
+                cache.put(url.clone(), image.clone().unwrap());
+            }
+            Message::LiveCoverReady { url, image }
+        });
+    }
+
+    /// U4:直播间 → Player 页(mpv 直播 FLV/HLS;评论区/画质/分P/弹幕不适用)。
+    fn start_live_playback(
+        &mut self,
+        roomid: u64,
+        title: String,
+        uname: String,
+        context: &ComponentContext<Self>,
+    ) {
+        self.more_menu_open = false;
+        self.search_overlay_open = false;
+        self.home_half_pane = false;
+        if self.route != Route::Player {
+            self.history.push(self.route);
+        }
+        self.route = Route::Player;
+        crate::trace::note("route->player (换流/重开)");
+        self.advance_playback_gen();
+        self.pending_open_preresolve = None;
+        self.current_meta = None;
+        self.playback_dash = None;
+        self.quality_qns = Vec::new();
+        self.current_qn = 0;
+        self.current_video_url.clear();
+        self.current_audio_url.clear();
+        self.media_probe_at = None;
+        self.failed_video_prefixes.clear();
+        self.video_fallback_done = false;
+        self.audio_fallback_done = false;
+        self.pages_menu.clear();
+        self.current_cid = 0;
+        self.now_playing_desc = None;
+        self.meta_fetch_inflight_seq = None;
+        self.playback_avatar_dirty = false;
+        self.playback_avatar_timer = None;
+        self.ensure_engine().set_danmaku(Vec::new());
+        self.comment_draft.clear();
+        self.composer_notice = None;
+        let mut item = minimal_video_item(&format!("live:{roomid}"), &title);
+        item.author = uname;
+        self.now_playing = Some(item);
+        self.playing = self.settings.autoplay;
+        self.position = 0;
+        self.engine_duration = None;
+        self.player_notice = None;
+        self.video_loading = true;
+        self.comments_session.reset(0, 0);
+        self.refresh_comments_snapshot();
+        self.schedule_tick(context);
+        let client = self.live_client.clone();
+        let gen_id = self.playback_gen;
+        context.spawn_background(move |_| {
+            let result = block_on(client.play_url(roomid)).map_err(|err| err.to_string());
+            Message::LiveReady { gen_id, result }
+        });
     }
 
     fn fetch_popular(&mut self, context: &ComponentContext<Self>) {
@@ -1553,19 +2008,39 @@ impl AppShell {
 
     fn apply_resolved_media(
         &mut self,
-        video_url: String,
-        audio_url: String,
-        meta: VideoMeta,
+        media: ResolvedMedia,
         seq: u64,
         context: &ComponentContext<Self>,
     ) {
+        let ResolvedMedia { meta, choice, dash } = media;
         self.absorb_video_meta(&meta, seq, context);
+        self.current_qn = choice.video.id;
+        self.current_cid = meta.cid;
+        self.pages_menu = pages_menu_from(&meta.pages);
+        self.playback_dash = Some(dash.clone());
+        self.quality_qns = quality_menu(&dash.video, 0);
+        self.current_video_url = choice.video.base_url.clone();
+        self.current_audio_url = choice.audio.base_url.clone();
+        self.media_probe_at = Some(Instant::now());
+        // v0.3 spike:native 引擎接管时,mpv 引擎仍需创建(播放页以 engine 存在
+        // 为渲染前提),但不 loadfile —— 保持 idle。
         let engine = self.ensure_engine();
+        if self.native_load_choice(&choice, self.settings.autoplay, 0.0) {
+            self.playing = self.settings.autoplay;
+            self.current_meta = Some(meta);
+            self.fetch_danmaku(seq, 0.0, context);
+            return;
+        }
         engine.set_volume(f64::from(self.volume));
-        engine.load_with_options(&video_url, Some(&audio_url), self.settings.autoplay);
+        engine.load_with_options(
+            &choice.video.base_url,
+            Some(&choice.audio.base_url),
+            0.0,
+            self.settings.autoplay,
+        );
         self.playing = self.settings.autoplay;
         self.current_meta = Some(meta);
-        self.fetch_danmaku(seq, context);
+        self.fetch_danmaku(seq, 0.0, context);
     }
 
     fn take_fresh_preresolved(
@@ -1582,13 +2057,93 @@ impl AppShell {
         }
     }
 
-    fn cache_preresolved(
-        &mut self,
-        bvid: String,
-        key: ResolveProfileKey,
-        meta: VideoMeta,
-        choice: StreamChoice,
-    ) {
+    /// F4:视频轨解码失败自动回退——按失败桶重选编码,记忆进度无缝换流。
+    fn apply_video_fallback(&mut self) {
+        let Some(dash) = self.playback_dash.clone() else {
+            return;
+        };
+        let failed_prefix = dash
+            .video
+            .iter()
+            .find(|v| v.base_url == self.current_video_url)
+            .and_then(|v| v.codecs.split('.').next())
+            .unwrap_or_default()
+            .to_string();
+        if !failed_prefix.is_empty() && !self.failed_video_prefixes.contains(&failed_prefix) {
+            self.failed_video_prefixes.push(failed_prefix);
+        }
+        let failed: Vec<&str> = self
+            .failed_video_prefixes
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let Some(choice) =
+            select_stream_excluding(&dash, 0, self.settings.codec.priority(), &failed)
+        else {
+            self.player_notice = Some(
+                "视频轨无法解码(所有编码桶均失败)。可尝试切换清晰度/编码或更新系统解码组件。"
+                    .to_string(),
+            );
+            self.playing = false;
+            return;
+        };
+        let start = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.status().time_pos)
+            .unwrap_or(0.0);
+        if let Some(engine) = &self.engine {
+            engine.load_with_options(
+                &choice.video.base_url,
+                Some(&choice.audio.base_url),
+                start,
+                self.playing,
+            );
+        }
+        eprintln!(
+            "[qaq-bx-ui] video-track fallback: {} -> {}",
+            failed.join("+"),
+            choice.video.codecs
+        );
+        self.current_video_url = choice.video.base_url;
+        self.current_audio_url = choice.audio.base_url;
+        self.current_qn = choice.video.id;
+        self.media_probe_at = Some(Instant::now());
+        self.player_notice = None;
+    }
+
+    /// F4:音频轨缺失自动回退——换次高带宽音轨,原画质不动。
+    fn apply_audio_fallback(&mut self) {
+        let Some(dash) = self.playback_dash.clone() else {
+            return;
+        };
+        let Some(audio) = select_audio_excluding(&dash, &self.current_audio_url) else {
+            self.player_notice = Some("音频轨不可用(无备选音轨)。".to_string());
+            return;
+        };
+        let start = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.status().time_pos)
+            .unwrap_or(0.0);
+        if let Some(engine) = &self.engine {
+            engine.load_with_options(
+                &self.current_video_url,
+                Some(&audio.base_url),
+                start,
+                self.playing,
+            );
+        }
+        eprintln!(
+            "[qaq-bx-ui] audio-track fallback: {} -> id={}",
+            self.current_audio_url, audio.id
+        );
+        self.current_audio_url = audio.base_url;
+        self.media_probe_at = Some(Instant::now());
+        self.player_notice = None;
+    }
+
+    fn cache_preresolved(&mut self, bvid: String, key: ResolveProfileKey, media: ResolvedMedia) {
         if self.preresolved.contains_key(&bvid) {
             self.preresolved_order.retain(|k| k != &bvid);
         } else if self.preresolved.len() >= MAX_PRERESOLVE_CACHE
@@ -1601,16 +2156,26 @@ impl AppShell {
             bvid,
             CachedMedia {
                 key,
-                video_url: choice.video.base_url,
-                audio_url: choice.audio.base_url,
-                meta,
+                media,
                 fetched_at: Instant::now(),
             },
         );
     }
 
-    /// 后台拉全片弹幕(view 端点为 protobuf 非计划内;分段数按 duration 推导)。
-    fn fetch_danmaku(&mut self, seq: u64, context: &ComponentContext<Self>) {
+    /// 预存弹幕:按 6 分钟段链式拉取,播放头所在段最先到货即画,其余段
+    /// 后台陆续补齐(每段 DanmakuPart → 引擎 AppendDanmaku → 链式取下一段)。
+    /// 不再等全片拉完才上屏;分P 切换须先 set_danmaku(Vec::new()) 清层。
+    fn fetch_danmaku(&mut self, seq: u64, start_secs: f64, context: &ComponentContext<Self>) {
+        if self.current_meta.is_none() {
+            return;
+        }
+        let first = danmaku_segment_at(start_secs);
+        self.danmaku_first_seg = first;
+        self.fetch_danmaku_segment(seq, first, context);
+    }
+
+    /// 拉取单个弹幕分段(预存链的一环;结果经 DanmakuPart/DanmakuFailed 驱动下一段)。
+    fn fetch_danmaku_segment(&mut self, seq: u64, index: u32, context: &ComponentContext<Self>) {
         let Some(meta) = self.current_meta.clone() else {
             return;
         };
@@ -1618,26 +2183,30 @@ impl AppShell {
         let nav = auth.nav_client();
         context.spawn_background(move |_| {
             let client = DanmakuClient::with_nav(auth.http(), auth.credential_provider(), nav);
-            let elems = block_on(client.all(
-                meta.cid,
-                meta.aid,
-                u64::try_from(meta.duration.max(0)).unwrap_or(0),
-            ));
-            match elems {
-                Ok(elems) => Message::DanmakuLoaded { seq, elems },
+            match block_on(client.segment(meta.cid, meta.aid, index)) {
+                Ok(elems) => Message::DanmakuPart { seq, index, elems },
                 Err(error) => Message::DanmakuFailed {
                     seq,
+                    index,
                     reason: error.to_string(),
                 },
             }
         });
     }
 
+    /// 预存链的下一段(播放头段 → 其余段升序;全部段到货后返回 None 收束)。
+    fn next_danmaku_index(&self, current: u32) -> Option<u32> {
+        let total = self
+            .current_meta
+            .as_ref()
+            .map_or(0, |meta| danmaku_segment_count(meta.duration as f64));
+        next_danmaku_segment(current, self.danmaku_first_seg, total)
+    }
+
     /// 去抖调度配置落盘（滑块拖动不频繁写盘，稳定后 300ms 原子写一次）。
     fn schedule_settings_save(&mut self, context: &ComponentContext<Self>) {
-        self.settings_save_timer = Some(context.set_local_timeout(SETTINGS_SAVE_DEBOUNCE, || {
-            Message::FlushSettingsSave
-        }));
+        self.settings_save_timer =
+            Some(context.set_local_timeout(SETTINGS_SAVE_DEBOUNCE, || Message::FlushSettingsSave));
     }
 
     /// 播放状态节拍(常驻续拍:now_playing 存在即持续;Drop 取消)。
@@ -1660,7 +2229,10 @@ impl AppShell {
             .unwrap_or(item.duration_secs)
     }
 
-    fn listen_gamepad(rx: &Arc<Mutex<std::sync::mpsc::Receiver<GamepadEvent>>>, context: &ComponentContext<Self>) {
+    fn listen_gamepad(
+        rx: &Arc<Mutex<std::sync::mpsc::Receiver<GamepadEvent>>>,
+        context: &ComponentContext<Self>,
+    ) {
         let rx = Arc::clone(rx);
         context.spawn_background(move |_| {
             let ev = rx.lock().ok().and_then(|guard| guard.recv().ok());
@@ -1668,7 +2240,10 @@ impl AppShell {
         });
     }
 
-    fn listen_toast(rx: &Arc<Mutex<std::sync::mpsc::Receiver<()>>>, context: &ComponentContext<Self>) {
+    fn listen_toast(
+        rx: &Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+        context: &ComponentContext<Self>,
+    ) {
         let rx = Arc::clone(rx);
         context.spawn_background(move |_| {
             let ok = rx.lock().ok().is_some_and(|guard| guard.recv().is_ok());
@@ -1693,13 +2268,17 @@ impl AppShell {
     }
 
     fn cycle_nav_route(&mut self, delta: isize) {
-        let current_idx = NAV_ROUTES.iter().position(|&r| r == self.route).unwrap_or(0) as isize;
+        let current_idx = NAV_ROUTES
+            .iter()
+            .position(|&r| r == self.route)
+            .unwrap_or(0) as isize;
         let len = NAV_ROUTES.len() as isize;
         let next_idx = ((current_idx + delta).rem_euclid(len)) as usize;
         let next_route = NAV_ROUTES[next_idx];
         if next_route != self.route {
             self.history.push(self.route);
             self.route = next_route;
+            crate::trace::note(format!("route->{}", next_route.tag()));
         }
     }
 
@@ -1708,13 +2287,19 @@ impl AppShell {
             GamepadAction::PrevTab => self.cycle_nav_route(-1),
             GamepadAction::NextTab => self.cycle_nav_route(1),
             GamepadAction::Back => {
-                self.navigate_back();
+                if self.is_fullscreen {
+                    self.exit_fullscreen(context);
+                } else {
+                    self.navigate_back();
+                }
             }
             GamepadAction::TogglePlay => {
                 self.update(Message::TogglePlay, context);
             }
             GamepadAction::Refresh => {
-                if self.route == Route::Home {
+                if self.is_player_visible() {
+                    self.update(Message::ToggleFullscreen, context);
+                } else if self.route == Route::Home {
                     self.update(Message::HomeRefresh, context);
                     self.home_focus_idx = 0;
                 }
@@ -1847,10 +2432,57 @@ impl AppShell {
     }
 
     fn is_player_visible(&self) -> bool {
-        self.route == Route::Player || (self.route == Route::Home && self.home_half_pane)
+        self.route == Route::Player
+            || (self.route == Route::Home && self.home_half_pane)
+            || (self.is_fullscreen && self.now_playing.is_some())
+    }
+
+    fn can_enter_fullscreen(&self) -> bool {
+        self.now_playing.is_some()
+            && self.engine.is_some()
+            && (self.route == Route::Player || (self.route == Route::Home && self.home_half_pane))
+    }
+
+    fn sync_key_route_ctx(&self) {
+        self.key_route_ctx
+            .set((self.is_player_visible(), self.is_fullscreen));
+    }
+
+    fn sync_window_fullscreen(&mut self, fullscreen: bool, context: &ComponentContext<Self>) {
+        self.fullscreen_gen = self.fullscreen_gen.wrapping_add(1);
+        let gen_id = self.fullscreen_gen;
+        let started = context.run_window(move |window| {
+            crate::winrt_ext::set_window_fullscreen(window.as_raw(), fullscreen);
+            Message::FullscreenSynced {
+                gen_id,
+                active: fullscreen,
+            }
+        });
+        self.fullscreen_sync_in_flight = started;
+    }
+
+    fn enter_fullscreen(&mut self, context: &ComponentContext<Self>) {
+        if self.is_fullscreen || !self.can_enter_fullscreen() {
+            return;
+        }
+        self.more_menu_open = false;
+        self.search_overlay_open = false;
+        self.is_fullscreen = true;
+        self.sync_window_fullscreen(true, context);
+        self.sync_key_route_ctx();
+    }
+
+    fn exit_fullscreen(&mut self, context: &ComponentContext<Self>) {
+        if !self.is_fullscreen {
+            return;
+        }
+        self.is_fullscreen = false;
+        self.sync_window_fullscreen(false, context);
+        self.sync_key_route_ctx();
     }
 
     fn stop_playback(&mut self, context: &ComponentContext<Self>) {
+        self.exit_fullscreen(context);
         self.advance_playback_gen();
         self.pending_open_preresolve = None;
         self.now_playing = None;
@@ -1877,9 +2509,15 @@ impl AppShell {
     }
 
     fn reconcile_playback_visibility(&mut self, context: &ComponentContext<Self>) {
+        if self.is_fullscreen
+            && (self.now_playing.is_none() || self.engine.is_none() || !self.is_player_visible())
+        {
+            self.exit_fullscreen(context);
+        }
         if self.now_playing.is_some() && !self.is_player_visible() {
             self.stop_playback(context);
         }
+        self.sync_key_route_ctx();
     }
 
     fn half_pane_layer(
@@ -1892,8 +2530,8 @@ impl AppShell {
         let (Some(item), Some(engine)) = (self.now_playing.as_ref(), self.engine.as_ref()) else {
             return None;
         };
-        let max_width = (self.viewport_layout.content_width() - 48.0)
-            .max(pages::player::HALF_PANE_MIN_WIDTH);
+        let max_width =
+            (self.viewport_layout.content_width() - 48.0).max(pages::player::HALF_PANE_MIN_WIDTH);
         Some(keyed(
             format!("half-pane:{}", item.bvid),
             View::component::<pages::player::HalfPanePreview>(pages::player::HalfPaneInput {
@@ -1920,6 +2558,7 @@ impl AppShell {
                 on_volume: context.callback(|value: f64| Message::SetVolume(value)),
                 on_toggle_mute: context.message(Message::ToggleMute),
                 on_toggle_danmaku: context.message(Message::ToggleDanmaku),
+                on_fullscreen: context.message(Message::EnterFullscreen),
                 on_expand: context.message(Message::ExpandHalfPane),
                 on_close: context.message(Message::CloseHalfPane),
                 on_resize: context.callback(Message::ResizeHalfPane),
@@ -1951,8 +2590,10 @@ impl AppShell {
         }
         if let Some(route) = self.history.pop() {
             self.route = route;
+            crate::trace::note(format!("route->{} (返回)", route.tag()));
         } else if self.route == Route::Player {
             self.route = Route::Home;
+            crate::trace::note("route->home (返回,空历史)");
         }
     }
 
@@ -2148,7 +2789,11 @@ impl AppShell {
                 }
                 self.notify_replies.loading = true;
                 self.notify_replies.error = None;
-                let cursor = if append { self.notify_replies_cursor } else { None };
+                let cursor = if append {
+                    self.notify_replies_cursor
+                } else {
+                    None
+                };
                 context.spawn_background(move |_| Message::RepliesLoaded {
                     seq,
                     append,
@@ -2174,7 +2819,11 @@ impl AppShell {
                 }
                 self.notify_likes.loading = true;
                 self.notify_likes.error = None;
-                let cursor = if append { self.notify_likes_cursor } else { None };
+                let cursor = if append {
+                    self.notify_likes_cursor
+                } else {
+                    None
+                };
                 context.spawn_background(move |_| Message::LikesLoaded {
                     seq,
                     append,
@@ -2187,7 +2836,11 @@ impl AppShell {
                 }
                 self.notify_systems.loading = true;
                 self.notify_systems.error = None;
-                let cursor = if append { self.notify_systems_cursor } else { None };
+                let cursor = if append {
+                    self.notify_systems_cursor
+                } else {
+                    None
+                };
                 context.spawn_background(move |_| Message::SystemsLoaded {
                     seq,
                     append,
@@ -2200,7 +2853,11 @@ impl AppShell {
                 }
                 self.notify_sessions.loading = true;
                 self.notify_sessions.error = None;
-                let end_ts = if append { self.notify_sessions_end_ts } else { None };
+                let end_ts = if append {
+                    self.notify_sessions_end_ts
+                } else {
+                    None
+                };
                 context.spawn_background(move |_| Message::SessionsLoaded {
                     seq,
                     append,
@@ -2325,7 +2982,11 @@ fn apply_feed_page<T>(
     slice.loaded_once = true;
     match res {
         Ok(page) => {
-            let urls: Vec<String> = page.items.iter().map(|i| avatar_of(i).to_string()).collect();
+            let urls: Vec<String> = page
+                .items
+                .iter()
+                .map(|i| avatar_of(i).to_string())
+                .collect();
             if append {
                 slice.items.extend(page.items);
             } else {
@@ -2348,8 +3009,66 @@ fn apply_feed_page<T>(
 /// 半屏抽屉 route 停留在 Home——旧门控只认 `route == Player`,冷启动时面板
 /// metrics 抢在引擎产出 swapchain 之前触发一次就再无第二次机会,首个视频
 /// 永久黑屏;`ClosePlayer` 丢弃引擎后重开又新建引擎,同样复发。
-fn mount_pulse_active(route: Route, home_half_pane: bool, engine_attached: bool) -> bool {
-    (route == Route::Player || home_half_pane) && !engine_attached
+fn mount_pulse_active(
+    route: Route,
+    home_half_pane: bool,
+    is_fullscreen: bool,
+    engine_attached: bool,
+) -> bool {
+    (route == Route::Player || home_half_pane || is_fullscreen) && !engine_attached
+}
+
+/// F4 首播音画缺失探测:媒体已就绪(时长>0)但解码轨道缺失持续 ≥3s → 报缺哪条轨。
+/// 「无画面有声音」= video-format 空;「有画面无声音」= audio-codec 空。
+pub(crate) fn missing_media_track(
+    video_format: &str,
+    audio_codec: &str,
+    has_media: bool,
+    probing_for: Option<Duration>,
+) -> Option<MissingTrack> {
+    const PROBE_GRACE: Duration = Duration::from_secs(3);
+    if !has_media {
+        return None;
+    }
+    if probing_for.is_none_or(|elapsed| elapsed < PROBE_GRACE) {
+        return None;
+    }
+    let video_missing = video_format.trim().is_empty();
+    let audio_missing = audio_codec.trim().is_empty();
+    match (video_missing, audio_missing) {
+        (true, _) => Some(MissingTrack::Video),
+        (false, true) => Some(MissingTrack::Audio),
+        (false, false) => None,
+    }
+}
+
+/// F4 探测结论(驱动自动回退方向)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MissingTrack {
+    /// 视频轨未解出(典型:编码器缺失,如 AV1-only 流)。
+    Video,
+    /// 音频轨未解出(典型:外挂音轨拉取失败或杜比解码缺失)。
+    Audio,
+}
+
+/// U3 分P菜单:(cid, "P{page} {part}");少于 2 个分P返回空(不渲染选择器)。
+pub(crate) fn pages_menu_from(pages: &[VideoPage]) -> Vec<(u64, String)> {
+    let mut menu: Vec<(u64, String)> = pages
+        .iter()
+        .filter(|page| page.cid > 0)
+        .map(|page| {
+            let label = if page.part.trim().is_empty() {
+                format!("P{}", page.page.max(1))
+            } else {
+                format!("P{} {}", page.page.max(1), page.part.trim())
+            };
+            (page.cid, label)
+        })
+        .collect();
+    if menu.len() < 2 {
+        menu.clear();
+    }
+    menu
 }
 
 fn spawn_resolve_media(
@@ -2364,7 +3083,7 @@ fn spawn_resolve_media(
     let (max_qn, codecs) = resolve_params_for(settings, &nav);
     context.spawn_background(move |_| {
         let client = PlayerClient::with_nav(auth.http(), auth.credential_provider(), nav);
-        let res = block_on(client.resolve_with_cid(
+        let res = block_on(client.resolve_full_with_cid(
             &item.bvid,
             item.aid,
             item.cid,
@@ -2374,12 +3093,7 @@ fn spawn_resolve_media(
             codecs,
         ));
         match res {
-            Ok((meta, choice)) => Message::MediaReady {
-                seq,
-                video_url: choice.video.base_url,
-                audio_url: choice.audio.base_url,
-                meta,
-            },
+            Ok(media) => Message::MediaReady { seq, media },
             Err(error) => Message::MediaFailed {
                 seq,
                 reason: error.to_string(),
@@ -2490,6 +3204,10 @@ impl Component for AppShell {
             auth_service.credential_provider(),
             nav.clone(),
         ));
+        let live_client = Arc::new(LiveClient::new(
+            auth_service.http(),
+            auth_service.credential_provider(),
+        ));
 
         // 启动即探测登录态（含自动 Cookie 续期 + `bili_ticket` 预热；后台单飞不重跑）。
         context.spawn_background({
@@ -2497,6 +3215,15 @@ impl Component for AppShell {
             move |_| Message::AuthProbed {
                 seq: auth_gen,
                 report: auth.probe_blocking(),
+            }
+        });
+
+        // U2:搜索默认词后台拉取(失败静默,占位文案兜底)。
+        context.spawn_background({
+            let search_client = search_client.clone();
+            move |_| {
+                let word = block_on(search_client.default_word()).ok();
+                Message::SearchDefaultReady(word)
             }
         });
 
@@ -2563,15 +3290,19 @@ impl Component for AppShell {
         let mut video_loading = false;
         if let Some(item) = &now_playing {
             engine = Some(VideoEngine::with_config(video_config_from(&settings)));
-            spawn_resolve_media(&auth_service, &settings, item.clone(), playback_gen, context);
+            spawn_resolve_media(
+                &auth_service,
+                &settings,
+                item.clone(),
+                playback_gen,
+                context,
+            );
             timer = Some(context.set_local_timeout(PLAYBACK_TICK, || Message::PositionTick));
             video_loading = true;
         }
         let demo = crate::demo::DemoConfig::from_env_and_args().map(crate::demo::DemoState::new);
         let demo_timer = if demo.is_some() {
-            Some(context.set_local_timeout(crate::demo::DEMO_TICK_INTERVAL, || {
-                Message::DemoTick
-            }))
+            Some(context.set_local_timeout(crate::demo::DEMO_TICK_INTERVAL, || Message::DemoTick))
         } else {
             None
         };
@@ -2598,6 +3329,7 @@ impl Component for AppShell {
             &home_on_open,
             &home_on_hover,
             &home_on_row_active,
+            &HashMap::new(),
         );
 
         // 热门页直连（QAQ_BX_ROUTE=popular 等）：真实 popular 首页随启动开拉。
@@ -2621,6 +3353,27 @@ impl Component for AppShell {
             Self::listen_toast(&rx, context);
             rx
         });
+
+        let key_route_ctx = Rc::new(Cell::new((route == Route::Player, false)));
+        let global_key_handler = {
+            let key_ctx = Rc::clone(&key_route_ctx);
+            let key_sender = context.sender();
+            RoutedCallback::new(move |ev: KeyEventInfo| {
+                let (player_visible, is_fullscreen) = key_ctx.get();
+                let text_focused = crate::winrt_ext::is_text_input_focused();
+                if let Some(action) = pages::fullscreen::resolve_player_hotkey(
+                    &ev,
+                    player_visible,
+                    is_fullscreen,
+                    text_focused,
+                ) {
+                    let _ = key_sender.send(Message::PlayerHotkey(action));
+                    true
+                } else {
+                    false
+                }
+            })
+        };
 
         Self {
             auth_service,
@@ -2665,6 +3418,7 @@ impl Component for AppShell {
             preresolved_order: VecDeque::new(),
             preresolve_inflight: HashMap::new(),
             pending_open_preresolve: None,
+            unplayable: HashMap::new(),
             image_cache,
             auth: AuthState::Unknown,
             login_flow: LoginFlowState::Idle,
@@ -2704,6 +3458,14 @@ impl Component for AppShell {
             search_state: pages::search::SearchUiState::default(),
             search_index: HashMap::new(),
             search_seq: 0,
+            search_default: None,
+            live: LivePageState {
+                // pn 从 1 起(与 popular 同语义)。
+                next_page: 1,
+                ..LivePageState::default()
+            },
+            live_client,
+            live_cover_inflight: std::collections::HashSet::new(),
             popular: pages::popular::PopularFeedState {
                 // pn 从 1 起（实测 pn=0 非法）；直启热门路由时首页已在飞。
                 next_pn: 1,
@@ -2729,7 +3491,23 @@ impl Component for AppShell {
             player_notice: None,
             video_loading,
             engine,
+            native_player: None,
+            native_enabled: std::env::var("QAQ_BX_NATIVE").as_deref() == Ok("1"),
             current_meta: None,
+            danmaku_first_seg: 0,
+            playback_dash: None,
+            quality_qns: Vec::new(),
+            current_qn: 0,
+            current_video_url: String::new(),
+            current_audio_url: String::new(),
+            media_probe_at: None,
+            failed_video_prefixes: Vec::new(),
+            video_fallback_done: false,
+            audio_fallback_done: false,
+            comment_draft: String::new(),
+            composer_notice: None,
+            pages_menu: Vec::new(),
+            current_cid: 0,
             timer,
             login_timer: None,
             smtc: None,
@@ -2740,6 +3518,13 @@ impl Component for AppShell {
             gamepad_rx,
             home_focus_idx: 0,
             home_half_pane: false,
+            is_fullscreen: false,
+            fullscreen_gen: 0,
+            fullscreen_sync_in_flight: false,
+            key_route_ctx,
+            global_key_handler,
+            pending_grid_rebuild: false,
+            grid_rebuild_timer: None,
             viewport_layout: initial_layout,
             whisper_detail_open: false,
             search_overlay_open: false,
@@ -2753,11 +3538,18 @@ impl Component for AppShell {
 
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
         self.refresh_probe();
+        #[cfg(feature = "probe")]
+        crate::probe::pump();
         match message {
             Message::Back => {
-                self.navigate_back();
+                if self.is_fullscreen {
+                    self.exit_fullscreen(context);
+                } else {
+                    self.navigate_back();
+                }
             }
             Message::NavTagSelected(tag) => {
+                self.exit_fullscreen(context);
                 self.logout_confirm = false;
                 self.more_menu_open = false;
                 self.search_overlay_open = false;
@@ -2767,11 +3559,15 @@ impl Component for AppShell {
                     self.whisper_detail_open = false;
                     self.history.push(self.route);
                     self.route = route;
+                    crate::trace::note(format!("route->{} (页签点击)", route.tag()));
                     if route == Route::Login {
                         self.ensure_account_loaded(context);
                     }
                     if route == Route::Popular {
                         self.ensure_popular(context);
+                    }
+                    if route == Route::Live {
+                        self.ensure_live(context);
                     }
                 }
             }
@@ -2802,7 +3598,12 @@ impl Component for AppShell {
             Message::SearchSubmitted => {
                 self.submit_search(context);
             }
-            Message::SearchResults { seq, query, items, total } => {
+            Message::SearchResults {
+                seq,
+                query,
+                items,
+                total,
+            } => {
                 if seq != self.search_seq {
                     return;
                 }
@@ -2812,7 +3613,12 @@ impl Component for AppShell {
                         && let Some(url) = &item.pic_url
                     {
                         // 复用首页封面补拉(缓存命中由后台线程已挂;feed_epoch 未变即生效)。
-                        self.spawn_cover_fetch(item.bvid.clone(), url.clone(), self.feed_gen, context);
+                        self.spawn_cover_fetch(
+                            item.bvid.clone(),
+                            url.clone(),
+                            self.feed_gen,
+                            context,
+                        );
                     }
                     self.search_index.insert(item.bvid.clone(), item.clone());
                     owned.push(item);
@@ -2829,6 +3635,17 @@ impl Component for AppShell {
                 self.search_state.loading = false;
                 self.search_state.error = Some(error);
             }
+            Message::SearchDefaultReady(word) => {
+                self.search_default = word.clone();
+                self.search_state.default_word = word;
+            }
+            Message::SearchPickDefault => {
+                // U2:默认词填充草稿并立即提交(草稿先入单源,提交复用同一路径)。
+                if let Some(word) = self.search_default.clone() {
+                    self.search_state.draft = word;
+                    self.update(Message::SearchSubmitted, context);
+                }
+            }
             Message::OpenVideo(bvid) => {
                 self.open_video(&bvid, context);
                 self.sync_smtc(context);
@@ -2838,6 +3655,23 @@ impl Component for AppShell {
                 self.sync_smtc(context);
             }
             Message::TogglePlay => {
+                // v0.3 spike:native 引擎优先。
+                if let Some(player) = &self.native_player {
+                    let status = player.status();
+                    if status.finished {
+                        let _ = player.seek(0.0);
+                        let _ = player.play();
+                        self.playing = true;
+                    } else if self.playing {
+                        let _ = player.pause();
+                        self.playing = false;
+                    } else {
+                        let _ = player.play();
+                        self.playing = true;
+                    }
+                    self.sync_smtc(context);
+                    return;
+                }
                 let Some(engine) = &self.engine else {
                     return;
                 };
@@ -2861,6 +3695,10 @@ impl Component for AppShell {
             }
             Message::Seek(value) => {
                 self.position = value.round().clamp(0.0, f64::from(u32::MAX)) as u32;
+                if let Some(player) = &self.native_player {
+                    let _ = player.seek(value.max(0.0));
+                    return;
+                }
                 if let Some(engine) = &self.engine {
                     engine.seek(value.max(0.0));
                 }
@@ -2872,7 +3710,9 @@ impl Component for AppShell {
                 }
                 if vol != self.volume {
                     self.volume = vol;
-                    if let Some(engine) = &self.engine {
+                    if let Some(player) = &self.native_player {
+                        let _ = player.set_volume(f64::from(self.volume));
+                    } else if let Some(engine) = &self.engine {
                         engine.set_volume(f64::from(self.volume));
                     }
                 }
@@ -2889,7 +3729,9 @@ impl Component for AppShell {
                     0
                 };
                 self.volume = target;
-                if let Some(engine) = &self.engine {
+                if let Some(player) = &self.native_player {
+                    let _ = player.set_volume(f64::from(target));
+                } else if let Some(engine) = &self.engine {
                     engine.set_volume(f64::from(target));
                 }
                 if self.settings.volume != target {
@@ -2904,24 +3746,191 @@ impl Component for AppShell {
                         self.settings.danmaku_enabled,
                         self.settings.danmaku_opacity,
                         self.settings.danmaku_max_lanes,
+                        &self.settings.danmaku_font_family,
+                        self.settings.danmaku_font_scale,
                     );
                 }
                 self.schedule_settings_save(context);
             }
+            Message::EnterFullscreen => {
+                self.enter_fullscreen(context);
+            }
+            Message::ExitFullscreen => {
+                self.exit_fullscreen(context);
+            }
+            Message::ToggleFullscreen => {
+                if self.is_fullscreen {
+                    self.exit_fullscreen(context);
+                } else {
+                    self.enter_fullscreen(context);
+                }
+            }
+            Message::FullscreenSynced { gen_id, active } => {
+                if gen_id == self.fullscreen_gen {
+                    self.fullscreen_sync_in_flight = false;
+                    if !active {
+                        self.is_fullscreen = false;
+                    }
+                }
+            }
+            Message::FullscreenProbeResult { gen_id, active } => {
+                if gen_id == self.fullscreen_gen && self.is_fullscreen && !active {
+                    self.is_fullscreen = false;
+                }
+            }
+            Message::PlayerHotkey(hotkey) => match hotkey {
+                pages::fullscreen::PlayerHotkey::ToggleFullscreen => {
+                    if self.is_fullscreen {
+                        self.exit_fullscreen(context);
+                    } else {
+                        self.enter_fullscreen(context);
+                    }
+                }
+                pages::fullscreen::PlayerHotkey::ExitFullscreen => {
+                    self.exit_fullscreen(context);
+                }
+                pages::fullscreen::PlayerHotkey::TogglePlay => {
+                    self.update(Message::TogglePlay, context);
+                }
+                pages::fullscreen::PlayerHotkey::SeekDelta(delta) => {
+                    if self.is_player_visible() {
+                        let max_secs = self
+                            .now_playing
+                            .as_ref()
+                            .map(|item| self.display_duration(item))
+                            .unwrap_or(0);
+                        let next = if delta < 0 {
+                            self.position.saturating_sub(delta.unsigned_abs())
+                        } else {
+                            self.position.saturating_add(delta as u32)
+                        };
+                        let clamped = if max_secs > 0 {
+                            next.min(max_secs)
+                        } else {
+                            next
+                        };
+                        self.update(Message::Seek(f64::from(clamped)), context);
+                    }
+                }
+                pages::fullscreen::PlayerHotkey::VolumeDelta(delta) => {
+                    if self.is_player_visible() {
+                        let next = if delta < 0 {
+                            self.volume.saturating_sub(delta.unsigned_abs())
+                        } else {
+                            (self.volume + delta as u32).min(100)
+                        };
+                        self.update(Message::SetVolume(f64::from(next)), context);
+                    }
+                }
+                pages::fullscreen::PlayerHotkey::ToggleMute => {
+                    if self.is_player_visible() {
+                        self.update(Message::ToggleMute, context);
+                    }
+                }
+                pages::fullscreen::PlayerHotkey::ToggleDanmaku => {
+                    if self.is_player_visible() {
+                        self.update(Message::ToggleDanmaku, context);
+                    }
+                }
+            },
             Message::PositionTick => {
+                // v0.3 spike:native 引擎状态单源(无 has_media/missing_track 探测)。
+                if let Some(player) = &self.native_player {
+                    let status = player.status();
+                    // 心跳诊断锚(F4 风格):播放态每 30s 一行,验证 pos 推进/时长有效。
+                    if status.playing
+                        && (status.position_secs as u64).is_multiple_of(30)
+                        && status.position_secs % 1.0 < 0.5
+                    {
+                        eprintln!(
+                            "[qaq-bx-ui] native heartbeat pos={:.1} dur={:.1}",
+                            status.position_secs, status.duration_secs
+                        );
+                    }
+                    if !status.playing || status.position_secs > 0.0 {
+                        self.video_loading = false;
+                    }
+                    self.position = status
+                        .position_secs
+                        .round()
+                        .clamp(0.0, f64::from(u32::MAX)) as u32;
+                    self.playing = status.playing;
+                    if status.duration_secs > 0.0 {
+                        self.engine_duration = Some(status.duration_secs);
+                    }
+                    if self.player_notice.is_none()
+                        && let Some(reason) = &status.error
+                    {
+                        self.player_notice = Some(reason.clone());
+                        self.video_loading = false;
+                    }
+                    // 挂载节拍:engine.attached 恒 false(mpv idle),持续驱动
+                    // NativeSurface 重试注入(500ms 节流一次足够)。
+                    if mount_pulse_active(
+                        self.route,
+                        self.home_half_pane,
+                        self.is_fullscreen,
+                        false,
+                    ) {
+                        self.mount_tick = self.mount_tick.wrapping_add(1);
+                    }
+                    self.sync_smtc(context);
+                    if self.now_playing.is_some() {
+                        self.timer =
+                            Some(context.set_local_timeout(PLAYBACK_TICK, || Message::PositionTick));
+                    } else {
+                        self.timer = None;
+                    }
+                    return;
+                }
                 // 引擎快照 → UI 单源(乐观更新的 TogglePlay/Seek 在此被真实值校正)。
-                if let Some(engine) = &self.engine {
+                // Arc 克隆出借用(F4 回退需要 &mut self)。
+                let engine = self.engine.clone();
+                if let Some(engine) = engine {
                     let status = engine.status();
                     if status.has_media() {
                         self.video_loading = false;
-                        self.position = status.time_pos.round().clamp(0.0, f64::from(u32::MAX)) as u32;
+                        self.position =
+                            status.time_pos.round().clamp(0.0, f64::from(u32::MAX)) as u32;
                         self.playing = !status.pause && !status.eof;
                         if status.duration > 0.0 {
                             self.engine_duration = Some(status.duration);
                         }
                     }
+                    // F4 首播音画缺失探测:媒体就绪后计时,持续缺轨 3s 自动回退。
+                    if status.has_media() && self.media_probe_at.is_none() {
+                        self.media_probe_at = Some(Instant::now());
+                    }
+                    if let Some(track) = missing_media_track(
+                        &status.video_format,
+                        &status.audio_codec,
+                        status.has_media(),
+                        self.media_probe_at.map(|at| at.elapsed()),
+                    ) {
+                        // 触发一次即清探测点,回退重载会重置。
+                        self.media_probe_at = None;
+                        match track {
+                            MissingTrack::Video => {
+                                if !self.video_fallback_done {
+                                    self.video_fallback_done = true;
+                                    self.apply_video_fallback();
+                                }
+                            }
+                            MissingTrack::Audio => {
+                                if !self.audio_fallback_done {
+                                    self.audio_fallback_done = true;
+                                    self.apply_audio_fallback();
+                                }
+                            }
+                        }
+                    }
                     // 仅当 SwapChain 尚未挂载成功时按 250ms 递增驱动 VideoSurface::try_mount()。
-                    if mount_pulse_active(self.route, self.home_half_pane, engine.attached()) {
+                    if mount_pulse_active(
+                        self.route,
+                        self.home_half_pane,
+                        self.is_fullscreen,
+                        engine.attached(),
+                    ) {
                         self.mount_tick = self.mount_tick.wrapping_add(1);
                     }
                     // 引擎错误(初始化/挂载/设备级)一次性上屏。
@@ -2941,17 +3950,233 @@ impl Component for AppShell {
                     self.timer = None;
                 }
             }
-            Message::MediaReady {
-                seq,
-                video_url,
-                audio_url,
-                meta,
-            } => {
+            Message::MediaReady { seq, media } => {
                 if seq != self.playback_gen {
                     return; // 过期解析结果直接丢弃，防止切视频后串台覆盖
                 }
                 self.pending_open_preresolve = None;
-                self.apply_resolved_media(video_url, audio_url, meta, seq, context);
+                self.apply_resolved_media(media, seq, context);
+            }
+            Message::SelectQuality(qn) => {
+                if qn == self.current_qn {
+                    return;
+                }
+                let Some(dash) = self.playback_dash.clone() else {
+                    return;
+                };
+                let Some(choice) = select_stream_by_qn(&dash, qn, self.settings.codec.priority())
+                else {
+                    return;
+                };
+                // 定点换流:记住当前进度与播放态,mpv `start` 直达,弹幕/相关推荐不动。
+                // v0.3 spike:native 走重载 + SetPosition。
+                if self.native_active() {
+                    let start = self.native_position();
+                    if self.native_load_choice(&choice, self.playing, start) {
+                        self.current_qn = qn;
+                        self.current_video_url = choice.video.base_url.clone();
+                        self.current_audio_url = choice.audio.base_url.clone();
+                        self.media_probe_at = Some(Instant::now());
+                        self.player_notice = None;
+                        return;
+                    }
+                }
+                let start = self
+                    .engine
+                    .as_ref()
+                    .map(|engine| engine.status().time_pos)
+                    .unwrap_or(0.0);
+                if let Some(engine) = &self.engine {
+                    engine.load_with_options(
+                        &choice.video.base_url,
+                        Some(&choice.audio.base_url),
+                        start,
+                        self.playing,
+                    );
+                }
+                self.current_qn = qn;
+                self.current_video_url = choice.video.base_url.clone();
+                self.current_audio_url = choice.audio.base_url.clone();
+                self.media_probe_at = Some(Instant::now());
+                self.player_notice = None;
+            }
+            Message::SelectPage(cid) => {
+                // U3 分P切换:重取 playurl(cid) → 定点换流 + 弹幕/进度联动。
+                if cid == 0 || cid == self.current_cid {
+                    return;
+                }
+                let Some(item) = self.now_playing.clone() else {
+                    return;
+                };
+                let nav = self.auth_service.nav_client();
+                let (max_qn, codecs) = resolve_params_for(&self.settings, &nav);
+                let auth = self.auth_service.clone();
+                let gen_id = self.playback_gen;
+                context.spawn_background(move |_| {
+                    let client = PlayerClient::with_nav(auth.http(), auth.credential_provider(), nav);
+                    let result = block_on(client.resolve_full_with_cid(
+                        &item.bvid,
+                        item.aid,
+                        cid,
+                        &item.title,
+                        i64::from(item.duration_secs),
+                        max_qn,
+                        codecs,
+                    ))
+                    .map_err(|err| err.to_string());
+                    Message::PageStreamReady { gen_id, cid, result }
+                });
+            }
+            Message::PageStreamReady { gen_id, cid, result } => {
+                if gen_id != self.playback_gen {
+                    return;
+                }
+                match result {
+                    Ok(media) => {
+                        let ResolvedMedia { choice, dash, .. } = media;
+                        // v0.3 spike:native 分支(重载 + SetPosition;native_position
+                        // 保持的是旧分P末进度,分P语义本就回零,可接受)。
+                        if self.native_active() {
+                            if self.native_load_choice(&choice, self.playing, 0.0) {
+                                self.current_cid = cid;
+                                self.current_qn = choice.video.id;
+                                self.current_video_url = choice.video.base_url;
+                                self.current_audio_url = choice.audio.base_url;
+                                self.playback_dash = Some(dash.clone());
+                                self.quality_qns = quality_menu(&dash.video, 0);
+                                self.media_probe_at = Some(Instant::now());
+                                self.player_notice = None;
+                                if let Some(meta) = &mut self.current_meta {
+                                    meta.cid = cid;
+                                }
+                                self.fetch_danmaku(gen_id, 0.0, context);
+                                return;
+                            }
+                        }
+                        let start = self
+                            .engine
+                            .as_ref()
+                            .map(|engine| engine.status().time_pos)
+                            .unwrap_or(0.0);
+                        if let Some(engine) = &self.engine {
+                            engine.load_with_options(
+                                &choice.video.base_url,
+                                Some(&choice.audio.base_url),
+                                start,
+                                self.playing,
+                            );
+                        }
+                        self.current_cid = cid;
+                        self.current_qn = choice.video.id;
+                        self.current_video_url = choice.video.base_url;
+                        self.current_audio_url = choice.audio.base_url;
+                        self.playback_dash = Some(dash.clone());
+                        self.quality_qns = quality_menu(&dash.video, 0);
+                        self.media_probe_at = Some(Instant::now());
+                        self.player_notice = None;
+                        // 弹幕跟随分P cid 重拉(评论区仍按 aid 不动);预存为
+                        // 增量追加,换流前先清空旧 P 的弹幕层。
+                        if let Some(engine) = &self.engine {
+                            engine.set_danmaku(Vec::new());
+                        }
+                        if let Some(meta) = &mut self.current_meta {
+                            meta.cid = cid;
+                        }
+                        self.fetch_danmaku(gen_id, start, context);
+                    }
+                    Err(reason) => {
+                        self.player_notice = Some(format!("切换分P失败:{reason}"));
+                    }
+                }
+            }
+            Message::LiveRoomsLoaded { page, res } => {
+                self.absorb_live_rooms(page, res, context);
+            }
+            Message::LiveCoverReady { url, image } => {
+                self.live_cover_inflight.remove(&url);
+                if let Some(img) = image {
+                    for card in &mut self.live.cards {
+                        if card.room.cover == url && card.cover.is_none() {
+                            card.cover = Some(img.clone());
+                        }
+                    }
+                }
+            }
+            Message::LiveRoomSelected(roomid, title, uname) => {
+                self.start_live_playback(roomid, title, uname, context);
+                self.sync_smtc(context);
+            }
+            Message::LiveReady { gen_id, result } => {
+                if gen_id != self.playback_gen {
+                    return;
+                }
+                match result {
+                    Ok(url) => {
+                        if let Some(engine) = &self.engine {
+                            engine.set_volume(f64::from(self.volume));
+                            engine.load_with_options(&url, None, 0.0, self.settings.autoplay);
+                        }
+                        self.playing = self.settings.autoplay;
+                        self.current_video_url = url;
+                        self.media_probe_at = Some(Instant::now());
+                    }
+                    Err(reason) => {
+                        self.player_notice = Some(format!("直播间打开失败:{reason}"));
+                        self.video_loading = false;
+                    }
+                }
+            }
+            Message::LiveMore => {
+                self.fetch_live_rooms(context);
+            }
+            Message::CommentDraftChanged(text) => {
+                self.comment_draft = text;
+                if self.composer_notice.is_some() {
+                    self.composer_notice = None;
+                }
+            }
+            Message::SubmitComment => {
+                // U1 登录门控:未登录直接行内提示,不发请求。
+                if !matches!(self.auth, AuthState::LoggedIn(_)) {
+                    self.composer_notice = Some("请先登录后再发布评论".to_string());
+                    return;
+                }
+                let draft = self.comment_draft.trim().to_string();
+                if draft.is_empty() {
+                    self.composer_notice = Some("评论内容不能为空".to_string());
+                    return;
+                }
+                let Some(meta) = self.current_meta.clone() else {
+                    self.composer_notice = Some("视频信息尚未就绪,稍后再试".to_string());
+                    return;
+                };
+                self.composer_notice = None;
+                let reply_client = self.reply_client.clone();
+                let gen_id = self.playback_gen;
+                context.spawn_background(move |_| {
+                    let result = block_on(reply_client.add(meta.aid, &draft))
+                        .map_err(|err| err.to_string());
+                    Message::CommentSubmitted { gen_id, result }
+                });
+            }
+            Message::CommentSubmitted { gen_id, result } => {
+                if gen_id != self.playback_gen {
+                    return;
+                }
+                match result {
+                    Ok(_) => {
+                        // 发布成功:清草稿 + 回到首页重拉最新评论。
+                        self.comment_draft.clear();
+                        self.composer_notice = None;
+                        let sort = self.comments_session.sort;
+                        self.comments_session.bucket_mut(sort).cursor = None;
+                        self.comments_session.bucket_mut(sort).has_more = true;
+                        self.fetch_comments(sort, false, context);
+                    }
+                    Err(reason) => {
+                        self.composer_notice = Some(format!("发布失败:{reason}"));
+                    }
+                }
             }
             Message::VideoMetaLoaded { seq, res } => {
                 if seq != self.playback_gen {
@@ -3073,13 +4298,13 @@ impl Component for AppShell {
                 self.spawn_playback_avatars(avatar_urls.iter().map(String::as_str), seq, context);
             }
             Message::ToggleSubReplies(rpid) => {
-                let need_fetch = if let Some(entry) = self.comments_session.sub_replies.get_mut(&rpid)
-                {
-                    entry.expanded = !entry.expanded;
-                    entry.expanded && entry.items.is_empty() && !entry.loading
-                } else {
-                    true
-                };
+                let need_fetch =
+                    if let Some(entry) = self.comments_session.sub_replies.get_mut(&rpid) {
+                        entry.expanded = !entry.expanded;
+                        entry.expanded && entry.items.is_empty() && !entry.loading
+                    } else {
+                        true
+                    };
                 if need_fetch {
                     self.fetch_sub_replies(rpid, false, context);
                 } else {
@@ -3142,12 +4367,12 @@ impl Component for AppShell {
                 self.refresh_comments_snapshot();
                 self.spawn_playback_avatars(avatar_urls.iter().map(String::as_str), seq, context);
             }
-            Message::DanmakuLoaded { seq, elems } => {
+            Message::DanmakuPart { seq, index, elems } => {
                 if seq != self.playback_gen {
                     return;
                 }
-                // 转引擎镜像类型(避免 qaq-bx-video 依赖 qaq-bx-core),交由
-                // 引擎线程在视频帧上叠画(暂停即冻结,与视频天然同步)。
+                // 转引擎镜像类型(避免 qaq-bx-video 依赖 qaq-bx-core),增量追加;
+                // 引擎线程归并回 progress 升序后在视频帧上叠画(暂停即冻结)。
                 let items = elems
                     .into_iter()
                     .map(|e| OverlayDanmaku {
@@ -3156,21 +4381,37 @@ impl Component for AppShell {
                         fontsize: e.fontsize,
                         color: e.color,
                         content: e.content,
+                        mid_hash: e.mid_hash,
+                        weight: e.weight,
                     })
                     .collect();
                 if let Some(engine) = &self.engine {
-                    engine.set_danmaku(items);
+                    engine.append_danmaku(items);
+                }
+                // 预存链:驱动下一段(全部段到货后自然收束)。
+                if let Some(next) = self.next_danmaku_index(index) {
+                    self.fetch_danmaku_segment(seq, next, context);
                 }
             }
-            Message::DanmakuFailed { seq, reason } => {
-                // 弹幕拉取失败不影响播放;静默保留空层，仅记录当前代次诊断日志。
+            Message::DanmakuFailed { seq, index, reason } => {
+                // 弹幕拉取失败不影响播放;静默跳过该段,预存链继续补齐后续段。
                 if seq == self.playback_gen {
-                    eprintln!("[qaq-bx-ui] 弹幕拉取失败（不影响播放）: {reason}");
+                    eprintln!("[qaq-bx-ui] 弹幕分段 {index} 拉取失败(不影响播放): {reason}");
+                    if let Some(next) = self.next_danmaku_index(index) {
+                        self.fetch_danmaku_segment(seq, next, context);
+                    }
                 }
             }
             Message::MediaFailed { seq, reason } => {
                 if seq != self.playback_gen {
                     return;
+                }
+                // 直点路径命中试看降级:登记不可播(回到首页时卡面带角标)。
+                if is_trial_downgrade_reason(&reason)
+                    && let Some(bvid) = self.now_playing.as_ref().map(|i| i.bvid.clone())
+                {
+                    self.unplayable.entry(bvid).or_insert(reason.clone());
+                    self.rebuild_home_source();
                 }
                 self.player_notice = Some(format!("视频解析失败:{reason}"));
                 self.playing = false;
@@ -3181,6 +4422,7 @@ impl Component for AppShell {
                 if self.route != Route::Player {
                     self.history.push(self.route);
                     self.route = Route::Player;
+                    crate::trace::note("route->player (半屏展开)");
                 }
             }
             Message::CloseHalfPane => {
@@ -3342,6 +4584,7 @@ impl Component for AppShell {
                 self.search_overlay_open = false;
             }
             Message::NavigateCompact(target) => {
+                self.exit_fullscreen(context);
                 self.more_menu_open = false;
                 self.search_overlay_open = false;
                 self.home_half_pane = false;
@@ -3350,11 +4593,15 @@ impl Component for AppShell {
                     self.whisper_detail_open = false;
                     self.history.push(self.route);
                     self.route = target;
+                    crate::trace::note(format!("route->{} (菜单导航)", target.tag()));
                     if target == Route::Login && self.auth_gen > 0 {
                         self.ensure_account_loaded(context);
                     }
                     if target == Route::Popular {
                         self.ensure_popular(context);
+                    }
+                    if target == Route::Live {
+                        self.ensure_live(context);
                     }
                 }
             }
@@ -3374,15 +4621,37 @@ impl Component for AppShell {
                 if !next_layout.uses_whisper_drilldown() {
                     self.whisper_detail_open = false;
                 }
-                if next_layout.is_mobile() && self.home_half_pane {
+                if !self.is_fullscreen && next_layout.is_mobile() && self.home_half_pane {
                     self.home_half_pane = false;
                     if self.now_playing.is_some() && self.route == Route::Home {
                         self.history.push(Route::Home);
                         self.route = Route::Player;
+                        crate::trace::note("route->player (移动布局半屏收起)");
                     }
                 }
+                if self.is_fullscreen && !self.fullscreen_sync_in_flight {
+                    let gen_id = self.fullscreen_gen;
+                    let _ = context.run_window(move |window| {
+                        let active =
+                            crate::winrt_ext::is_window_fullscreen(window.as_raw()).unwrap_or(true);
+                        Message::FullscreenProbeResult { gen_id, active }
+                    });
+                }
                 if next_layout.should_rebuild_grid(prev_cards) {
+                    // 轻量字段即时更新(探针/分页目标依赖);重量级 VirtualSource
+                    // 重建去抖 150ms(P1:拖拽期间每 2 DIP 一重建是卡顿主因)。
                     self.home_state.grid_cols = next_layout.cards.cols;
+                    self.pending_grid_rebuild = true;
+                    self.grid_rebuild_timer =
+                        Some(context.set_local_timeout(GRID_REBUILD_DEBOUNCE, || {
+                            Message::WindowResizeSettled
+                        }));
+                }
+            }
+            Message::WindowResizeSettled => {
+                self.grid_rebuild_timer = None;
+                if self.pending_grid_rebuild {
+                    self.pending_grid_rebuild = false;
                     self.home_active_rows.clear();
                     self.home_anchor_row = 0;
                     self.home_last_evict_row = 0;
@@ -3418,12 +4687,12 @@ impl Component for AppShell {
                 self.home_state.loading = false;
                 if self.home_refresh_pending {
                     self.home_refresh_pending = false;
-                    let target = self.home_pending_skeletons.max(
-                        feed_pager::logical_page_target_for(
-                            self.viewport_layout.cards,
-                            self.home_viewport_h,
-                        ),
-                    );
+                    let target =
+                        self.home_pending_skeletons
+                            .max(feed_pager::logical_page_target_for(
+                                self.viewport_layout.cards,
+                                self.home_viewport_h,
+                            ));
                     self.request_feed_batch(FeedKind::Refresh, target, true, context);
                     return;
                 }
@@ -3510,12 +4779,12 @@ impl Component for AppShell {
                 self.home_state.loading = false;
                 if self.home_refresh_pending {
                     self.home_refresh_pending = false;
-                    let target = self.home_pending_skeletons.max(
-                        feed_pager::logical_page_target_for(
-                            self.viewport_layout.cards,
-                            self.home_viewport_h,
-                        ),
-                    );
+                    let target =
+                        self.home_pending_skeletons
+                            .max(feed_pager::logical_page_target_for(
+                                self.viewport_layout.cards,
+                                self.home_viewport_h,
+                            ));
                     self.request_feed_batch(FeedKind::Refresh, target, true, context);
                     return;
                 }
@@ -3588,6 +4857,10 @@ impl Component for AppShell {
                 }
             }
             Message::PreResolveVideo(bvid) => {
+                // 已判定不可播(充电/付费未解锁):不再重复发 playurl。
+                if self.unplayable.contains_key(&bvid) {
+                    return;
+                }
                 let Some(item) = self.home_index.get(&bvid).cloned() else {
                     return;
                 };
@@ -3619,7 +4892,7 @@ impl Component for AppShell {
                 context.spawn_background(move |_| {
                     let client =
                         PlayerClient::with_nav(auth.http(), auth.credential_provider(), nav);
-                    let res = block_on(client.resolve_with_cid(
+                    let res = block_on(client.resolve_full_with_cid(
                         &item.bvid,
                         item.aid,
                         item.cid,
@@ -3638,35 +4911,33 @@ impl Component for AppShell {
             }
             Message::MediaPreResolved { bvid, key, result } => {
                 self.preresolve_inflight.remove(&bvid);
-                let matched_open = self
-                    .pending_open_preresolve
-                    .as_ref()
-                    .is_some_and(|(pending_bvid, gen_id, pending_key)| {
+                let matched_open = self.pending_open_preresolve.as_ref().is_some_and(
+                    |(pending_bvid, gen_id, pending_key)| {
                         pending_bvid == &bvid && *gen_id == self.playback_gen && *pending_key == key
-                    });
+                    },
+                );
                 if matched_open {
                     self.pending_open_preresolve = None;
                 }
                 match result {
-                    Ok((meta, choice)) => {
+                    Ok(media) => {
                         if std::env::var_os("QAQ_BX_TRACE_HOME").is_some() {
                             eprintln!(
                                 "[qaq-bx-ui] preresolved cached (no autoplay): bvid={}, qn={}, route={:?}",
-                                bvid, choice.video.id, self.route
+                                bvid, media.choice.video.id, self.route
                             );
                         }
                         if matched_open {
-                            self.apply_resolved_media(
-                                choice.video.base_url.clone(),
-                                choice.audio.base_url.clone(),
-                                meta.clone(),
-                                self.playback_gen,
-                                context,
-                            );
+                            self.apply_resolved_media(media.clone(), self.playback_gen, context);
                         }
-                        self.cache_preresolved(bvid, key, meta, choice);
+                        self.cache_preresolved(bvid, key, media);
                     }
                     Err(reason) => {
+                        // 试看降级(充电/付费未解锁):登记不可播并刷新卡面角标。
+                        if is_trial_downgrade_reason(&reason) {
+                            self.unplayable.entry(bvid.clone()).or_insert(reason.clone());
+                            self.rebuild_home_source();
+                        }
                         if matched_open {
                             self.player_notice = Some(format!("视频解析失败:{reason}"));
                             self.playing = false;
@@ -3695,14 +4966,25 @@ impl Component for AppShell {
                 }
                 if (next.danmaku_enabled != self.settings.danmaku_enabled
                     || (next.danmaku_opacity - self.settings.danmaku_opacity).abs() > f32::EPSILON
-                    || next.danmaku_max_lanes != self.settings.danmaku_max_lanes)
+                    || next.danmaku_max_lanes != self.settings.danmaku_max_lanes
+                    || next.danmaku_font_family != self.settings.danmaku_font_family
+                    || (next.danmaku_font_scale - self.settings.danmaku_font_scale).abs()
+                        > f32::EPSILON)
                     && let Some(engine) = &self.engine
                 {
                     engine.set_danmaku_config(
                         next.danmaku_enabled,
                         next.danmaku_opacity,
                         next.danmaku_max_lanes,
+                        &next.danmaku_font_family,
+                        next.danmaku_font_scale,
                     );
+                }
+                if danmaku_filter_from(&next) != danmaku_filter_from(&self.settings)
+                    && let Some(engine) = &self.engine
+                {
+                    // 规则变化 → 引擎线程编译并对已缓存弹幕全量重滤(热更新)。
+                    engine.set_danmaku_filter(danmaku_filter_from(&next));
                 }
                 self.settings = next;
                 self.schedule_settings_save(context);
@@ -3784,7 +5066,9 @@ impl Component for AppShell {
                     self.login_flow = match &self.login_flow {
                         LoginFlowState::AwaitingScan { qr }
                         | LoginFlowState::Scanned { qr }
-                        | LoginFlowState::Expired { qr } => LoginFlowState::Expired { qr: qr.clone() },
+                        | LoginFlowState::Expired { qr } => {
+                            LoginFlowState::Expired { qr: qr.clone() }
+                        }
                         other => other.clone(),
                     };
                 }
@@ -3839,6 +5123,7 @@ impl Component for AppShell {
 
             // ---- 个人中心与通知中心 ----
             Message::OpenNotifications => {
+                self.exit_fullscreen(context);
                 self.logout_confirm = false;
                 self.more_menu_open = false;
                 self.search_overlay_open = false;
@@ -3846,6 +5131,7 @@ impl Component for AppShell {
                 if self.route != Route::Login {
                     self.history.push(self.route);
                     self.route = Route::Login;
+                    crate::trace::note("route->login (账号入口)");
                 }
                 if self.notify_tab.unread(self.unread_summary) == 0
                     && let Some(unread_tab) = NotifyTab::ALL
@@ -4006,7 +5292,10 @@ impl Component for AppShell {
             Message::SelectWhisperSession((talker_id, session_type)) => {
                 self.selected_whisper = Some((talker_id, session_type));
                 self.whisper_detail_open = true;
-                if !self.whisper_threads.contains_key(&(talker_id, session_type)) {
+                if !self
+                    .whisper_threads
+                    .contains_key(&(talker_id, session_type))
+                {
                     self.fetch_whisper_thread(talker_id, session_type, context);
                 }
             }
@@ -4157,9 +5446,42 @@ impl Component for AppShell {
         }
         context.window_visuals(visuals);
         context.on_window_size(context.callback(Message::WindowResized));
+        self.sync_key_route_ctx();
 
         let layout = self.viewport_layout;
         let is_mobile = layout.is_mobile();
+        if self.is_fullscreen
+            && let (Some(item), Some(engine)) = (self.now_playing.as_ref(), self.engine.as_ref())
+        {
+            let fs_view = View::component::<pages::fullscreen::FullscreenPlayer>(
+                pages::fullscreen::FullscreenInput {
+                    item: item.clone(),
+                    playing: self.playing,
+                    position: self.position,
+                    duration_secs: self.display_duration(item),
+                    volume: self.volume,
+                    danmaku_enabled: self.settings.danmaku_enabled,
+                    quality_menu: self.quality_menu_view(),
+                    current_qn: self.current_qn,
+                    mount_tick: self.mount_tick,
+                    notice: self.player_notice.clone(),
+                    loading: self.video_loading,
+                    window_width: layout.window_width,
+                    engine: engine.clone(),
+                    on_toggle: context.message(Message::TogglePlay),
+                    on_seek: context.callback(|value: f64| Message::Seek(value)),
+                    on_volume: context.callback(|value: f64| Message::SetVolume(value)),
+                    on_toggle_mute: context.message(Message::ToggleMute),
+                    on_toggle_danmaku: context.message(Message::ToggleDanmaku),
+                    on_select_quality: context.callback(Message::SelectQuality),
+                    on_exit_fullscreen: context.message(Message::ExitFullscreen),
+                },
+            );
+            return Border::new()
+                .on_preview_key_down(self.global_key_handler.clone())
+                .content(Grid::new().keyed_children([keyed("fs-root", fs_view)]))
+                .into();
+        }
         let on_open = context.callback(Message::OpenVideo);
         let is_vip = matches!(&self.auth, AuthState::LoggedIn(user) if user.vip.is_vip());
         let my_avatar = match &self.auth {
@@ -4172,6 +5494,11 @@ impl Component for AppShell {
             on_retry: context.message(Message::RetryComments),
             on_toggle_sub: context.callback(Message::ToggleSubReplies),
             on_load_more_sub: context.callback(Message::LoadMoreSubReplies),
+            on_draft: context.callback(|text: Rc<str>| Message::CommentDraftChanged(text.to_string())),
+            on_submit: context.message(Message::SubmitComment),
+            composer_notice: self.composer_notice.clone(),
+            can_post: matches!(self.auth, AuthState::LoggedIn(_)),
+            composer_draft: self.comment_draft.clone(),
         };
         let author_avatar = self
             .now_playing
@@ -4192,12 +5519,17 @@ impl Component for AppShell {
                         position: self.position,
                         volume: self.volume,
                         danmaku_enabled: self.settings.danmaku_enabled,
+                        quality_menu: self.quality_menu_view(),
+                        current_qn: self.current_qn,
+                        pages_menu: self.pages_menu_view(),
+                        current_cid: self.current_cid,
                         layout,
                         mount_tick: self.mount_tick,
                         duration_secs: self.display_duration(item),
                         notice: self.player_notice.clone(),
                         loading: self.video_loading,
                         engine: engine.clone(),
+                        native: self.native_player.clone(),
                         comments: self.comments_snapshot.clone(),
                         comment_cb: comment_cb.clone(),
                         related: self.related.clone(),
@@ -4208,6 +5540,9 @@ impl Component for AppShell {
                         on_volume: context.callback(|value: f64| Message::SetVolume(value)),
                         on_toggle_mute: context.message(Message::ToggleMute),
                         on_toggle_danmaku: context.message(Message::ToggleDanmaku),
+                        on_select_quality: context.callback(Message::SelectQuality),
+                        on_select_page: context.callback(Message::SelectPage),
+                        on_enter_fullscreen: context.message(Message::EnterFullscreen),
                         demo_override: self.demo.as_ref().and_then(|d| d.player_override),
                     })
                 }
@@ -4278,9 +5613,27 @@ impl Component for AppShell {
             let on_draft =
                 context.callback(|text: Rc<str>| Message::SearchDraftChanged(text.to_string()));
             let on_submit = context.message(Message::SearchSubmitted);
-            pages::search::search_page(&self.search_state, &on_draft, &on_submit, &on_open, layout)
+            let on_pick_default = context.message(Message::SearchPickDefault);
+            pages::search::search_page(
+                &self.search_state,
+                &on_draft,
+                &on_submit,
+                &on_pick_default,
+                &on_open,
+                layout,
+            )
         } else if self.route == Route::Home {
             self.home_view(context)
+        } else if self.route == Route::Live {
+            let on_open_room = context.callback(|(roomid, title, uname): (u64, String, String)| {
+                Message::LiveRoomSelected(roomid, title, uname)
+            });
+            pages::live::live_page(
+                &self.live,
+                layout,
+                &on_open_room,
+                &context.message(Message::LiveMore),
+            )
         } else if self.route == Route::Popular {
             pages::popular::popular_page(
                 &self.popular,
@@ -4296,7 +5649,9 @@ impl Component for AppShell {
         let key = if self.route == Route::Player {
             format!(
                 "player:{}",
-                self.now_playing.as_ref().map_or(String::new(), |item| item.bvid.clone())
+                self.now_playing
+                    .as_ref()
+                    .map_or(String::new(), |item| item.bvid.clone())
             )
         } else {
             self.route.tag().to_string()
@@ -4371,6 +5726,7 @@ impl Component for AppShell {
             matches!(self.auth, AuthState::LoggedIn(_)),
             self.unread_summary.total(),
             &self.search_state.draft,
+            self.search_default.as_deref(),
             context.message(Message::Back),
             context.message(Message::TogglePane),
             context.callback(|text: Rc<str>| Message::SearchDraftChanged(text.to_string())),
@@ -4435,9 +5791,13 @@ impl Component for AppShell {
                 context.message(Message::ToggleMoreMenu),
             );
 
-            return Grid::new()
+            let shell_root = Grid::new()
                 .rows([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
-                .children((title_bar, content_host, bottom_bar.grid_row(2)))
+                .children((title_bar, content_host, bottom_bar.grid_row(2)));
+
+            return Border::new()
+                .on_preview_key_down(self.global_key_handler.clone())
+                .content(Grid::new().keyed_children([keyed("shell-root", shell_root)]))
                 .into();
         }
 
@@ -4501,9 +5861,13 @@ impl Component for AppShell {
                 layers
             }));
 
-        Grid::new()
+        let shell_root = Grid::new()
             .rows([GridLength::Auto, GridLength::Star(1.0)])
-            .children((title_bar, navigation))
+            .children((title_bar, navigation));
+
+        Border::new()
+            .on_preview_key_down(self.global_key_handler.clone())
+            .content(Grid::new().keyed_children([keyed("shell-root", shell_root)]))
             .into()
     }
 }
@@ -4526,6 +5890,45 @@ mod tests {
     use qaq_bx_core::settings::{CodecPref, QualityPref};
 
     #[test]
+    fn danmaku_segment_math_anchors_six_minute_boundaries() {
+        assert_eq!(danmaku_segment_count(0.0), 1);
+        assert_eq!(danmaku_segment_count(359.9), 1);
+        assert_eq!(danmaku_segment_count(360.0), 1);
+        assert_eq!(danmaku_segment_count(360.1), 2);
+        assert_eq!(danmaku_segment_count(1234.0), 4);
+        // 负值/缺失兜底单段。
+        assert_eq!(danmaku_segment_count(-5.0), 1);
+        assert_eq!(danmaku_segment_at(0.0), 1);
+        assert_eq!(danmaku_segment_at(359.9), 1);
+        assert_eq!(danmaku_segment_at(360.0), 2);
+        assert_eq!(danmaku_segment_at(800.0), 3);
+    }
+
+    #[test]
+    fn danmaku_preload_order_playhead_first_then_ascending() {
+        // 播放头在第 1 段:1 → 2 → 3 → 4 → 收束。
+        let chain: Vec<u32> = std::iter::successors(Some(1u32), |&c| next_danmaku_segment(c, 1, 4))
+            .take(10)
+            .collect();
+        assert_eq!(chain, vec![1, 2, 3, 4]);
+        // 播放头在第 3 段:3 → 1 → 2 → 4 → 收束(优先段只到一次)。
+        let chain: Vec<u32> = std::iter::successors(Some(3u32), |&c| next_danmaku_segment(c, 3, 4))
+            .take(10)
+            .collect();
+        assert_eq!(chain, vec![3, 1, 2, 4]);
+        // 优先段越界(总段数缩水):先试 9(该段为空/失败),再 1 → 2 收束。
+        let chain: Vec<u32> = std::iter::successors(Some(9u32), |&c| next_danmaku_segment(c, 9, 2))
+            .take(10)
+            .collect();
+        assert_eq!(chain, vec![9, 1, 2]);
+        // 单段视频:首段即收束。
+        let chain: Vec<u32> = std::iter::successors(Some(1u32), |&c| next_danmaku_segment(c, 1, 1))
+            .take(10)
+            .collect();
+        assert_eq!(chain, vec![1]);
+    }
+
+    #[test]
     fn resolve_params_caps_guest_at_80_and_honors_codec_pref() {
         let nav = NavClient::new_anonymous(reqwest::Client::new());
         let mut settings = AppSettings::default();
@@ -4543,19 +5946,54 @@ mod tests {
         assert_eq!(codecs, &["hev1", "avc1", "av01"]);
     }
 
+    /// F4:首播音画缺失探测判定(媒体就绪 + 3s 宽限 + 轨道格式为空)。
     #[test]
-    fn mount_pulse_covers_half_pane_and_stops_when_attached() {
+    fn missing_media_track_requires_media_grace_and_empty_format() {
+        use MissingTrack::*;
+        // 媒体未就绪不探测。
+        assert_eq!(
+            missing_media_track("", "", false, Some(Duration::from_secs(10))),
+            None
+        );
+        // 宽限期内不探测。
+        assert_eq!(
+            missing_media_track("", "aac", true, Some(Duration::from_millis(2500))),
+            None
+        );
+        // 无画面有声音 → Video;有画面无声音 → Audio;齐备 → None。
+        assert_eq!(
+            missing_media_track("", "aac", true, Some(Duration::from_secs(4))),
+            Some(Video)
+        );
+        assert_eq!(
+            missing_media_track("h264", "", true, Some(Duration::from_secs(4))),
+            Some(Audio)
+        );
+        assert_eq!(
+            missing_media_track("h264", "aac", true, Some(Duration::from_secs(4))),
+            None
+        );
+        // 探测点缺失(未载入)不探测。
+        assert_eq!(missing_media_track("", "aac", true, None), None);
+    }
+
+    #[test]
+    fn mount_pulse_covers_half_pane_fullscreen_and_stops_when_attached() {
         // 全播放页未挂载 → 脉冲。
-        assert!(mount_pulse_active(Route::Player, false, false));
+        assert!(mount_pulse_active(Route::Player, false, false, false));
         // 半屏抽屉(route 停在 Home)未挂载 → 必须脉冲(修复冷启动/关闭播放条后首个视频黑屏)。
-        assert!(mount_pulse_active(Route::Home, true, false));
+        assert!(mount_pulse_active(Route::Home, true, false, false));
+        // 全屏态未挂载 → 必须脉冲(切全屏重挂新 SwapChainPanel)。
+        assert!(mount_pulse_active(Route::Player, false, true, false));
+        assert!(mount_pulse_active(Route::Home, true, true, false));
         // 已挂载成功 → 任何路由都停脉冲。
-        assert!(!mount_pulse_active(Route::Player, false, true));
-        assert!(!mount_pulse_active(Route::Home, true, true));
+        assert!(!mount_pulse_active(Route::Player, false, false, true));
+        assert!(!mount_pulse_active(Route::Home, true, false, true));
+        assert!(!mount_pulse_active(Route::Player, false, true, true));
         // 首页无半屏抽屉、无播放画面 → 不脉冲(省电:无 surface 需要挂载)。
-        assert!(!mount_pulse_active(Route::Home, false, false));
+        assert!(!mount_pulse_active(Route::Home, false, false, false));
         // 其它空态页(收藏/历史等)同理不脉冲。
-        assert!(!mount_pulse_active(Route::Favorites, false, false));
+        assert!(!mount_pulse_active(Route::Favorites, false, false, false));
     }
 
     /// 全局搜索框 Enter 提交门控:按下(主/小键盘)提交并拦截;释放与其他键放行。
@@ -4623,7 +6061,10 @@ mod tests {
         // 运行时版本与参数化版本一致(探测结果只影响后缀)。
         assert_eq!(
             thumbnail_url("https://i0.hdslb.com/bfs/archive/abc.jpg"),
-            thumbnail_url_with("https://i0.hdslb.com/bfs/archive/abc.jpg", crate::codec::raster_suffix())
+            thumbnail_url_with(
+                "https://i0.hdslb.com/bfs/archive/abc.jpg",
+                crate::codec::raster_suffix()
+            )
         );
         // 已有参数/非图床保持不二次拼接。
         assert_eq!(
@@ -4758,7 +6199,10 @@ mod tests {
         ];
         let fresh = merge_popular_items(&mut existing, incoming);
         assert_eq!(
-            fresh.iter().map(|item| item.bvid.as_str()).collect::<Vec<_>>(),
+            fresh
+                .iter()
+                .map(|item| item.bvid.as_str())
+                .collect::<Vec<_>>(),
             ["BV3"]
         );
         assert_eq!(existing.len(), 3);
@@ -4803,7 +6247,9 @@ mod tests {
 
         let thumb = avatar_thumbnail_url("https://i0.hdslb.com/bfs/face/u1.jpg");
         assert!(session.references_avatar(&thumb));
-        assert!(!session.references_avatar("https://i0.hdslb.com/bfs/face/other.jpg@96w_96h_1c.jpg"));
+        assert!(
+            !session.references_avatar("https://i0.hdslb.com/bfs/face/other.jpg@96w_96h_1c.jpg")
+        );
 
         let cache = ImageCache::with_capacity(8);
         cache.put(thumb.clone(), EncodedImage::new(vec![1, 2, 3]));

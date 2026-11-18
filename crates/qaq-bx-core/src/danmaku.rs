@@ -23,7 +23,7 @@ const SEG_URL: &str = "https://api.bilibili.com/x/v2/dm/wbi/web/seg.so";
 /// 每段时长（毫秒；B 站 6 分钟/段实测）。
 pub const SEGMENT_MS: u64 = 360_000;
 
-/// 一条弹幕（渲染所需的子集；其余字段跳过）。
+/// 一条弹幕（渲染/过滤所需的子集；其余字段跳过）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct DanmakuElem {
     /// 出现时刻（毫秒）。
@@ -34,6 +34,10 @@ pub struct DanmakuElem {
     /// 文字颜色 0xRRGGBB（protobuf uint32；黑/白默认由 mode 端处理）。
     pub color: u32,
     pub content: String,
+    /// 发送者 mid 的 CRC32 十六进制串（field 6；网页版用户屏蔽同源标识）。
+    pub mid_hash: String,
+    /// 云屏蔽权重（field 12;0 = 未下发。权重越低越疑似垃圾,网页版智能屏蔽同源）。
+    pub weight: u32,
 }
 
 /// 弹幕客户端（WBI 签名复用凭据）。
@@ -57,11 +61,21 @@ impl DanmakuClient {
         nav: Arc<NavClient>,
     ) -> Self {
         let ticket = nav.ticket().cloned();
-        Self { wbi: WbiSigner::with_nav(nav), http, creds, ticket }
+        Self {
+            wbi: WbiSigner::with_nav(nav),
+            http,
+            creds,
+            ticket,
+        }
     }
 
     /// 拉取一段弹幕并解析（segment_index 从 1 起）。
-    pub async fn segment(&self, cid: u64, aid: u64, segment_index: u32) -> Result<Vec<DanmakuElem>> {
+    pub async fn segment(
+        &self,
+        cid: u64,
+        aid: u64,
+        segment_index: u32,
+    ) -> Result<Vec<DanmakuElem>> {
         let signed = self
             .wbi
             .sign_query(&[
@@ -122,8 +136,8 @@ pub fn parse_segment(bytes: &[u8]) -> Result<Vec<DanmakuElem>> {
     Ok(elems)
 }
 
-/// 解析一条 `DanmakuElem`（2=progress 3=mode 4=fontsize 5=color 7=content;
-/// 无 content 的记录丢弃）。
+/// 解析一条 `DanmakuElem`（2=progress 3=mode 4=fontsize 5=color 6=midHash
+/// 7=content 12=weight;无 content 的记录丢弃）。
 fn parse_elem(bytes: &[u8]) -> Option<DanmakuElem> {
     let mut elem = DanmakuElem {
         progress_ms: 0,
@@ -131,6 +145,8 @@ fn parse_elem(bytes: &[u8]) -> Option<DanmakuElem> {
         fontsize: 25,
         color: 0xFF_FF_FF,
         content: String::new(),
+        mid_hash: String::new(),
+        weight: 0,
     };
     let mut has_content = false;
     let mut pos = 0usize;
@@ -141,6 +157,15 @@ fn parse_elem(bytes: &[u8]) -> Option<DanmakuElem> {
             (3, 0) => elem.mode = read_varint(bytes, &mut pos).ok()? as i32,
             (4, 0) => elem.fontsize = read_varint(bytes, &mut pos).ok()? as i32,
             (5, 0) => elem.color = read_varint(bytes, &mut pos).ok()? as u32,
+            (6, 2) => {
+                let len = read_varint(bytes, &mut pos).ok()? as usize;
+                let end = pos.checked_add(len)?;
+                if end > bytes.len() {
+                    return None;
+                }
+                elem.mid_hash = String::from_utf8_lossy(&bytes[pos..end]).into_owned();
+                pos = end;
+            }
             (7, 2) => {
                 let len = read_varint(bytes, &mut pos).ok()? as usize;
                 let end = pos.checked_add(len)?;
@@ -151,6 +176,7 @@ fn parse_elem(bytes: &[u8]) -> Option<DanmakuElem> {
                 has_content = true;
                 pos = end;
             }
+            (12, 0) => elem.weight = read_varint(bytes, &mut pos).ok()? as u32,
             _ => skip_field(bytes, &mut pos, wire_type).ok()?,
         }
     }
@@ -193,9 +219,7 @@ fn skip_field(bytes: &[u8], pos: &mut usize, wire_type: u8) -> Result<()> {
             read_varint(bytes, pos)?;
         }
         1 => {
-            *pos = pos
-                .checked_add(8)
-                .ok_or_else(|| bad_wire("fixed64 越界"))?;
+            *pos = pos.checked_add(8).ok_or_else(|| bad_wire("fixed64 越界"))?;
             if *pos > bytes.len() {
                 return Err(bad_wire("fixed64 越界"));
             }
@@ -209,9 +233,7 @@ fn skip_field(bytes: &[u8], pos: &mut usize, wire_type: u8) -> Result<()> {
             *pos = end;
         }
         5 => {
-            *pos = pos
-                .checked_add(4)
-                .ok_or_else(|| bad_wire("fixed32 越界"))?;
+            *pos = pos.checked_add(4).ok_or_else(|| bad_wire("fixed32 越界"))?;
             if *pos > bytes.len() {
                 return Err(bad_wire("fixed32 越界"));
             }
@@ -260,13 +282,15 @@ mod tests {
     #[test]
     fn parses_minimal_segment() {
         // DanmakuElem { progress:1234, mode:1, fontsize:25, color:0xFFFFFF,
-        //              content:"你好" } —— 手工字节编码。
+        //              midHash:"ab12", content:"你好", weight:9 } —— 手工字节编码。
         let mut elem = Vec::new();
         elem.extend(enc_varint_field(2, 1234));
         elem.extend(enc_varint_field(3, 1));
         elem.extend(enc_varint_field(4, 25));
         elem.extend(enc_varint_field(5, 0xFF_FF_FF));
+        elem.extend(enc_bytes_field(6, b"ab12"));
         elem.extend(enc_bytes_field(7, "你好".as_bytes()));
+        elem.extend(enc_varint_field(12, 9));
         // DmSegMobileReply { elems: [elem] } + 一个未知字段(field 9 varint)。
         let mut reply = enc_bytes_field(1, &elem);
         reply.extend(enc_varint_field(9, 7));
@@ -277,6 +301,8 @@ mod tests {
         assert_eq!(parsed[0].fontsize, 25);
         assert_eq!(parsed[0].color, 0xFF_FF_FF);
         assert_eq!(parsed[0].content, "你好");
+        assert_eq!(parsed[0].mid_hash, "ab12");
+        assert_eq!(parsed[0].weight, 9);
     }
 
     #[test]

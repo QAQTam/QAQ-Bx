@@ -258,10 +258,8 @@ impl DemoState {
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
         let chrome_w = ((wr.right - wr.left) - (cr.right - cr.left)).max(0);
         let chrome_h = ((wr.bottom - wr.top) - (cr.bottom - cr.top)).max(0);
-        let (cx, cy) = monitor_work_center(hwnd).unwrap_or((
-            (wr.left + wr.right) / 2,
-            (wr.top + wr.bottom) / 2,
-        ));
+        let (cx, cy) = monitor_work_center(hwnd)
+            .unwrap_or(((wr.left + wr.right) / 2, (wr.top + wr.bottom) / 2));
 
         self.dpi = dpi;
         self.chrome_pad = Some((chrome_w, chrome_h));

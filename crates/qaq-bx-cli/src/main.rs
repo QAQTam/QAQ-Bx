@@ -334,7 +334,7 @@ async fn cmd_playurl(bvid: Option<String>) -> anyhow::Result<()> {
     let dash = play
         .dash
         .as_ref()
-        .context("playurl 无 dash（fnval=16 被拒或权限不足）")?;
+        .with_context(|| qaq_bx_core::player::dash_missing_reason(&play))?;
     println!(
         "── playurl code=0 fnval=16 ──\n  下发档位={}  accept={:?}",
         play.quality, play.accept_description

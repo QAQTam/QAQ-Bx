@@ -10,7 +10,9 @@ pub mod danmaku;
 pub mod error;
 pub mod feed;
 pub mod httpx;
+pub mod live;
 pub mod loose;
+pub mod mpd;
 pub mod notify;
 pub mod player;
 pub mod plugin;
@@ -44,8 +46,10 @@ pub mod prelude {
         ReplyClient, ReplyCursor, ReplyItem, ReplyPage, ReplySort, SubReplyPage,
     };
     pub use crate::search::{SearchClient, SearchPage, SearchVideo};
-    pub use crate::settings::{AppSettings, CodecPref, FileSettingsStore, QualityPref, SETTINGS_FILE};
+    pub use crate::settings::{
+        AppSettings, CodecPref, FileSettingsStore, QualityPref, SETTINGS_FILE,
+    };
     pub use crate::storage::{is_packaged_app, resolve_data_dir};
-    pub use crate::ticket::{FileTicketStore, TicketData, TicketManager, TICKET_FILE};
+    pub use crate::ticket::{FileTicketStore, TICKET_FILE, TicketData, TicketManager};
     pub use crate::wbi::WbiSigner;
 }

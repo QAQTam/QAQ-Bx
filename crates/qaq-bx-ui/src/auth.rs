@@ -14,14 +14,13 @@ use qaq_bx_core::credentials::{CredentialProvider, FileCredentialStore};
 use qaq_bx_core::notify::NotifyClient;
 use qaq_bx_core::plugin::{PluginContext, PluginRegistry};
 use qaq_bx_core::resolve_data_dir;
-use qaq_bx_core::ticket::{FileTicketStore, TicketManager, TICKET_FILE};
-use qaq_bx_plugin_login::{QrAuthPlugin, CREDENTIALS_FILE};
+use qaq_bx_core::ticket::{FileTicketStore, TICKET_FILE, TicketManager};
+use qaq_bx_plugin_login::{CREDENTIALS_FILE, QrAuthPlugin};
 use windows_reactor::EncodedImage;
 
 use crate::runtime::block_on;
 
-const UA: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36";
+const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36";
 
 /// 登录会话共享槽（shell 与后台轮询闭包各持一份 Arc）。
 pub type FlowCell = Arc<Mutex<Option<Box<dyn LoginFlow>>>>;
@@ -358,7 +357,10 @@ mod tests {
         // 运行时版本与参数化版本一致(探测结果只影响后缀)。
         assert_eq!(
             avatar_thumbnail_url("https://i2.hdslb.com/bfs/face/u1.jpg"),
-            avatar_thumbnail_url_with("https://i2.hdslb.com/bfs/face/u1.jpg", crate::codec::raster_suffix())
+            avatar_thumbnail_url_with(
+                "https://i2.hdslb.com/bfs/face/u1.jpg",
+                crate::codec::raster_suffix()
+            )
         );
         // 已有参数 → 不二次拼接;非图床保持不动。
         assert_eq!(

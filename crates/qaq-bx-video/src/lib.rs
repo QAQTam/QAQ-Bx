@@ -7,6 +7,7 @@
 pub mod engine;
 pub mod error;
 pub mod ffi;
+pub mod native;
 pub mod player;
 
 pub use error::BiliVideoError;

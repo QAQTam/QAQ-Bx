@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use windows_core::{Interface as _, IUnknown};
+use windows_core::{IUnknown, Interface as _};
 use windows_reactor::{
     Component, ComponentContext, ElementRef, SwapChainPanel, SwapChainPanelEvent, View, ViewContext,
 };
@@ -48,7 +48,10 @@ impl Component for VideoSurface {
     type Message = Message;
 
     fn create(input: &Self::Input, _context: &ComponentContext<Self>) -> Self {
-        Self { engine: input.engine.clone(), panel: ElementRef::new() }
+        Self {
+            engine: input.engine.clone(),
+            panel: ElementRef::new(),
+        }
     }
 
     fn input_changed(&mut self, input: &Self::Input, _context: &ComponentContext<Self>) {
@@ -73,13 +76,15 @@ impl Component for VideoSurface {
             })
         });
 
-        // 卸载清理:解绑引擎 attached + 清 panel 的 swapchain(重进播放页再挂)。
+        // 卸载清理:解绑引擎 attached。**不主动 clear 面板**(黑屏排查 2026-11):
+        // 组件卸载时 panel 元素随视图树一起销毁,SwapChain 引用由 XAML 释放,
+        // request_clear_swap_chain 只会把视频区主动清黑拉长空窗;引擎侧
+        // `detach_panel` 已把 swapchain 放回待挂载槽,新面板首个 metrics
+        // 事件即重挂。
         let engine = self.engine.clone();
-        let panel_for_cleanup = self.panel.clone();
         context.use_effect("lifetime", (), move || {
             Some(Box::new(move || {
                 engine.detach_panel();
-                let _ = panel_for_cleanup.request_clear_swap_chain(|_| {});
             }))
         });
 
@@ -92,7 +97,14 @@ fn handle_metrics_event(
     panel: &ElementRef<SwapChainPanel>,
     event: SwapChainPanelEvent,
 ) {
-    let SwapChainPanelEvent::Metrics { width, height, scale_x, scale_y, .. } = event else {
+    let SwapChainPanelEvent::Metrics {
+        width,
+        height,
+        scale_x,
+        scale_y,
+        ..
+    } = event
+    else {
         return;
     };
     apply_surface_metrics(engine, panel, width, height, scale_x, scale_y);
@@ -112,15 +124,18 @@ fn apply_surface_metrics(
 
 /// 尝试把引擎的待挂载 swapchain 挂上 panel(UI 线程;无 pending 则空操作)。
 fn attach_pending(engine: &Arc<VideoEngine>, panel: &ElementRef<SwapChainPanel>) {
-    let Some(raw) = engine.take_pending() else { return };
-    let Some(chain) = adopt_swap_chain(raw) else { return };
+    let Some(raw) = engine.take_pending() else {
+        return;
+    };
+    let Some(chain) = adopt_swap_chain(raw) else {
+        return;
+    };
     // request 接管克隆引用;入队失败(面板未实例化)时原件放回引擎槽,
     // 由 250ms 后的下一拍重试(input.tick 持续递增)。
     let engine_on_attach = engine.clone();
-    let accepted = panel.request_set_swap_chain(
-        chain.clone(),
-        move |result| engine_on_attach.mark_attached(result.is_ok()),
-    );
+    let accepted = panel.request_set_swap_chain(chain.clone(), move |result| {
+        engine_on_attach.mark_attached(result.is_ok())
+    });
     if !accepted {
         engine.put_back_pending(chain.into_raw());
     }

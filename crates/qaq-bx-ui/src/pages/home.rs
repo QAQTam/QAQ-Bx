@@ -153,26 +153,31 @@ pub fn home_page(
     let header = Border::new()
         .padding(Thickness::new(header_x, header_top, header_x, 12.0))
         .grid_row(0)
-        .content(StackPanel::new().spacing(4.0).children((
-            Grid::new()
-                .columns([GridLength::Star(1.0), GridLength::Auto])
-                .children((
-                    theme::text("推荐")
-                        .font_size(layout.page_title_size())
-                        .font_weight(FontWeight::BOLD)
-                        .vertical_alignment(VerticalAlignment::Center),
-                    View::from(refresh_btn.grid_column(1)),
-                )),
-            theme::text(subtitle)
-                .font_size(if layout.is_mobile() { 12.0 } else { 13.0 })
-                .opacity(0.6),
-        )));
+        .content(
+            StackPanel::new().spacing(4.0).children((
+                Grid::new()
+                    .columns([GridLength::Star(1.0), GridLength::Auto])
+                    .children((
+                        theme::text("推荐")
+                            .font_size(layout.page_title_size())
+                            .font_weight(FontWeight::BOLD)
+                            .vertical_alignment(VerticalAlignment::Center),
+                        View::from(refresh_btn.grid_column(1)),
+                    )),
+                theme::text(subtitle)
+                    .font_size(if layout.is_mobile() { 12.0 } else { 13.0 })
+                    .opacity(0.6),
+            )),
+        );
 
     // ScrollViewer 直接承载 ItemsRepeater 且不订阅 ViewChanged，防止 WinUI 滚动队列阻塞同步虚拟化测量。
     let scroll_host: View = Grid::new()
         .keyed_children([keyed(
             format!("home-scroll-{}", state.stream_gen),
-            ScrollViewer::new().content(video_card::virtual_video_grid(source, layout.page_margin_x())),
+            ScrollViewer::new().content(video_card::virtual_video_grid(
+                source,
+                layout.page_margin_x(),
+            )),
         )])
         .into();
 

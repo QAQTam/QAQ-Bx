@@ -1,5 +1,7 @@
 pub mod account;
+pub mod fullscreen;
 pub mod home;
+pub mod live;
 pub mod login;
 pub mod player;
 pub mod popular;

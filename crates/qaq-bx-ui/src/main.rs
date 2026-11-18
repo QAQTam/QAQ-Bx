@@ -13,6 +13,8 @@ mod image_cache;
 mod layout;
 mod notifications;
 mod pages;
+#[cfg(feature = "probe")]
+mod probe;
 mod router;
 mod runtime;
 #[cfg(feature = "selftest")]
@@ -20,6 +22,7 @@ mod selftest;
 mod shell;
 mod smtc;
 mod theme;
+mod trace;
 mod widgets;
 mod winrt_ext;
 
@@ -38,12 +41,13 @@ fn install_panic_hook() {
         let is_first = !FIRST_PANIC_RECORDED.swap(true, Ordering::SeqCst);
         if is_first {
             let _ = std::fs::write(&log_path, &detail);
-            let summary = format!(
-                "{info}\n\n完整堆栈已写入：\n{}",
-                log_path.display()
-            );
+            let summary = format!("{info}\n\n完整堆栈已写入：\n{}", log_path.display());
             show_error_box("QAQ-Bx 崩溃提示", &summary);
-        } else if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        } else if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
             let _ = write!(f, "\n\n=== 级联异常（保留上方首次堆栈） ===\n{detail}");
         }
     }));
@@ -67,8 +71,19 @@ fn main() {
         return;
     }
     install_panic_hook();
+    #[cfg(feature = "probe")]
+    if std::env::args().any(|arg| arg == "--probe-xamlroot") {
+        probe::PROBE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    trace::note(format!(
+        "app start pid={} args={:?}",
+        std::process::id(),
+        std::env::args().collect::<Vec<_>>()
+    ));
     let _identity = notifications::init_process_identity();
-    if let Err(err) = windows_reactor::App::run_component::<shell::AppShell>(shell::ShellInput::default()) {
+    if let Err(err) =
+        windows_reactor::App::run_component::<shell::AppShell>(shell::ShellInput::default())
+    {
         let detail = format!("WinUI 启动失败：\n{err:?}");
         let log_path = qaq_bx_core::resolve_data_dir().join("crash.log");
         if let Some(parent) = log_path.parent() {

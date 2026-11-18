@@ -10,7 +10,9 @@ use windows::Media::{
     MediaPlaybackStatus, MediaPlaybackType, SystemMediaTransportControls,
     SystemMediaTransportControlsButton,
 };
-use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream, RandomAccessStreamReference};
+use windows::Storage::Streams::{
+    DataWriter, InMemoryRandomAccessStream, RandomAccessStreamReference,
+};
 use windows::Win32::minwindef::LPARAM;
 use windows::Win32::processthreadsapi::GetCurrentThreadId;
 use windows::Win32::systemmediatransportcontrolsinterop::ISystemMediaTransportControlsInterop;
@@ -35,11 +37,12 @@ impl SmtcController {
     /// 在当前 UI 线程查找主窗口 `HWND` 并绑定 `SystemMediaTransportControls`。
     pub fn try_init(tx: Sender<SmtcCommand>) -> Option<Self> {
         let hwnd = find_app_hwnd()?;
-        let interop: ISystemMediaTransportControlsInterop =
-            windows_core::factory::<SystemMediaTransportControls, ISystemMediaTransportControlsInterop>()
-                .ok()?;
-        let controls: SystemMediaTransportControls =
-            unsafe { interop.GetForWindow(hwnd) }.ok()?;
+        let interop: ISystemMediaTransportControlsInterop = windows_core::factory::<
+            SystemMediaTransportControls,
+            ISystemMediaTransportControlsInterop,
+        >()
+        .ok()?;
+        let controls: SystemMediaTransportControls = unsafe { interop.GetForWindow(hwnd) }.ok()?;
 
         let _ = controls.SetIsEnabled(true);
         let _ = controls.SetIsPlayEnabled(true);
@@ -79,7 +82,9 @@ impl SmtcController {
     }
 
     pub fn set_stopped(&self) {
-        let _ = self.controls.SetPlaybackStatus(MediaPlaybackStatus::Stopped);
+        let _ = self
+            .controls
+            .SetPlaybackStatus(MediaPlaybackStatus::Stopped);
         if let Ok(updater) = self.controls.DisplayUpdater() {
             let _ = updater.ClearAll();
             let _ = updater.Update();

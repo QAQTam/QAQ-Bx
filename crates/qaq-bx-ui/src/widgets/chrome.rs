@@ -38,6 +38,8 @@ pub fn build_title_bar(
     logged_in: bool,
     total_unread: u64,
     search_draft: &str,
+    // 搜索默认词(U2;None → 通用占位)。
+    search_default_word: Option<&str>,
     on_back: Callback<()>,
     on_toggle_pane: Callback<()>,
     on_search_draft: Callback<Rc<str>>,
@@ -91,7 +93,7 @@ pub fn build_title_bar(
                         .children((
                             TextBox::new()
                                 .grid_column(0)
-                                .placeholder_text("搜索视频、UP 主")
+                                .placeholder_text(search_default_word.unwrap_or("搜索视频、UP 主"))
                                 .text(search_draft)
                                 .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
                                 .border_thickness(0.0)
@@ -149,6 +151,9 @@ pub fn build_title_bar(
                 .children(right_items),
         );
     }
+    // xamlroot-probe:焦点锚点挂进 left_header(probe feature 下生效)。
+    #[cfg(feature = "probe")]
+    let bar = crate::probe::attach_focus_button(bar);
     bar
 }
 
@@ -235,60 +240,61 @@ pub fn compact_bottom_bar(
     ];
     let more_active = more_open || COMPACT_MORE_ROUTES.contains(&active_route);
 
-    let tab_btn = |col: usize, symbol: Symbol, label: &str, selected: bool, on_click: Callback<()>| {
-        let pill_bg = if selected {
-            Brush::Theme(ThemeBrush::Accent)
-        } else {
-            Brush::Solid(Color::argb(0, 0, 0, 0))
+    let tab_btn =
+        |col: usize, symbol: Symbol, label: &str, selected: bool, on_click: Callback<()>| {
+            let pill_bg = if selected {
+                Brush::Theme(ThemeBrush::Accent)
+            } else {
+                Brush::Solid(Color::argb(0, 0, 0, 0))
+            };
+            let icon_fg = if selected {
+                Brush::Solid(Color::rgb(255, 255, 255))
+            } else {
+                Brush::Theme(ThemeBrush::PrimaryText)
+            };
+            Button::new()
+                .grid_column(col as i32)
+                .style(ButtonStyle::Subtle)
+                .horizontal_alignment(HorizontalAlignment::Stretch)
+                .vertical_alignment(VerticalAlignment::Stretch)
+                .horizontal_content_alignment(HorizontalAlignment::Center)
+                .vertical_content_alignment(VerticalAlignment::Center)
+                .on_click(on_click)
+                .content(
+                    StackPanel::new().spacing(3.0).children((
+                        Border::new()
+                            .width(48.0)
+                            .height(28.0)
+                            .corner_radius(14.0)
+                            .background(pill_bg)
+                            .horizontal_alignment(HorizontalAlignment::Center)
+                            .content(
+                                FontIcon::new()
+                                    .glyph(symbol_glyph(symbol))
+                                    .font_size(14.0)
+                                    .foreground(icon_fg)
+                                    .opacity(if selected { 1.0 } else { 0.72 })
+                                    .horizontal_alignment(HorizontalAlignment::Center)
+                                    .vertical_alignment(VerticalAlignment::Center),
+                            ),
+                        TextBlock::new()
+                            .text(label)
+                            .font_size(11.0)
+                            .font_weight(if selected {
+                                FontWeight::SEMI_BOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .foreground(if selected {
+                                ThemeBrush::AccentText
+                            } else {
+                                ThemeBrush::PrimaryText
+                            })
+                            .opacity(if selected { 1.0 } else { 0.72 })
+                            .horizontal_alignment(HorizontalAlignment::Center),
+                    )),
+                )
         };
-        let icon_fg = if selected {
-            Brush::Solid(Color::rgb(255, 255, 255))
-        } else {
-            Brush::Theme(ThemeBrush::PrimaryText)
-        };
-        Button::new()
-            .grid_column(col as i32)
-            .style(ButtonStyle::Subtle)
-            .horizontal_alignment(HorizontalAlignment::Stretch)
-            .vertical_alignment(VerticalAlignment::Stretch)
-            .horizontal_content_alignment(HorizontalAlignment::Center)
-            .vertical_content_alignment(VerticalAlignment::Center)
-            .on_click(on_click)
-            .content(
-                StackPanel::new().spacing(3.0).children((
-                    Border::new()
-                        .width(48.0)
-                        .height(28.0)
-                        .corner_radius(14.0)
-                        .background(pill_bg)
-                        .horizontal_alignment(HorizontalAlignment::Center)
-                        .content(
-                            FontIcon::new()
-                                .glyph(symbol_glyph(symbol))
-                                .font_size(14.0)
-                                .foreground(icon_fg)
-                                .opacity(if selected { 1.0 } else { 0.72 })
-                                .horizontal_alignment(HorizontalAlignment::Center)
-                                .vertical_alignment(VerticalAlignment::Center),
-                        ),
-                    TextBlock::new()
-                        .text(label)
-                        .font_size(11.0)
-                        .font_weight(if selected {
-                            FontWeight::SEMI_BOLD
-                        } else {
-                            FontWeight::NORMAL
-                        })
-                        .foreground(if selected {
-                            ThemeBrush::AccentText
-                        } else {
-                            ThemeBrush::PrimaryText
-                        })
-                        .opacity(if selected { 1.0 } else { 0.72 })
-                        .horizontal_alignment(HorizontalAlignment::Center),
-                )),
-            )
-    };
 
     let mut children: Vec<View> = primary
         .iter()
@@ -305,9 +311,7 @@ pub fn compact_bottom_bar(
         })
         .collect();
 
-    children.push(
-        tab_btn(4, Symbol::More, "更多", more_active, on_toggle_more).into(),
-    );
+    children.push(tab_btn(4, Symbol::More, "更多", more_active, on_toggle_more).into());
 
     Grid::new().children((Border::new()
         .height(64.0)

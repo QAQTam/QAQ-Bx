@@ -200,33 +200,34 @@ mod tests {
 
     #[test]
     fn resolution_adaptive_cols_and_page_targets() {
-        // 1280x800（扣除 48px nav rail 后 ~1232 宽）→ 4 列，预热 48 条
-        assert_eq!(columns(1232.0), 4);
-        assert_eq!(logical_page_target(1232.0, 750.0), 48);
+        // 1280x800（扣除 nav rail 后 ~1232 宽）→ F5 曲线 5 列，预热 50 条（整行对齐）
+        assert_eq!(columns(1232.0), 5);
+        assert_eq!(logical_page_target(1232.0, 750.0), 50);
 
-        // 1600x900 近似内容宽 1550 → 5~6 列
+        // 1600x900 近似内容宽 1550 → F5 曲线 7 列
         let c1600 = columns(1550.0);
-        assert!((5..=6).contains(&c1600));
+        assert_eq!(c1600, 7);
         assert_eq!(logical_page_target(1550.0, 860.0) % c1600, 0);
 
-        // 1920x1080 全屏（~1870 内容宽）→ 7 列，2 屏对齐整行 = 56 条
-        assert_eq!(columns(1870.0), 7);
-        assert_eq!(logical_page_target(1870.0, 1000.0), 56);
+        // 1920x1080 全屏（~1870 内容宽）→ F5 曲线 8 列；卡高 227 → vis_rows=5，
+        // 期望 80 条但被 72 条上限钳制。
+        assert_eq!(columns(1870.0), 8);
+        assert_eq!(logical_page_target(1870.0, 1000.0), 72);
 
-        // 2560x1440 全屏（~2510 内容宽）→ 9 列，整行对齐 = 72 条
-        assert_eq!(columns(2510.0), 9);
+        // 2560x1440 全屏（~2510 内容宽）→ F5 曲线 11 列，页规模钳 72 条上限
+        assert_eq!(columns(2510.0), 11);
         assert_eq!(logical_page_target(2510.0, 1360.0), 72);
     }
 
     #[test]
     fn seen_bottom_and_half_page_prefetch_trigger() {
-        // 1280x800: cols=4, vis_h=750 → bottom_row=3 → 首屏底部已见 12 条
-        assert_eq!(seen_bottom_count(0.0, 1232.0, 750.0, 48), 12);
-        // 剩 36 条 > 半页 24 条 → 不触发
+        // 1280x800: F5 曲线 cols=5, vis_h=750 → bottom_row=3 → 首屏底部已见 15 条
+        assert_eq!(seen_bottom_count(0.0, 1232.0, 750.0, 48), 15);
+        // 剩 33 条 > 半页 24 条 → 不触发
         assert!(!should_prefetch(0.0, 1232.0, 750.0, 48, 0.0));
 
-        // 向下滚动 3 行（756px）：底部到第 6 行 → 已见 24 条，剩 24 条 == 半页阈值 → 触发下一页
-        assert_eq!(seen_bottom_count(756.0, 1232.0, 750.0, 48), 24);
+        // 向下滚动 3 行：底部到第 6 行 → 已见 30 条，剩 18 条 ≤ 半页阈值 → 触发下一页
+        assert_eq!(seen_bottom_count(756.0, 1232.0, 750.0, 48), 30);
         assert!(should_prefetch(756.0, 1232.0, 750.0, 48, 0.0));
     }
 
@@ -241,9 +242,9 @@ mod tests {
     #[test]
     fn visible_cover_window_tracks_buffer_screens_around_viewport() {
         assert_eq!(visible_cover_window(0.0, 1232.0, 750.0, 0, 4), 0..0);
-        // cols=4, vis_rows=3, buffer=2 → margin=6 rows (24 items); offset=2520 (row 10) → keep [4..19)*4 = 16..76
+        // F5 曲线 cols=5, vis_rows=3, buffer=2 → margin=6 rows; offset=2520 (row 10) → [4..19)*5 = 20..95
         let win = visible_cover_window(2520.0, 1232.0, 750.0, 120, 2);
-        assert_eq!(win, 16..76);
+        assert_eq!(win, 20..95);
 
         let by_row = visible_cover_window_by_row(15, CardMetrics::default(), 750.0, 160, 2);
         assert_eq!(by_row, 24..108);
@@ -251,11 +252,8 @@ mod tests {
 
     #[test]
     fn mobile_metrics_drive_two_col_targets_and_odd_slot_alignment() {
-        let m = CardMetrics::for_viewport(
-            ShellChromeMode::Mobile,
-            ContentLayoutTier::Compact,
-            390.0,
-        );
+        let m =
+            CardMetrics::for_viewport(ShellChromeMode::Mobile, ContentLayoutTier::Compact, 390.0);
         assert_eq!(m.cols, 2);
         assert!(m.compact_card);
         assert_eq!(visible_rows_for(m, 528.0), 3);

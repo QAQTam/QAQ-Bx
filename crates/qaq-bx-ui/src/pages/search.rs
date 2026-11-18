@@ -25,12 +25,15 @@ pub struct SearchUiState {
     pub videos: Vec<VideoItem>,
     /// 服务端报告的总命中数(`numResults`)。
     pub total: Option<u64>,
+    /// 搜索默认词(U2;服务端 `search/default`,空 = 未取到)。
+    pub default_word: Option<String>,
 }
 
 pub fn search_page(
     state: &SearchUiState,
     on_draft: &Callback<Rc<str>>,
     on_submit: &Callback<()>,
+    on_pick_default: &Callback<()>,
     on_open: &Callback<String>,
     layout: ViewportLayout,
 ) -> View {
@@ -97,7 +100,11 @@ pub fn search_page(
         .grid_row(0)
         .content(
             StackPanel::new()
-                .spacing(if layout.shows_inline_title_search() { 4.0 } else { 10.0 })
+                .spacing(if layout.shows_inline_title_search() {
+                    4.0
+                } else {
+                    10.0
+                })
                 .children((
                     theme::text("搜索")
                         .font_size(layout.page_title_size())
@@ -121,7 +128,9 @@ pub fn search_page(
             .horizontal_alignment(HorizontalAlignment::Center)
             .vertical_alignment(VerticalAlignment::Center)
             .children((
-                TextBlock::new().text(format!("搜索失败：{err}")).opacity(0.8),
+                TextBlock::new()
+                    .text(format!("搜索失败：{err}"))
+                    .opacity(0.8),
                 TextBlock::new()
                     .text("可调整关键词后重新搜索")
                     .font_size(12.0)
@@ -129,17 +138,47 @@ pub fn search_page(
             ))
             .into()
     } else if state.videos.is_empty() {
-        let hint = if state.query.is_empty() {
-            "输入关键词搜索视频".to_string()
+        if state.query.is_empty() {
+            // U2:空态展示搜索默认词,点击即填入并提交。
+            let mut empty_items: Vec<View> = vec![TextBlock::new()
+                .text("输入关键词搜索视频")
+                .opacity(0.6)
+                .into()];
+            if let Some(word) = &state.default_word {
+                let on_pick = on_pick_default.clone();
+                empty_items.push(
+                    Button::new()
+                        .style(ButtonStyle::Subtle)
+                        .on_click(move || on_pick.call(()))
+                        .content(
+                            StackPanel::new()
+                                .orientation(Orientation::Horizontal)
+                                .spacing(6.0)
+                                .children((
+                                    TextBlock::new().text("大家在搜：").font_size(13.0),
+                                    TextBlock::new()
+                                        .text(word.clone())
+                                        .font_size(13.0)
+                                        .foreground(Brush::Theme(ThemeBrush::Accent)),
+                                )),
+                        )
+                        .into(),
+                );
+            }
+            StackPanel::new()
+                .spacing(10.0)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center)
+                .children(empty_items)
+                .into()
         } else {
-            format!("没有找到与「{}」相关的内容", state.query)
-        };
-        TextBlock::new()
-            .text(hint)
-            .opacity(0.6)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .vertical_alignment(VerticalAlignment::Center)
-            .into()
+            TextBlock::new()
+                .text(format!("没有找到与「{}」相关的内容", state.query))
+                .opacity(0.6)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into()
+        }
     } else {
         let subtitle = match state.total {
             Some(total) => format!("「{}」约 {} 个结果", state.query, theme::fmt_count(total)),

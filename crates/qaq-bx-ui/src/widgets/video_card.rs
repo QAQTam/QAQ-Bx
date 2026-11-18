@@ -3,6 +3,7 @@
 //! - 每张卡片为独立 `VideoCard` 子组件（本地局部状态 + `PartialEq` 跳过未变卡）；
 //! - 桌面态支持鼠标悬停两段式中心缩放动画（70ms 微缩蓄力 0.96 → 150ms 扩张 1.045），Mobile 紧凑态关闭悬停动画。
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -49,6 +50,7 @@ pub fn home_virtual_source(
     on_open: &Callback<String>,
     on_hover_preresolve: &Callback<String>,
     on_row_active: &Callback<(u64, usize, bool)>,
+    unplayable: &HashMap<String, String>,
 ) -> VirtualSource {
     let cols = metrics.cols.max(1);
     let rows: Rc<Vec<Rc<Vec<HomeSlot>>>> = Rc::new(
@@ -61,6 +63,7 @@ pub fn home_virtual_source(
     let on_open = on_open.clone();
     let on_hover = on_hover_preresolve.clone();
     let on_row = on_row_active.clone();
+    let unplayable = Rc::new(unplayable.clone());
     VirtualSource::new(
         row_revision,
         row_count,
@@ -81,6 +84,7 @@ pub fn home_virtual_source(
                 on_open: on_open.clone(),
                 on_hover_preresolve: on_hover.clone(),
                 on_row_active: on_row.clone(),
+                unplayable: Rc::clone(&unplayable),
             })
         },
     )
@@ -117,6 +121,7 @@ pub fn video_grid(items: &[VideoItem], metrics: CardMetrics, on_open: &Callback<
                             is_focused: false,
                             on_open: on_open.clone(),
                             on_hover_preresolve: None,
+                            unplayable_badge: None,
                         }),
                     )
                 })
@@ -152,6 +157,8 @@ pub struct FeedRowInput {
     pub on_open: Callback<String>,
     pub on_hover_preresolve: Callback<String>,
     pub on_row_active: Callback<(u64, usize, bool)>,
+    /// bvid → 不可播原因（充电/付费未解锁；命中即卡面打标）。
+    pub unplayable: Rc<HashMap<String, String>>,
 }
 
 pub struct FeedRow;
@@ -189,6 +196,9 @@ impl Component for FeedRow {
                     is_focused: input.focused_col == Some(col_idx),
                     on_open: input.on_open.clone(),
                     on_hover_preresolve: Some(input.on_hover_preresolve.clone()),
+                    unplayable_badge: slot
+                        .bvid()
+                        .and_then(|bvid| input.unplayable.get(bvid).cloned()),
                 }),
             )
         });
@@ -209,6 +219,8 @@ pub struct VideoCardInput {
     pub is_focused: bool,
     pub on_open: Callback<String>,
     pub on_hover_preresolve: Option<Callback<String>>,
+    /// 非空 = 该稿已被预解析判定为不可播（充电/付费未解锁），卡面打标。
+    pub unplayable_badge: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -327,7 +339,10 @@ impl Component for VideoCard {
 
     fn input_changed(&mut self, input: &Self::Input, _context: &ComponentContext<Self>) {
         // 仅当槽位从骨架填充为视频，或换了新视频时才复位悬停；封面异步到图不打断悬停动画。
-        if self.hover.sync_bvid(input.slot.bvid().map(ToOwned::to_owned)) {
+        if self
+            .hover
+            .sync_bvid(input.slot.bvid().map(ToOwned::to_owned))
+        {
             self.timer = None;
         }
         if input.metrics.compact_card && self.timer.is_some() {
@@ -345,16 +360,18 @@ impl Component for VideoCard {
         match message {
             Message::PointerEntered => {
                 if let Some(seq) = self.hover.on_enter() {
-                    self.timer = Some(
-                        context.set_local_timeout(CONTRACT_DURATION, move || Message::ExpandTick(seq)),
-                    );
+                    self.timer =
+                        Some(context.set_local_timeout(CONTRACT_DURATION, move || {
+                            Message::ExpandTick(seq)
+                        }));
                 }
             }
             Message::ExpandTick(seq) => {
                 if let Some(seq) = self.hover.on_expand(seq) {
-                    self.timer = Some(
-                        context.set_local_timeout(EXPAND_DURATION, move || Message::PreresolveTick(seq)),
-                    );
+                    self.timer =
+                        Some(context.set_local_timeout(EXPAND_DURATION, move || {
+                            Message::PreresolveTick(seq)
+                        }));
                 }
             }
             Message::PreresolveTick(seq) => {
@@ -381,7 +398,13 @@ impl Component for VideoCard {
         let content: View = match &input.slot {
             HomeSlot::Skeleton { .. } => skeleton_card_view(metrics),
             HomeSlot::Video { item, .. } => {
-                populated_card_view(item, input.is_focused, metrics, &input.on_open)
+                populated_card_view(
+                    item,
+                    input.is_focused,
+                    metrics,
+                    &input.on_open,
+                    input.unplayable_badge.as_deref(),
+                )
             }
         };
 
@@ -460,6 +483,7 @@ fn populated_card_view(
     is_focused: bool,
     metrics: CardMetrics,
     on_open: &Callback<String>,
+    unplayable_badge: Option<&str>,
 ) -> View {
     let bvid = item.bvid.clone();
     let on_click = on_open.clone();
@@ -485,6 +509,32 @@ fn populated_card_view(
             .content(cover_inner)
             .into(),
     ];
+
+    // 不可播角标(充电/付费未解锁):置顶盖住时长徽标,先于其它覆盖层渲染保证可见。
+    if let Some(reason) = unplayable_badge {
+        let badge_text = if qaq_bx_core::player::is_trial_downgrade_reason(reason) {
+            "充电专稿"
+        } else {
+            "无法播放"
+        };
+        cover_layers.push(
+            Border::new()
+                .background(Brush::Solid(Color::argb(216, 12, 12, 12)))
+                .border_brush(Brush::Solid(Color::argb(255, 196, 86, 43)))
+                .border_thickness(1.0)
+                .corner_radius(4.0)
+                .padding(Thickness::xy(6.0, 2.0))
+                .margin(Thickness::new(6.0, 6.0, 6.0, 0.0))
+                .horizontal_alignment(HorizontalAlignment::Right)
+                .vertical_alignment(VerticalAlignment::Top)
+                .content(
+                    theme::text(badge_text)
+                        .foreground(Brush::Solid(Color::rgb(255, 179, 92)))
+                        .font_size(if compact { 10.0 } else { 11.0 }),
+                )
+                .into(),
+        );
+    }
 
     if compact {
         let overlay_bg = Brush::Solid(Color::argb(176, 16, 16, 16));
@@ -654,7 +704,10 @@ mod tests {
 
         assert!(hm.sync_bvid(Some("BV1test".into())));
         let seq = hm.on_enter().expect("填充视频后应支持悬停微缩");
-        assert_eq!(hm.scale_transition(), Some((CONTRACT_SCALE, CONTRACT_DURATION)));
+        assert_eq!(
+            hm.scale_transition(),
+            Some((CONTRACT_SCALE, CONTRACT_DURATION))
+        );
         assert_eq!(hm.on_expand(seq), Some(seq));
         assert_eq!(hm.scale_transition(), Some((EXPAND_SCALE, EXPAND_DURATION)));
         assert_eq!(hm.on_preresolve(seq).as_deref(), Some("BV1test"));
