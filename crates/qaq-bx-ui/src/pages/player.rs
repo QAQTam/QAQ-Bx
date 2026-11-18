@@ -162,6 +162,9 @@ pub struct RelatedPane {
     pub loaded_once: bool,
     pub error: Option<String>,
     pub items: Vec<VideoItem>,
+    /// F3:渲染换代号——shell 每次写入(items 原位 push/封面回填/状态翻转)必须 +1,
+    /// PlayerPage 据此重建相关推荐虚拟源(与 `CommentsSnapshot.rev` 同契约)。
+    pub rev: u64,
 }
 
 #[derive(Clone)]
@@ -280,6 +283,9 @@ pub struct PlayerPage {
     last_bvid: String,
     last_demo_override: Option<(u64, PlayerTab, bool)>,
     double_click: DoubleClickTracker,
+    /// F3:评论/相关列表虚拟源缓存(桌面/紧凑两档;同 (档位, rev) 复用同一实例)。
+    comments_cache: VirtualSourceCache,
+    related_cache: VirtualSourceCache,
 }
 
 #[derive(Clone, PartialEq)]
@@ -292,6 +298,62 @@ pub enum Message {
     VideoPressed(f64, f64, bool),
 }
 
+impl PlayerPage {
+    /// F3:按 (档位, rev) 刷新评论/相关虚拟源缓存;rev 未变则零成本复用。
+    /// 只在 create/input_changed 调用(view 持 &self 不可写);view 侧 peek。
+    fn refresh_virtual_sources(&mut self, input: &PlayerInput) {
+        let snapshot = &input.comments;
+        let rev = snapshot.rev;
+        let data = Arc::clone(&snapshot.data);
+        let cb = input.comment_cb.clone();
+        self.comments_cache.get(VARIANT_DESKTOP, rev, || {
+            comments_virtual_source(&data, &cb, false, rev)
+        });
+        self.comments_cache.get(VARIANT_COMPACT, rev, || {
+            comments_virtual_source(&data, &cb, true, rev)
+        });
+        let related = &input.related;
+        let rel_rev = related.rev;
+        let on_open = input.on_open_video.clone();
+        self.related_cache.get(VARIANT_DESKTOP, rel_rev, || {
+            related_virtual_source(related, &on_open, false, rel_rev)
+        });
+        self.related_cache.get(VARIANT_COMPACT, rel_rev, || {
+            related_virtual_source(related, &on_open, true, rel_rev)
+        });
+    }
+
+    /// view 侧取评论虚拟源(正常路径命中缓存;未命中现建兜底,正确性优先)。
+    fn comments_source(&self, input: &PlayerInput, variant: usize) -> VirtualSource {
+        let snapshot = &input.comments;
+        self.comments_cache
+            .peek(variant, snapshot.rev)
+            .unwrap_or_else(|| {
+                comments_virtual_source(
+                    &snapshot.data,
+                    &input.comment_cb,
+                    variant == VARIANT_COMPACT,
+                    snapshot.rev,
+                )
+            })
+    }
+
+    /// view 侧取相关推荐虚拟源(同上)。
+    fn related_source(&self, input: &PlayerInput, variant: usize) -> VirtualSource {
+        let related = &input.related;
+        self.related_cache
+            .peek(variant, related.rev)
+            .unwrap_or_else(|| {
+                related_virtual_source(
+                    related,
+                    &input.on_open_video,
+                    variant == VARIANT_COMPACT,
+                    related.rev,
+                )
+            })
+    }
+}
+
 impl Component for PlayerPage {
     type Input = PlayerInput;
     type Message = Message;
@@ -301,7 +363,7 @@ impl Component for PlayerPage {
             .demo_override
             .map(|(_, tab, expanded)| (tab, expanded))
             .unwrap_or((PlayerTab::Intro, false));
-        Self {
+        let mut page = Self {
             scroll_y: 0.0,
             scroll_reset_gen: 1,
             pip_pinned: false,
@@ -310,10 +372,15 @@ impl Component for PlayerPage {
             last_bvid: input.item.bvid.clone(),
             last_demo_override: input.demo_override,
             double_click: DoubleClickTracker::new(),
-        }
+            comments_cache: VirtualSourceCache::default(),
+            related_cache: VirtualSourceCache::default(),
+        };
+        page.refresh_virtual_sources(input);
+        page
     }
 
     fn input_changed(&mut self, input: &PlayerInput, _context: &ComponentContext<Self>) {
+        self.refresh_virtual_sources(input);
         if self.last_bvid != input.item.bvid {
             self.last_bvid = input.item.bvid.clone();
             self.active_tab = PlayerTab::Intro;
@@ -776,7 +843,18 @@ impl Component for PlayerPage {
                             .background(ThemeBrush::CardStroke)
                             .into(),
                     );
-                    intro_children.push(related_panel(input, is_mobile));
+                    intro_children.push(related_panel(
+                        input,
+                        is_mobile,
+                        &self.related_source(
+                            input,
+                            if is_mobile {
+                                VARIANT_COMPACT
+                            } else {
+                                VARIANT_DESKTOP
+                            },
+                        ),
+                    ));
 
                     View::from(
                         StackPanel::new()
@@ -792,6 +870,7 @@ impl Component for PlayerPage {
                         &input.comment_cb,
                         &input.comment_cb.composer_draft,
                         true,
+                        &self.comments_source(input, VARIANT_COMPACT),
                     );
                     View::from(
                         StackPanel::new()
@@ -864,6 +943,7 @@ impl Component for PlayerPage {
             &input.comment_cb,
             &input.comment_cb.composer_draft,
             false,
+            &self.comments_source(input, VARIANT_DESKTOP),
         );
 
         let left_scroll_content = StackPanel::new()
@@ -891,7 +971,11 @@ impl Component for PlayerPage {
             // 横向 Disabled:默认 Auto 会以无限宽量测内容,推荐卡 Star 列退化为
             // 自然宽,卡片随标题长短参差且不满栏;禁用后按视口宽满栏等宽。
             .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
-            .content(related_panel(input, false));
+            .content(related_panel(
+                input,
+                false,
+                &self.related_source(input, VARIANT_DESKTOP),
+            ));
 
         let two_col_body = Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Pixel(RIGHT_RAIL_WIDTH)])
@@ -1091,12 +1175,112 @@ fn format_desc_body(bvid: &str, desc: Option<&str>) -> String {
     format!("{d}\n\nBV 号：{bvid}")
 }
 
+// ---------- F3:评论/相关列表行虚拟化 ----------
+
+/// 虚拟源缓存档位(桌面全量 / 移动紧凑各一枚)。
+const VARIANT_DESKTOP: usize = 0;
+const VARIANT_COMPACT: usize = 1;
+
+/// 虚拟源按档位缓存。
+/// `VirtualSource` 判等是 Rc 指针等价——同一 (档位, rev) 必须复用同一实例才能跨
+/// pass 判等短路;每 pass 现建会得到新 Rc 闭包,判等必 false → 行整体重 realize。
+#[derive(Default)]
+struct VirtualSourceCache {
+    entries: [Option<(u64, VirtualSource)>; 2],
+}
+
+impl VirtualSourceCache {
+    /// 取/建:同 (档位, rev) 复用;否则 build 重建并占位。
+    fn get(
+        &mut self,
+        variant: usize,
+        rev: u64,
+        build: impl FnOnce() -> VirtualSource,
+    ) -> VirtualSource {
+        if let Some((cached_rev, source)) = &self.entries[variant] {
+            if *cached_rev == rev {
+                return source.clone();
+            }
+        }
+        let source = build();
+        self.entries[variant] = Some((rev, source.clone()));
+        source
+    }
+
+    /// 只读窥视(view 持 &self 不可写;未命中由调用方现建兜底)。
+    fn peek(&self, variant: usize, rev: u64) -> Option<VirtualSource> {
+        let (cached_rev, source) = self.entries[variant].as_ref()?;
+        (*cached_rev == rev).then(|| source.clone())
+    }
+}
+
+/// 评论行键:段位前缀(置顶 `c-top-` / 普通 `c-`,沿用旧 KeyedView 语义防 rpid
+/// 跨段复用)+ 行序(reactor 对重复键在 mount/revision 变更时 panic;行序入键保证
+/// 构造唯一)+ rpid(append-only 加载时已 realize 行按稿件身份复用)。
+fn comment_row_key(row_idx: usize, top_len: usize, rpid: u64) -> String {
+    if row_idx < top_len {
+        format!("c-top-{row_idx}-{rpid}")
+    } else {
+        format!("c-{row_idx}-{rpid}")
+    }
+}
+
+/// 相关推荐行键(行序防重,bvid 保身份)。
+fn related_row_key(row_idx: usize, bvid: &str) -> String {
+    format!("r-{row_idx}-{bvid}")
+}
+
+/// 评论区行虚拟源——一行一张评论卡(变高行,StackLayout 支持)。
+/// 闭包捕获整份 `Arc<CommentsData>`(UP 标记/头像表/楼中楼展开态随快照 rev 整体
+/// 换代)与 `CommentCallbacks`(行内只消费 on_toggle_sub / on_load_more_sub 两个
+/// 路由回调)。
+fn comments_virtual_source(
+    data: &Arc<CommentsData>,
+    cb: &CommentCallbacks,
+    compact_pane: bool,
+    rev: u64,
+) -> VirtualSource {
+    let top_len = data.top_replies.len();
+    let mut rows: Vec<Rc<ReplyItem>> = Vec::with_capacity(top_len + data.replies.len());
+    rows.extend(data.top_replies.iter().cloned().map(Rc::new));
+    rows.extend(data.replies.iter().cloned().map(Rc::new));
+    let rows = Rc::new(rows);
+    let key_rows = Rc::clone(&rows);
+    let data = Arc::clone(data);
+    let cb = cb.clone();
+    VirtualSource::new(
+        rev,
+        rows.len(),
+        move |row_idx| Key::from(comment_row_key(row_idx, top_len, key_rows[row_idx].rpid)),
+        move |row_idx| comment_card(&rows[row_idx], &data, &cb, compact_pane),
+    )
+}
+
+/// 相关推荐行虚拟源——一行一张相关卡。
+fn related_virtual_source(
+    related: &RelatedPane,
+    on_open: &Callback<String>,
+    compact_card: bool,
+    rev: u64,
+) -> VirtualSource {
+    let rows: Rc<Vec<VideoItem>> = Rc::new(related.items.clone());
+    let key_rows = Rc::clone(&rows);
+    let on_open = on_open.clone();
+    VirtualSource::new(
+        rev,
+        rows.len(),
+        move |row_idx| Key::from(related_row_key(row_idx, &key_rows[row_idx].bvid)),
+        move |row_idx| related_card(&rows[row_idx], compact_card, &on_open),
+    )
+}
+
 fn comments_panel_with(
     snapshot: &CommentsSnapshot,
     my_avatar: Option<&EncodedImage>,
     cb: &CommentCallbacks,
     draft: &str,
     compact_pane: bool,
+    source: &VirtualSource,
 ) -> View {
     let data = &snapshot.data;
     let on_hot = {
@@ -1276,18 +1460,13 @@ fn comments_panel_with(
             ));
         }
     } else {
-        for item in &data.top_replies {
-            rows.push(KeyedView::new(
-                format!("c-top-{}", item.rpid),
-                comment_card(item, data, cb, compact_pane),
-            ));
-        }
-        for item in &data.replies {
-            rows.push(KeyedView::new(
-                format!("c-{}", item.rpid),
-                comment_card(item, data, cb, compact_pane),
-            ));
-        }
+        // F3:整表卡片换成虚拟源行。同 rev 复用缓存实例时,本面板每 pass 只构建
+        // header/composer/footer 与一个 ItemsRepeater 节点,行声明零重跑;
+        // 卡间距(原 StackPanel spacing 14)改由评论卡自带下边距补齐。
+        rows.push(KeyedView::new(
+            "c-list",
+            View::from(ItemsRepeater::new().virtual_source(source.clone())),
+        ));
 
         if let Some(err) = &data.error {
             let on_retry = cb.on_retry.clone();
@@ -1507,6 +1686,8 @@ fn comment_card(
 
     Border::new()
         .padding(Thickness::new(0.0, 10.0, 0.0, 6.0))
+        // F3:行间距改由卡片自带(虚拟行无 sibling spacing;对应原 StackPanel spacing 14)。
+        .margin(Thickness::new(0.0, 0.0, 0.0, 14.0))
         .content(
             Grid::new()
                 .columns([GridLength::Auto, GridLength::Star(1.0)])
@@ -1811,7 +1992,7 @@ fn related_status_view(text: &str, on_retry: Option<&Callback<()>>, compact_card
     box_border.into()
 }
 
-fn related_panel(input: &PlayerInput, compact_card: bool) -> View {
+fn related_panel(input: &PlayerInput, compact_card: bool, source: &VirtualSource) -> View {
     let related = &input.related;
     let mut cards: Vec<View> = vec![
         TextBlock::new()
@@ -1834,9 +2015,9 @@ fn related_panel(input: &PlayerInput, compact_card: bool) -> View {
     } else if related.items.is_empty() {
         cards.push(related_status_view("暂无相关视频", None, compact_card));
     } else {
-        for item in &related.items {
-            cards.push(related_card(item, compact_card, &input.on_open_video));
-        }
+        // F3:同评论区——整表卡片换虚拟源行,同 rev 复用即零行重跑;
+        // 卡间距(原 StackPanel spacing 10)改由相关卡自带下边距补齐。
+        cards.push(ItemsRepeater::new().virtual_source(source.clone()).into());
     }
 
     StackPanel::new().spacing(10.0).children(cards).into()
@@ -1870,6 +2051,8 @@ fn related_card(item: &VideoItem, compact_card: bool, on_open: &Callback<String>
         .background(ThemeBrush::CardBackground)
         .border_brush(ThemeBrush::CardStroke)
         .border_thickness(1.0)
+        // F3:行间距改由卡片自带(对应原 StackPanel spacing 10)。
+        .margin(Thickness::new(0.0, 0.0, 0.0, 10.0))
         .on_pointer_released(move |_| on_click.call(bvid.clone()));
     card = if compact_card {
         card.horizontal_alignment(HorizontalAlignment::Stretch)
@@ -2347,6 +2530,8 @@ pub struct HalfPanePreview {
     live_width: Option<f64>,
     max_width: f64,
     double_click: DoubleClickTracker,
+    /// F3:半窗评论区虚拟源缓存(常驻 compact 档;与 PlayerPage 同契约)。
+    comments_cache: VirtualSourceCache,
 }
 
 #[derive(Clone, PartialEq)]
@@ -2357,20 +2542,47 @@ pub enum HalfPaneMessage {
     VideoPressed(f64, f64, bool),
 }
 
+impl HalfPanePreview {
+    /// 按 rev 刷新半窗评论虚拟源(常驻 compact 档)。
+    fn refresh_comments_source(&mut self, input: &HalfPaneInput) {
+        let snapshot = &input.comments;
+        let rev = snapshot.rev;
+        let data = Arc::clone(&snapshot.data);
+        let cb = input.comment_cb.clone();
+        self.comments_cache.get(VARIANT_COMPACT, rev, || {
+            comments_virtual_source(&data, &cb, true, rev)
+        });
+    }
+
+    /// view 侧取评论虚拟源(命中缓存;未命中现建兜底)。
+    fn comments_source(&self, input: &HalfPaneInput) -> VirtualSource {
+        let snapshot = &input.comments;
+        self.comments_cache
+            .peek(VARIANT_COMPACT, snapshot.rev)
+            .unwrap_or_else(|| {
+                comments_virtual_source(&snapshot.data, &input.comment_cb, true, snapshot.rev)
+            })
+    }
+}
+
 impl Component for HalfPanePreview {
     type Input = HalfPaneInput;
     type Message = HalfPaneMessage;
 
     fn create(input: &HalfPaneInput, _context: &ComponentContext<Self>) -> Self {
-        Self {
+        let mut pane = Self {
             drag_origin: None,
             live_width: None,
             max_width: input.max_width,
             double_click: DoubleClickTracker::new(),
-        }
+            comments_cache: VirtualSourceCache::default(),
+        };
+        pane.refresh_comments_source(input);
+        pane
     }
 
     fn input_changed(&mut self, input: &HalfPaneInput, _context: &ComponentContext<Self>) {
+        self.refresh_comments_source(input);
         self.max_width = input.max_width;
         if let Some(w) = self.live_width {
             self.live_width = Some(clamp_half_pane_width(w, self.max_width));
@@ -2571,6 +2783,7 @@ impl Component for HalfPanePreview {
                     &input.comment_cb,
                     &input.comment_cb.composer_draft,
                     true,
+                    &self.comments_source(input),
                 ),
             ));
 
@@ -2641,12 +2854,18 @@ impl Component for HalfPanePreview {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use qaq_bx_core::reply::ReplyItem;
+
     use super::{
-        HALF_PANE_MAX_WIDTH, HALF_PANE_MIN_WIDTH, PlayerTab, RELATED_CARD_WIDTH,
-        RELATED_COVER_HEIGHT, RELATED_META_HEIGHT, RELATED_TEXT_SPACING, RELATED_TITLE_HEIGHT,
-        RIGHT_RAIL_WIDTH, clamp_half_pane_width, comments_tab_label,
+        CommentCallbacks, CommentSort, CommentsData, HALF_PANE_MAX_WIDTH, HALF_PANE_MIN_WIDTH,
+        PlayerTab, RELATED_CARD_WIDTH, RELATED_COVER_HEIGHT, RELATED_META_HEIGHT,
+        RELATED_TEXT_SPACING, RELATED_TITLE_HEIGHT, RelatedPane, RIGHT_RAIL_WIDTH,
+        VARIANT_COMPACT, VARIANT_DESKTOP, VirtualSourceCache, clamp_half_pane_width,
+        comment_row_key, comments_tab_label, comments_virtual_source,
         compute_half_pane_video_height, desktop_transport_compact, format_desc_body,
-        half_pane_shows_volume_slider,
+        half_pane_shows_volume_slider, related_row_key,
     };
 
     #[test]
@@ -2812,5 +3031,110 @@ mod tests {
         let cb = windows_reactor::Callback::new(|()| {});
         let _ = super::fullscreen_toggle_button(false, false, false, cb.clone());
         let _ = super::fullscreen_toggle_button(true, true, false, cb);
+    }
+
+    // ---------- F3:评论/相关列表行虚拟化 ----------
+
+    fn reply_item(rpid: u64) -> ReplyItem {
+        ReplyItem {
+            rpid,
+            oid: 0,
+            root: 0,
+            parent: 0,
+            mid: 0,
+            uname: format!("user{rpid}"),
+            avatar: String::new(),
+            level: 1,
+            message: format!("msg{rpid}"),
+            ctime: 0,
+            like: 0,
+            rcount: 0,
+            time_desc: String::new(),
+            location: String::new(),
+            is_up_top: false,
+            up_liked: false,
+            up_replied: false,
+            replies: Vec::new(),
+        }
+    }
+
+    fn test_callbacks() -> CommentCallbacks {
+        CommentCallbacks {
+            on_sort: super::Callback::new(|_: CommentSort| {}),
+            on_load_more: super::Callback::new(|()| {}),
+            on_retry: super::Callback::new(|()| {}),
+            on_toggle_sub: super::Callback::new(|_: u64| {}),
+            on_load_more_sub: super::Callback::new(|_: u64| {}),
+            on_draft: super::Callback::new(|_: std::rc::Rc<str>| {}),
+            on_submit: super::Callback::new(|()| {}),
+            composer_notice: None,
+            can_post: false,
+            composer_draft: String::new(),
+        }
+    }
+
+    #[test]
+    fn virtual_source_cache_reuses_per_rev_and_rebuilds_on_change() {
+        let mut cache = VirtualSourceCache::default();
+        let data = Arc::new(CommentsData::default());
+        let cb = test_callbacks();
+        let desktop = |rev: u64| comments_virtual_source(&data, &cb, false, rev);
+        let first = cache.get(VARIANT_DESKTOP, 7, || desktop(7));
+        let again = cache.get(VARIANT_DESKTOP, 7, || desktop(7));
+        assert!(
+            first == again,
+            "同 (档位, rev) 必须复用同一实例(跨 pass 判等短路的根基)"
+        );
+        let rebuilt = cache.get(VARIANT_DESKTOP, 8, || desktop(8));
+        assert!(first != rebuilt, "rev 变化必须重建(新 Rc 实例)");
+        let compact = cache.get(VARIANT_COMPACT, 7, || {
+            comments_virtual_source(&data, &cb, true, 7)
+        });
+        assert!(first != compact, "档位之间互相隔离");
+        assert!(
+            cache.get(VARIANT_DESKTOP, 8, || desktop(8)) == rebuilt,
+            "另一档刷新不得干扰本档缓存"
+        );
+    }
+
+    #[test]
+    fn comment_row_keys_unique_across_and_within_segments() {
+        // 置顶段与普通段可能复用同一 rpid(旧 c-top-/c- 前缀契约):不得撞键。
+        assert_ne!(comment_row_key(0, 1, 42), comment_row_key(1, 1, 42));
+        // 行序入键:bilibili 异常返回段内重复 rpid 也不会触发 reactor 重复键 panic。
+        assert_ne!(comment_row_key(0, 2, 42), comment_row_key(1, 2, 42));
+    }
+
+    #[test]
+    fn related_row_keys_unique_per_row() {
+        assert_ne!(related_row_key(0, "BV1"), related_row_key(1, "BV1"));
+        assert_ne!(related_row_key(0, "BV1"), related_row_key(0, "BV2"));
+    }
+
+    #[test]
+    fn comments_virtual_source_len_and_rebuild_distinctness() {
+        let data = Arc::new(CommentsData {
+            top_replies: vec![reply_item(1), reply_item(2)],
+            replies: vec![reply_item(3), reply_item(1)],
+            ..CommentsData::default()
+        });
+        let cb = test_callbacks();
+        let source = comments_virtual_source(&data, &cb, false, 9);
+        assert_eq!(source.len(), 4);
+        // 机制锁定:同 rev 现建两次必然不等(Rc 闭包指针不同)——这正是调用方
+        // 必须经 VirtualSourceCache 缓存复用、不能在 view 里现建的原因。
+        assert_ne!(source, comments_virtual_source(&data, &cb, false, 9));
+    }
+
+    #[test]
+    fn related_pane_rev_participates_in_equality() {
+        let mut pane = RelatedPane::default();
+        let clone = pane.clone();
+        assert_eq!(pane, clone);
+        pane.rev = pane.rev.wrapping_add(1);
+        assert_ne!(
+            pane, clone,
+            "rev 必须参与判等:封面回填/原位 push 依赖它触发换代"
+        );
     }
 }

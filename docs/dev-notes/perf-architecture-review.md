@@ -185,8 +185,11 @@
 >   避开拖框期间逐布局 pass 的全树重算(兼避开 0x359595 崩溃路径)。
 >   测试 `title_bar_auto_refresh_opt_out_survives_height_override` 验证与
 >   `preferred_height` 互不冲顶 + 默认值不受影响。
-> - ⏳ **F3 评论/关联虚拟化**:待做(与 native 弹幕迁移无关,可独立推进)。
-> - ⏳ **F4 MPE/弹幕层常驻单实例**:待做(跨 v0.3 迁移线,需协调窗口)。
+> - ✅ **F3 评论/关联虚拟化**(2026-11-19):评论区/相关推荐整表 KeyedView 循环
+>   换成缓存的 `VirtualSource`+`ItemsRepeater`(配方同首页,见 §6 实测记录)。
+> - ⏳ **F4 MPE/弹幕层常驻单实例**:待做。协调前提已变化——v0.3 线已收口出包
+>   (933667e,worktree 干净),但其新增 `docs/dev-notes/persistent-mpe.md`
+>   显示 MPE 方向仍有并行动作;动工前先读该文档对齐,避免撞车。
 
 1. **F6 profile**(半天内见效,零风险)→ E14 坐实收益。
 2. **F2 应用侧 16ms 采样 + 拖拽期停心跳整页重建**(应用层单文件改动,可回归)。
@@ -236,6 +239,27 @@
   `RecomputeDragRegions` 句柄 + `element_ref` 贯通,正交且互补)。本 worktree
   全部验证(E11/E12/单测)在 `335c541` 上完成;对分支 tip 复验 `cargo check` 通过。
   应用侧「档位翻转后手动重算」现已具备句柄通道,等该分支并入 master 后接线。
+- **2026-11-19 F3 落地记录**(`feat/v0.4.0`,player.rs + shell.rs):
+  - 结构:评论区/相关推荐的整表 `KeyedView` 循环 → 单个 `ItemsRepeater`
+    (行 = 一卡,变高行交 StackLayout);`VirtualSource` 按 (档位, rev) 缓存在
+    `PlayerPage`(桌面/紧凑两档)与 `HalfPanePreview`(常驻 compact 档),
+    create/input_changed 刷新、view 只读 peek——`VirtualSource` 判等是 Rc 指针
+    等价(declaration.rs:1668),同 rev 复用同一实例才能跨 pass 短路,这是本轮
+    收益主体(每 pass 从 O(全部卡片声明+diff) 降到 O(1));行 realize 本身
+    交给 ItemsRepeater 的 EffectiveViewportChanged 视口机制(嵌套在
+    StackPanel 内亦然,首页同款已实证)。行键 = 段前缀(c-top-/c-,沿用旧语义
+    防 rpid 跨段复用)+ 行序(防重复键 panic)+ rpid(保身份);卡间距从
+    StackPanel spacing 改由卡片下边距自带(视觉等价换算见注释)。
+  - 配套:`RelatedPane` 加 `rev` 字段(absorb/push/封面回填三处 shell 写点 +1,
+    封面回填是原位变更、指纹法必漏,故走与 CommentsSnapshot 同款换代契约)。
+  - 验证:`cargo test --workspace` 全绿(ui 67→**72**,+5:F1 缓存复用/换代重建/
+    档位隔离、行键跨段/段内唯一、source 长度与「同 rev 现建必不等」机制锁定、
+    RelatedPane.rev 判等);`--features selftest` 构建 + `--selftest all` 全 PASS
+    (half-pane 11.6s 实挂载新缓存路径,mobile 覆盖紧凑档)。
+  - 未验证(诚实清单):变高行下 StackLayout 的未 realize 估算导致的滚动条
+    精度未实测;拖框期 view() 重跑的实际降耗未量化(待 E14 计数器)。
+  - 注记追记:`fix/titlebar-ghost-rectchanged` 已并入 reactor master
+    (`7c448c1`),应用侧手动 RecomputeDragRegions 接线条件已满足(本轮未接线)。
 
 ## 7. 本次未验证项(诚实清单)
 

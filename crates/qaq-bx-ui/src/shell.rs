@@ -2038,6 +2038,8 @@ impl AppShell {
         self.related = pages::player::RelatedPane {
             bvid: bvid.clone(),
             loading: true,
+            // F3:换代 +1;absorb/封面回填同契约,PlayerPage 据此重建相关虚拟源。
+            rev: self.related.rev.wrapping_add(1),
             ..pages::player::RelatedPane::default()
         };
         let client = self.feed_client.clone();
@@ -2080,6 +2082,8 @@ impl AppShell {
             return;
         }
         self.related.loading = false;
+        // F3:换代 +1(loading 翻转与 error 路径共同覆盖)。
+        self.related.rev = self.related.rev.wrapping_add(1);
         let items = match res {
             Ok(items) => items,
             Err(err) => {
@@ -2105,6 +2109,7 @@ impl AppShell {
             self.related.items.push(item);
         }
         self.related.loaded_once = true;
+        self.related.rev = self.related.rev.wrapping_add(1);
     }
 
     fn apply_resolved_media(
@@ -5033,6 +5038,8 @@ impl Component for AppShell {
                         && item.cover.is_none()
                     {
                         item.cover = Some(image);
+                        // F3:封面回填是原位变更,必须换代触发相关虚拟源重建。
+                        self.related.rev = self.related.rev.wrapping_add(1);
                     }
                 }
                 if changed {
