@@ -162,6 +162,32 @@
 
 ## 4. 0.4.0 落地顺序建议(按 ROI)
 
+> **实施进度(2026-11-18,`feat/v0.4.0`)**:
+> - ✅ **F6 profile**:workspace 加 `[profile.dev] opt-level=1` +
+>   `[profile.dev.package."*"] opt-level=2` + `[profile.release] lto="thin"`。
+>   实测 `just dev` 产物标签变为 `optimized + debuginfo`;`cargo test --workspace`
+>   core 60+6 / login 7 / ui 67 / video 25 全绿,selftest 全场景 PASS
+>   (half-pane/mobile/fullscreen 含 mpv+d3d11va 实开画)。
+> - ✅ **F1 latest-wins 合并(框架正解)**:reactor 新增
+>   `Component::coalesce_key`(挂载时绑进 `LocalSender::coalescer`,
+>   合并发生在 `component/messaging.rs` 入队点),
+>   `LocalSender::send` 命中同 key 未消费消息时**原位换负载**(保留槽位/序)。
+>   默认返回 `None`=对其它使用方零行为变化(opt-in)。应用侧 `AppShell` 只对
+>   `WindowResized`/`FullscreenProbeResult` 声明可合并(单测
+>   `latest_value_messages_are_coalescable_and_the_rest_are_not` 钉死语义边界:
+>   带副作用的 `PositionTick`/`Back`/`WindowResizeSettled` 一律 `None`)。
+>   reactor 测试 `coalesced_messages_deliver_only_the_latest_queued_payload`
+>   (3→1)+ `coalescing_keeps_distinct_keys_and_ordinary_messages_apart`
+>   (5 槽只并同键的 2)双绿。
+> - ✅ **§8.2 TitleBar 开关**:reactor 声明层加 `TitleBar::auto_refresh_drag_regions`
+>   (默认 true,行为不变),`WindowTitleBar{height,auto_refresh_drag_regions}`
+>   贯通到 winui 装配处的 `SetAutoRefreshDragRegions`。应用侧 chrome 关自动刷新,
+>   避开拖框期间逐布局 pass 的全树重算(兼避开 0x359595 崩溃路径)。
+>   测试 `title_bar_auto_refresh_opt_out_survives_height_override` 验证与
+>   `preferred_height` 互不冲顶 + 默认值不受影响。
+> - ⏳ **F3 评论/关联虚拟化**:待做(与 native 弹幕迁移无关,可独立推进)。
+> - ⏳ **F4 MPE/弹幕层常驻单实例**:待做(跨 v0.3 迁移线,需协调窗口)。
+
 1. **F6 profile**(半天内见效,零风险)→ E14 坐实收益。
 2. **F2 应用侧 16ms 采样 + 拖拽期停心跳整页重建**(应用层单文件改动,可回归)。
 3. **F3 评论/关联虚拟化**(纯应用层,配合 E14 度量帧时间)。
@@ -191,11 +217,20 @@
   4. `cargo test --workspace` + `just selftest all` 全绿,E11/E12/E13 不回退;
   5. 任务管理器基线:拖框期间本进程 CPU 峰值记录进本文 §6 实测区。
 
-## 6. 实测记录区(留空,实施轮回填)
+## 6. 实测记录区(实施轮回填)
 
-- (待填)debug@opt0 vs opt1:拖框 CPU 峰值 / 帧时间
-- (待填)F1+F2 前后 render_view 次数
-- (待填)TitleBar 换自绘前后 E14 对比(若做)
+- **2026-11-18 F1+F6+§8.2 落地回归**(`feat/v0.4.0`,debug@opt-level 1/2 构建):
+  - `cargo test --workspace`:core 60+6 / fix 6 / login 7 / ui 67 / video 25 全绿;
+    reactor `cargo test --lib` 346 全绿(新增 3)。`selftest all` 全 PASS。
+  - **E12(native 播放,30×快速伸缩 55%↔100%)**:PASS。
+    `native media failed`=0,`native media opened`=2,STAGE-A/B 齐;
+    但 detach=**12** / remount=**4** —— R4 组件树重建风暴仍在(预期内,F4 未做),
+    伸缩后 800ms 帧亮度 244(MF 管线仍在补帧)。
+  - **E11(mpv 播放,同风暴)**:三轮采样亮度 119.5/121.3/107.2,全程无黑屏,
+    合并改动未伤挂载协议。
+  - 拖框主观体感:待用户真机复核(本 harness 无法量帧)。
+- (待填)F1+F2 前后 render_view 次数(E14 计数器方案 §5)
+- (待填)TitleBar 自绘备胎对比(仅当开关方案体感不足时)
 
 ## 7. 本次未验证项(诚实清单)
 

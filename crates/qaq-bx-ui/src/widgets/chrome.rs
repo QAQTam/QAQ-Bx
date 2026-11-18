@@ -49,6 +49,10 @@ pub fn build_title_bar(
 ) -> TitleBar {
     let mut bar = TitleBar::new()
         .preferred_height(WindowTitleBarHeight::Tall)
+        // 拖框卡顿治理(perf-architecture-review §8.2):关掉 WinUI TitleBar 控件
+        // 的逐布局 pass 拖拽区全树重算;控件仍会在自身尺寸/属性变化时刷新,
+        // 覆盖我们档位切换(搜索框进/出 Content)的主要路径。
+        .auto_refresh_drag_regions(false)
         .icon(Icon::image_data(EncodedImage::from_static(app_icon_png)))
         .title(app_name)
         .subtitle(if layout.is_mobile() {

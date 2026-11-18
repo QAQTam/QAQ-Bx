@@ -3377,6 +3377,17 @@ impl Component for AppShell {
     type Input = ShellInput;
     type Message = Message;
 
+    /// 最新值语义的消息声明(框架侧 latest-wins 合并,perf-architecture-review
+    /// §R1/F1):拖框风暴里入队未消费的中间尺寸没有意义,合并后每次 drain
+    /// 只处理一条,整页 `view()` 重跑从每 DIP 一次降到每帧至多一次。
+    fn coalesce_key(message: &Self::Message) -> Option<u64> {
+        match message {
+            Message::WindowResized(_) => Some(1),
+            Message::FullscreenProbeResult { .. } => Some(2),
+            _ => None,
+        }
+    }
+
     fn create(input: &ShellInput, context: &ComponentContext<Self>) -> Self {
         crate::winrt_ext::apply_global_font(crate::theme::DEFAULT_FONT_FAMILY);
         let auth_service = Arc::new(Auth::new());
@@ -6063,6 +6074,25 @@ fn nav_item(tag: &str, label: &str, icon: Option<Symbol>, selected: bool) -> Key
 mod tests {
     use super::*;
     use qaq_bx_core::settings::{CodecPref, QualityPref};
+
+    #[test]
+    fn latest_value_messages_are_coalescable_and_the_rest_are_not() {
+        let size = |width, height| windows_reactor::WindowSize { width, height };
+        assert_eq!(
+            AppShell::coalesce_key(&Message::WindowResized(size(800.0, 600.0))),
+            Some(1),
+            "拖框风暴:中间尺寸无意义,必须 latest-wins"
+        );
+        assert_eq!(
+            AppShell::coalesce_key(&Message::FullscreenProbeResult { gen_id: 7, active: true }),
+            Some(2),
+            "探针只看最新一代的当前态"
+        );
+        // 非「最新值」语义的消息绝不可被合并丢弃:逐条计数/投递的都有副作用。
+        assert_eq!(AppShell::coalesce_key(&Message::PositionTick), None);
+        assert_eq!(AppShell::coalesce_key(&Message::Back), None);
+        assert_eq!(AppShell::coalesce_key(&Message::WindowResizeSettled), None);
+    }
 
     #[test]
     fn danmaku_segment_math_anchors_six_minute_boundaries() {
