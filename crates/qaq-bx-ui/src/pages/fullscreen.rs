@@ -12,7 +12,7 @@ use crate::data::VideoItem;
 use crate::pages::player::{
     danmaku_toggle_button, fullscreen_toggle_button, hud_foreground, hud_scrim_color,
     mute_toggle_button, play_pause_button, quality_selector, seek_slider, surface_with_loading,
-    time_label,
+    time_label, volume_slider,
 };
 use crate::widgets::video_surface::{VideoSurface, VideoSurfaceInput};
 use crate::widgets::danmaku_surface::{DanmakuSurface, DanmakuSurfaceInput};
@@ -176,6 +176,8 @@ pub struct FullscreenInput {
     pub on_toggle: Callback<()>,
     pub on_seek: Callback<f64>,
     pub on_volume: Callback<f64>,
+    /// 音量条滚轮(±5/格,复用 shell `VolumeDelta` 钳制)。
+    pub on_volume_wheel: Callback<i32>,
     pub on_toggle_mute: Callback<()>,
     pub on_toggle_danmaku: Callback<()>,
     pub on_select_quality: Callback<i64>,
@@ -210,6 +212,7 @@ impl PartialEq for FullscreenInput {
             && self.on_toggle == other.on_toggle
             && self.on_seek == other.on_seek
             && self.on_volume == other.on_volume
+            && self.on_volume_wheel == other.on_volume_wheel
             && self.on_toggle_mute == other.on_toggle_mute
             && self.on_toggle_danmaku == other.on_toggle_danmaku
             && self.on_select_quality == other.on_select_quality
@@ -543,16 +546,7 @@ impl Component for FullscreenPlayer {
 
             let mut right_items: Vec<View> = vec![mute_btn];
             if !compact {
-                right_items.push(
-                    Slider::new()
-                        .width(104.0)
-                        .minimum(0.0)
-                        .maximum(100.0)
-                        .value(f64::from(input.volume))
-                        .on_value_changed(input.on_volume.clone())
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .into(),
-                );
+                right_items.push(volume_slider(104.0, input.volume, &input.on_volume, &input.on_volume_wheel).into());
                 right_items.push(
                     TextBlock::new()
                         .text(format!("{}%", input.volume))

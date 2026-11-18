@@ -3043,6 +3043,11 @@ impl AppShell {
                         on_toggle: context.message(Message::TogglePlay),
                         on_seek: context.callback(|value: f64| Message::Seek(value)),
                         on_volume: context.callback(|value: f64| Message::SetVolume(value)),
+                        on_volume_wheel: context.callback(|delta: i32| {
+                            Message::PlayerHotkey(pages::fullscreen::PlayerHotkey::VolumeDelta(
+                                delta,
+                            ))
+                        }),
                         on_toggle_mute: context.message(Message::ToggleMute),
                         on_toggle_danmaku: context.message(Message::ToggleDanmaku),
                         on_select_quality: context.callback(Message::SelectQuality),
@@ -3108,6 +3113,9 @@ impl AppShell {
                 on_toggle: context.message(Message::TogglePlay),
                 on_seek: context.callback(|value: f64| Message::Seek(value)),
                 on_volume: context.callback(|value: f64| Message::SetVolume(value)),
+                on_volume_wheel: context.callback(|delta: i32| {
+                    Message::PlayerHotkey(pages::fullscreen::PlayerHotkey::VolumeDelta(delta))
+                }),
                 on_toggle_mute: context.message(Message::ToggleMute),
                 on_toggle_danmaku: context.message(Message::ToggleDanmaku),
                 on_fullscreen: context.message(Message::EnterFullscreen),
@@ -6012,6 +6020,9 @@ impl Component for AppShell {
                     on_toggle: context.message(Message::TogglePlay),
                     on_seek: context.callback(|value: f64| Message::Seek(value)),
                     on_volume: context.callback(|value: f64| Message::SetVolume(value)),
+                    on_volume_wheel: context.callback(|delta: i32| {
+                        Message::PlayerHotkey(pages::fullscreen::PlayerHotkey::VolumeDelta(delta))
+                    }),
                     on_toggle_mute: context.message(Message::ToggleMute),
                     on_toggle_danmaku: context.message(Message::ToggleDanmaku),
                     on_select_quality: context.callback(Message::SelectQuality),

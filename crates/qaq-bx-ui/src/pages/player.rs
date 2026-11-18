@@ -206,6 +206,8 @@ pub struct PlayerInput {
     pub on_toggle: Callback<()>,
     pub on_seek: Callback<f64>,
     pub on_volume: Callback<f64>,
+    /// 音量条滚轮(±5/格,复用 shell `VolumeDelta` 钳制)。
+    pub on_volume_wheel: Callback<i32>,
     pub on_toggle_mute: Callback<()>,
     pub on_toggle_danmaku: Callback<()>,
     /// 画质切换(F2;携带目标 qn)。
@@ -255,6 +257,7 @@ impl PartialEq for PlayerInput {
             && self.on_toggle == other.on_toggle
             && self.on_seek == other.on_seek
             && self.on_volume == other.on_volume
+            && self.on_volume_wheel == other.on_volume_wheel
             && self.on_toggle_mute == other.on_toggle_mute
             && self.on_toggle_danmaku == other.on_toggle_danmaku
             && self.on_select_quality == other.on_select_quality
@@ -515,14 +518,13 @@ impl Component for PlayerPage {
         } else {
             let mut right_items: Vec<View> = vec![
                 mute_btn,
-                Slider::new()
-                    .width(if compact_desktop { 64.0 } else { 110.0 })
-                    .minimum(0.0)
-                    .maximum(100.0)
-                    .value(input.volume as f64)
-                    .on_value_changed(input.on_volume.clone())
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .into(),
+                volume_slider(
+                    if compact_desktop { 64.0 } else { 110.0 },
+                    input.volume,
+                    &input.on_volume,
+                    &input.on_volume_wheel,
+                )
+                .into(),
             ];
             if !compact_desktop {
                 right_items.push(
@@ -2131,11 +2133,41 @@ pub(crate) fn fullscreen_toggle_button(
 }
 
 pub(crate) fn seek_slider(position: u32, duration_secs: u32, on_seek: Callback<f64>) -> Slider {
+    // 拖拽提示(label)显示真实播放时间,而非 1..N 的裸数值。
     Slider::new()
+        .thumb_tooltip(ThumbTooltip::Duration)
         .minimum(0.0)
         .maximum(f64::from(duration_secs.max(1)))
         .value(f64::from(position))
         .on_value_changed(on_seek)
+}
+
+/// 音量条(悬停滚轮每格 ±5);delta 走 shell 的 `VolumeDelta` 钳制语义,避免闭包快照过期。
+pub(crate) fn volume_slider(
+    width: f64,
+    volume: u32,
+    on_volume: &Callback<f64>,
+    on_volume_wheel: &Callback<i32>,
+) -> Slider {
+    let on_volume_wheel = on_volume_wheel.clone();
+    Slider::new()
+        .width(width)
+        .minimum(0.0)
+        .maximum(100.0)
+        .value(f64::from(volume))
+        .on_value_changed(on_volume.clone())
+        .on_pointer_wheel_changed(move |info: PointerEventInfo| {
+            let step = volume_wheel_step(info.wheel_delta);
+            if step != 0 {
+                on_volume_wheel.call(step);
+            }
+        })
+        .vertical_alignment(VerticalAlignment::Center)
+}
+
+/// 滚轮一格的音量步长:正向 +5、负向 -5、无 delta(非滚轮指针事件)不动。
+fn volume_wheel_step(wheel_delta: i32) -> i32 {
+    wheel_delta.signum() * 5
 }
 
 pub(crate) fn time_label(position: u32, duration_secs: u32, font_size: f64) -> TextBlock {
@@ -2228,16 +2260,7 @@ fn half_pane_transport(input: &HalfPaneInput, pane_width: f64) -> View {
 
     let mut right_items: Vec<View> = vec![mute_btn];
     if show_slider {
-        right_items.push(
-            Slider::new()
-                .width(68.0)
-                .minimum(0.0)
-                .maximum(100.0)
-                .value(f64::from(input.volume))
-                .on_value_changed(input.on_volume.clone())
-                .vertical_alignment(VerticalAlignment::Center)
-                .into(),
-        );
+        right_items.push(volume_slider(68.0, input.volume, &input.on_volume, &input.on_volume_wheel).into());
         right_items.push(
             TextBlock::new()
                 .text(format!("{}%", input.volume))
@@ -2302,6 +2325,8 @@ pub struct HalfPaneInput {
     pub on_toggle: Callback<()>,
     pub on_seek: Callback<f64>,
     pub on_volume: Callback<f64>,
+    /// 音量条滚轮(±5/格,复用 shell `VolumeDelta` 钳制)。
+    pub on_volume_wheel: Callback<i32>,
     pub on_toggle_mute: Callback<()>,
     pub on_toggle_danmaku: Callback<()>,
     pub on_fullscreen: Callback<()>,
@@ -2333,6 +2358,7 @@ impl PartialEq for HalfPaneInput {
             && self.on_toggle == other.on_toggle
             && self.on_seek == other.on_seek
             && self.on_volume == other.on_volume
+            && self.on_volume_wheel == other.on_volume_wheel
             && self.on_toggle_mute == other.on_toggle_mute
             && self.on_toggle_danmaku == other.on_toggle_danmaku
             && self.on_fullscreen == other.on_fullscreen
@@ -2646,7 +2672,7 @@ mod tests {
         RELATED_COVER_HEIGHT, RELATED_META_HEIGHT, RELATED_TEXT_SPACING, RELATED_TITLE_HEIGHT,
         RIGHT_RAIL_WIDTH, clamp_half_pane_width, comments_tab_label,
         compute_half_pane_video_height, desktop_transport_compact, format_desc_body,
-        half_pane_shows_volume_slider,
+        half_pane_shows_volume_slider, volume_wheel_step,
     };
 
     #[test]
@@ -2672,6 +2698,16 @@ mod tests {
         assert_eq!(comments_tab_label(Some(0)), "评论");
         assert_eq!(comments_tab_label(Some(285)), "评论 285");
         assert_eq!(comments_tab_label(Some(12_340)), "评论 1.2万");
+    }
+
+    /// 音量条滚轮步长:一格 ±5,非滚轮事件(0 delta)不动。
+    #[test]
+    fn volume_wheel_step_maps_one_notch_to_five_percent() {
+        assert_eq!(volume_wheel_step(120), 5);
+        assert_eq!(volume_wheel_step(-120), -5);
+        assert_eq!(volume_wheel_step(28), 5);
+        assert_eq!(volume_wheel_step(-28), -5);
+        assert_eq!(volume_wheel_step(0), 0);
     }
 
     #[test]

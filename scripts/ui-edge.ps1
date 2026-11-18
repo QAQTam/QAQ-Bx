@@ -1224,6 +1224,295 @@ if ($global:E17Fail) { throw "E17 FAIL: tier1 验证失败(详见 $stderrLog)" }
 }
 
 Write-Host "[done] 极端场景走查完成，截图位于 $FramesDir" -ForegroundColor Green
+
+# ---------- 场景 E18:音量条悬停滚轮调节(每格 ±5) ----------
+# 判据(UIA,不依赖像素):音量条 = RangeValue.Max==100 的 Slider(进度条 max=视频时长秒);
+# 滚轮上滚一格 → 60→65(% 文本同步),下滚一格 → 65→60。种子三件套照抄 E15/E17。
+function Find-PlayerVolumeSlider {
+    param([System.Windows.Automation.AutomationElement]$Root)
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Slider
+    )
+    $sliders = $Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+    for ($i = 0; $i -lt $sliders.Count; $i++) {
+        try {
+            $range = $sliders[$i].GetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern)
+            if ([Math]::Abs($range.Current.Maximum - 100.0) -lt 0.01 -and [Math]::Abs($range.Current.Minimum) -lt 0.01) {
+                return $sliders[$i]
+            }
+        } catch {}
+    }
+    return $null
+}
+
+function Find-VolumePercentText {
+    # 音量条旁的 "N%" 文本:限定在音量条右侧 90px 内,避免误吃右栏其它数字。
+    param([System.Windows.Automation.AutomationElement]$Root, [System.Windows.Automation.AutomationElement]$Slider)
+    $condText = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Text
+    )
+    $texts = $Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condText)
+    $srect = $Slider.Current.BoundingRectangle
+    for ($i = 0; $i -lt $texts.Count; $i++) {
+        $name = $texts[$i].Current.Name
+        if ($name -match '^\d{1,3}%$') {
+            $trect = $texts[$i].Current.BoundingRectangle
+            if ($trect.Left -ge $srect.Left - 8 -and $trect.Left -le $srect.Right + 90 -and
+                [Math]::Abs(($trect.Top + $trect.Bottom) / 2 - ($srect.Top + $srect.Bottom) / 2) -lt 40) {
+                return $texts[$i]
+            }
+        }
+    }
+    return $null
+}
+
+function Wait-VolumeValue {
+    param([System.Windows.Automation.RangeValuePattern]$Range, [double]$Expect, [int]$TimeoutMs)
+    for ($i = 0; $i -lt ($TimeoutMs / 200); $i++) {
+        Start-Sleep -Milliseconds 200
+        try {
+            if ([Math]::Abs([double]$Range.Current.Value - $Expect) -lt 1.5) { return $true }
+        } catch {}
+    }
+    return $false
+}
+
+if (Should-RunScenario "E18") {
+Write-Host "[E18] 音量条悬停滚轮调节(60 → 65 → 60)" -ForegroundColor Cyan
+$global:E18Fail = $false
+$stderrLog = Join-Path $OutRoot "e18-stderr.log"
+$settingsPath = Join-Path $dataDir "settings.json"
+$settingsBak = "$settingsPath.e18-bak"
+$script:settingsSeeded = $false
+$proc = $null
+try {
+    if (Test-Path $settingsPath) { Copy-Item -Path $settingsPath -Destination $settingsBak -Force }
+    # 种子三件套(无 BOM / webp_hint_shown / 显式 window) + 音量 60 起点 + mpv 引擎。
+    [System.IO.File]::WriteAllText(
+        $settingsPath,
+        '{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"FullPlayer","danmaku_enabled":true,"autoplay":true,"hardware_decode":true,"volume":60,"webp_hint_shown":true,"player_engine":"Mpv","window":{"x":60,"y":60,"width":1296,"height":808,"maximized":false}}'
+    )
+    $script:settingsSeeded = $true
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.WorkingDirectory = (Split-Path $exe)
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables["QAQ_BX_VIDEO"] = "BV1GJ411x7h7"
+    $psi.EnvironmentVariables["QAQ_BX_NATIVE"] = "0"
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stderrSink = $proc.StandardError
+    $stderrTask = $stderrSink.ReadToEndAsync()
+    $hwnd = Wait-MainWindow $proc
+    [void][UiEdgeNative]::SetWindowPos($hwnd, [IntPtr](-1), 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0010)
+    Start-Sleep -Milliseconds 4500 # 起播出画,播控条就位
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+
+    $vol = Find-PlayerVolumeSlider -Root $root
+    if (-not $vol) { throw "E18 FAIL: 播放页未定位到音量条(Max==100 的 Slider)" }
+    $range = $vol.GetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern)
+    $initial = [double]$range.Current.Value
+    if ([Math]::Abs($initial - 60) -gt 2) { throw "E18 FAIL: 种子音量未生效(期望≈60,实际 $initial)" }
+    $volText = Find-VolumePercentText -Root $root -Slider $vol
+    if (-not $volText) { throw "E18 FAIL: 音量条旁未定位到 N% 文本" }
+    Write-Host "[E18] 起点 volume=$($range.Current.Value) text='$($volText.Current.Name)'" -ForegroundColor DarkCyan
+
+    # 1) 悬停滚轮上滚一格:60 → 65(% 文本必须同步)
+    $r = $vol.Current.BoundingRectangle
+    [void][UiEdgeNative]::SetForegroundWindow($hwnd)
+    [void][UiEdgeNative]::SetCursorPos([int](($r.Left + $r.Right) / 2), [int](($r.Top + $r.Bottom) / 2))
+    Start-Sleep -Milliseconds 260
+    [UiEdgeNative]::mouse_event([UiEdgeNative]::MOUSEEVENTF_WHEEL, 0, 0, 120, [UIntPtr]::Zero)
+    if (-not (Wait-VolumeValue -Range $range -Expect 65 -TimeoutMs 5000)) {
+        throw "E18 FAIL: 滚轮上滚后音量未变 65(实际 $($range.Current.Value))"
+    }
+    $upTextOk = $false
+    for ($i = 0; $i -lt 10 -and -not $upTextOk; $i++) {
+        Start-Sleep -Milliseconds 200
+        $volText = Find-VolumePercentText -Root $root -Slider $vol
+        if ($volText -and $volText.Current.Name -eq "65%") { $upTextOk = $true }
+    }
+    if (-not $upTextOk) { throw "E18 FAIL: 上滚后 % 文本未同步为 65%" }
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e18-1-wheel-up-65.png"
+
+    # 2) 下滚一格:65 → 60
+    [UiEdgeNative]::mouse_event([UiEdgeNative]::MOUSEEVENTF_WHEEL, 0, 0, -120, [UIntPtr]::Zero)
+    if (-not (Wait-VolumeValue -Range $range -Expect 60 -TimeoutMs 5000)) {
+        throw "E18 FAIL: 滚轮下滚后音量未回 60(实际 $($range.Current.Value))"
+    }
+    $downTextOk = $false
+    for ($i = 0; $i -lt 10 -and -not $downTextOk; $i++) {
+        Start-Sleep -Milliseconds 200
+        $volText = Find-VolumePercentText -Root $root -Slider $vol
+        if ($volText -and $volText.Current.Name -eq "60%") { $downTextOk = $true }
+    }
+    if (-not $downTextOk) { throw "E18 FAIL: 下滚后 % 文本未同步回 60%" }
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e18-2-wheel-down-60.png"
+
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "E18: 进程提前退出 ($($proc.ExitCode))" }
+    Write-Host "[E18] PASS: 音量条悬停滚轮 60→65→60,% 文本同步" -ForegroundColor Green
+} finally {
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    if ($script:settingsSeeded) {
+        if (Test-Path $settingsBak) { Copy-Item -Path $settingsBak -Destination $settingsPath -Force }
+        else { Remove-Item -Path $settingsPath -Force -ErrorAction SilentlyContinue }
+        Remove-Item -Path $settingsBak -Force -ErrorAction SilentlyContinue
+    }
+    try {
+        if ($stderrSink) { $stderrSink.Close() }
+        if ($stderrTask.Wait(3000)) { $stderrTask.Result | Set-Content -Path $stderrLog -Encoding UTF8; Write-Host "[E18] stderr -> $stderrLog" -ForegroundColor DarkCyan }
+    } catch {}
+    Remove-Item Env:QAQ_BX_VIDEO -ErrorAction SilentlyContinue
+}
+if ($global:E18Fail) { throw "E18 FAIL: 音量条滚轮验证失败(详见 $stderrLog)" }
+}
+
+# ---------- 场景 E19:进度条拖拽提示(label)显示真实播放时间 ----------
+# 判据(UIA):按住进度条拖动期间,滑块上方出现形如 mm:ss(或 h:mm:ss)的独立时间文本,
+# 且其数值与拖动位置的 RangeValue 对应 —— 替换掉原生 1..N 裸数值 tooltip。
+function Find-SeekSlider {
+    param([System.Windows.Automation.AutomationElement]$Root)
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Slider
+    )
+    $sliders = $Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+    for ($i = 0; $i -lt $sliders.Count; $i++) {
+        try {
+            $range = $sliders[$i].GetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern)
+            # 进度条 max=视频时长秒(BV1GJ411x7h7 ≈ 213s),音量条 max=100。
+            if ($range.Current.Maximum -gt 105.0) { return $sliders[$i] }
+        } catch {}
+    }
+    return $null
+}
+
+function Find-DragTimeTooltip {
+    # 拖动中滑块上方的时间文本:限定在进度条横向范围内、其正上方 90px 内。
+    param([System.Windows.Automation.AutomationElement]$Root, [System.Windows.Automation.AutomationElement]$Slider)
+    $condText = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Text
+    )
+    $texts = $Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condText)
+    $srect = $Slider.Current.BoundingRectangle
+    for ($i = 0; $i -lt $texts.Count; $i++) {
+        $name = $texts[$i].Current.Name
+        if ($name -match '^\d{1,2}:[0-5]\d$' -or $name -match '^\d+:[0-5]\d:[0-5]\d$') {
+            $trect = $texts[$i].Current.BoundingRectangle
+            $cx = ($trect.Left + $trect.Right) / 2
+            if ($cx -ge $srect.Left - 20 -and $cx -le $srect.Right + 20 -and
+                $trect.Bottom -le $srect.Top + 12 -and $trect.Bottom -ge $srect.Top - 90) {
+                return $texts[$i]
+            }
+        }
+    }
+    return $null
+}
+
+function Convert-SeekTooltipExpect {
+    # 与 fork converters.rs 的 Duration 格式一致:秒(round-half-up)→ mm:ss / h:mm:ss。
+    param([double]$Seconds)
+    $secs = [int][Math]::Floor([Math]::Max(0.0, $Seconds) + 0.5)
+    $h = [int][Math]::Floor($secs / 3600)
+    $m = [int][Math]::Floor(($secs % 3600) / 60)
+    $s = $secs % 60
+    if ($h -gt 0) { return "{0}:{1:d2}:{2:d2}" -f $h, $m, $s }
+    return "{0:d2}:{1:d2}" -f $m, $s
+}
+
+if (Should-RunScenario "E19") {
+Write-Host "[E19] 进度条拖拽提示显示真实播放时间(替换 1..N 数值)" -ForegroundColor Cyan
+$global:E19Fail = $false
+$settingsPath = Join-Path $dataDir "settings.json"
+$settingsBak = "$settingsPath.e19-bak"
+$script:settingsSeeded = $false
+$proc = $null
+try {
+    if (Test-Path $settingsPath) { Copy-Item -Path $settingsPath -Destination $settingsBak -Force }
+    [System.IO.File]::WriteAllText(
+        $settingsPath,
+        '{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"FullPlayer","danmaku_enabled":true,"autoplay":true,"hardware_decode":true,"volume":60,"webp_hint_shown":true,"player_engine":"Mpv","window":{"x":60,"y":60,"width":1296,"height":808,"maximized":false}}'
+    )
+    $script:settingsSeeded = $true
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.WorkingDirectory = (Split-Path $exe)
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables["QAQ_BX_VIDEO"] = "BV1GJ411x7h7"
+    $psi.EnvironmentVariables["QAQ_BX_NATIVE"] = "0"
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stderrSink = $proc.StandardError
+    $null = $stderrSink.ReadToEndAsync()
+    $hwnd = Wait-MainWindow $proc
+    [void][UiEdgeNative]::SetWindowPos($hwnd, [IntPtr](-1), 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0010)
+    Start-Sleep -Milliseconds 4500
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+
+    $seek = Find-SeekSlider -Root $root
+    if (-not $seek) { throw "E19 FAIL: 未定位到进度条(max>105 的 Slider)" }
+    $range = $seek.GetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern)
+    $duration = [double]$range.Current.Maximum
+    $srect = $seek.Current.BoundingRectangle
+
+    # 真实拖拽:按住轨道 25% 处 → 分步移到 45% → 持住期间轮询 tooltip。
+    [void][UiEdgeNative]::SetForegroundWindow($hwnd)
+    $startX = [int]($srect.Left + ($srect.Right - $srect.Left) * 0.25)
+    $endX = [int]($srect.Left + ($srect.Right - $srect.Left) * 0.45)
+    $dragY = [int](($srect.Top + $srect.Bottom) / 2)
+    [void][UiEdgeNative]::SetCursorPos($startX, $dragY)
+    Start-Sleep -Milliseconds 260
+    [UiEdgeNative]::mouse_event([UiEdgeNative]::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 120
+    try {
+        $tooltip = $null
+        for ($i = 1; $i -le 14 -and -not $tooltip; $i++) {
+            $x = [int]($startX + ($endX - $startX) * ($i / 14.0))
+            [void][UiEdgeNative]::SetCursorPos($x, $dragY)
+            Start-Sleep -Milliseconds 90
+            $tooltip = Find-DragTimeTooltip -Root $root -Slider $seek
+        }
+        if (-not $tooltip) {
+            throw "E19 FAIL: 拖动进度条期间未在滑块上方发现 mm:ss 形态的时间提示(仍是原生数值 tooltip 或未渲染)"
+        }
+        $tipName = $tooltip.Current.Name
+        Start-Sleep -Milliseconds 250
+        $tooltip2 = Find-DragTimeTooltip -Root $root -Slider $seek
+        $tipName2 = if ($tooltip2) { $tooltip2.Current.Name } else { $tipName }
+        $expect = Convert-SeekTooltipExpect -Seconds ([double]$range.Current.Value)
+        Write-Host "[E19] tooltip='$tipName'/'$tipName2' range=$([Math]::Round([double]$range.Current.Value,1))s expect≈$expect" -ForegroundColor DarkCyan
+        if ($tipName2 -ne $expect) {
+            throw "E19 FAIL: 静止后 tooltip '$tipName2' 与拖动位置 $([Math]::Round([double]$range.Current.Value,1))s 的期望值 '$expect' 不一致"
+        }
+        Capture-WindowFrame -Hwnd $hwnd -Mode screen -FileName "e19-1-seek-tooltip-time.png"
+    } finally {
+        [UiEdgeNative]::mouse_event([UiEdgeNative]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 400
+    }
+
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "E19: 进程提前退出 ($($proc.ExitCode))" }
+    Write-Host "[E19] PASS: 进度条拖拽提示为真实播放时间(mm:ss)" -ForegroundColor Green
+} finally {
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    if ($script:settingsSeeded) {
+        if (Test-Path $settingsBak) { Copy-Item -Path $settingsBak -Destination $settingsPath -Force }
+        else { Remove-Item -Path $settingsPath -Force -ErrorAction SilentlyContinue }
+        Remove-Item -Path $settingsBak -Force -ErrorAction SilentlyContinue
+    }
+    try {
+        if ($stderrSink) { $stderrSink.Close() }
+    } catch {}
+    Remove-Item Env:QAQ_BX_VIDEO -ErrorAction SilentlyContinue
+}
+if ($global:E19Fail) { throw "E19 FAIL: 进度条拖拽提示验证失败" }
+}
 # ---------- 场景 E16:退出全屏→拖拽标题栏风暴(0x359595 幽灵回调修复回归,§8.4) ----------
 if (Should-RunScenario "E16") {
 Write-Host "[E16] 退出全屏后立刻拖拽标题条 20 次(WindowRectChanged 幽灵路径防护)" -ForegroundColor Cyan
