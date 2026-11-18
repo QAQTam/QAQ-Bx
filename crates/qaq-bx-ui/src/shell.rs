@@ -79,6 +79,76 @@ const MAX_HOME_SLOTS: usize = 1_200;
 const PLAYBACK_TICK: Duration = Duration::from_millis(250);
 /// P1 网格重建去抖:拖拽期间 VirtualSource 重建延迟到窗口静止后 150ms 一次。
 const GRID_REBUILD_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// E14:拖框风暴跟踪——连续 `WindowResized`(间隔 ≤250ms)视为一次风暴;收口时输出
+/// `RESIZE-STORM n=… span_ms=… max_gap_ms=…` 到 stderr,供 E14 场景量化 UI 线程
+/// 节拍(F1 合并生效度:n 即风暴期实际消费的消息数,对比脚本侧产出的步数)。
+/// 纯计数器,不改变任何处理路径。
+#[derive(Debug, Default)]
+struct ResizeStormTrack {
+    open: Option<ResizeStorm>,
+}
+
+#[derive(Debug)]
+struct ResizeStorm {
+    start: Instant,
+    last: Instant,
+    count: u32,
+    max_gap_ms: f64,
+}
+
+impl ResizeStormTrack {
+    /// 事件间隔超过该值视为风暴结束。
+    const STORM_GAP_MS: f64 = 250.0;
+    /// 孤立 resize 不输出(阈值防噪声)。
+    const MIN_BURST: u32 = 3;
+
+    /// 记录一次 resize;若上一场风暴已因间隔超限自然结束,先返回其摘要。
+    fn on_resized(&mut self, now: Instant) -> Option<String> {
+        let closed = self.close_stale(now);
+        match &mut self.open {
+            Some(storm) => {
+                let gap = now.duration_since(storm.last).as_secs_f64() * 1000.0;
+                storm.max_gap_ms = storm.max_gap_ms.max(gap);
+                storm.last = now;
+                storm.count += 1;
+            }
+            None => {
+                self.open = Some(ResizeStorm {
+                    start: now,
+                    last: now,
+                    count: 1,
+                    max_gap_ms: 0.0,
+                });
+            }
+        }
+        closed
+    }
+
+    /// 显式收口(去抖 settled / 新风暴开槽);不足 `MIN_BURST` 不输出。
+    fn close(&mut self, reason: &str) -> Option<String> {
+        let storm = self.open.take()?;
+        if storm.count < Self::MIN_BURST {
+            return None;
+        }
+        let span = storm.last.duration_since(storm.start).as_secs_f64() * 1000.0;
+        Some(format!(
+            "RESIZE-STORM n={} span_ms={:.0} max_gap_ms={:.0} ({reason})",
+            storm.count, span, storm.max_gap_ms
+        ))
+    }
+
+    /// 间隔超限的上一场风暴收口。
+    fn close_stale(&mut self, now: Instant) -> Option<String> {
+        let last = self.open.as_ref()?.last;
+        let gap = now.duration_since(last).as_secs_f64() * 1000.0;
+        if gap > Self::STORM_GAP_MS {
+            self.close("gap")
+        } else {
+            None
+        }
+    }
+}
 /// 设置滑块（音量/透明度）去抖落盘窗口。
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -575,6 +645,8 @@ pub struct AppShell {
     comments_rev: u64,
     playback_avatar_dirty: bool,
     playback_avatar_timer: Option<ComponentTimer>,
+    /// E14:拖框风暴计数器(见 `ResizeStormTrack`;只观测,不改路径)。
+    resize_storm: ResizeStormTrack,
     playing: bool,
     position: u32,
     mount_tick: u32,
@@ -1650,6 +1722,20 @@ impl AppShell {
         self.comments_snapshot = self
             .comments_session
             .to_snapshot(self.comments_rev, &self.avatar_cache);
+    }
+
+    /// E14:记录一次 resize;风暴因间隔超限自然收口时输出摘要到 stderr。
+    fn track_resize_storm(&mut self) {
+        if let Some(summary) = self.resize_storm.on_resized(Instant::now()) {
+            eprintln!("{summary}");
+        }
+    }
+
+    /// E14:显式收口当前风暴(去抖 settled)。
+    fn close_resize_storm(&mut self, reason: &str) {
+        if let Some(summary) = self.resize_storm.close(reason) {
+            eprintln!("{summary}");
+        }
     }
 
     fn schedule_playback_avatar_flush(&mut self, context: &ComponentContext<Self>) {
@@ -3710,6 +3796,7 @@ impl Component for AppShell {
             comments_rev: 0,
             playback_avatar_dirty: false,
             playback_avatar_timer: None,
+            resize_storm: ResizeStormTrack::default(),
             playing: false,
             position: 0,
             mount_tick: 0,
@@ -4794,6 +4881,7 @@ impl Component for AppShell {
                 }
             }
             Message::WindowResized(size) => {
+                self.track_resize_storm();
                 let prev_cards = self.viewport_layout.cards;
                 let next_layout = ViewportLayout::from_window_size(size.width, size.height);
                 self.viewport_layout = next_layout;
@@ -4837,6 +4925,7 @@ impl Component for AppShell {
                 }
             }
             Message::WindowResizeSettled => {
+                self.close_resize_storm("settled");
                 self.grid_rebuild_timer = None;
                 if self.pending_grid_rebuild {
                     self.pending_grid_rebuild = false;
@@ -6099,6 +6188,39 @@ mod tests {
         assert_eq!(AppShell::coalesce_key(&Message::PositionTick), None);
         assert_eq!(AppShell::coalesce_key(&Message::Back), None);
         assert_eq!(AppShell::coalesce_key(&Message::WindowResizeSettled), None);
+    }
+
+    #[test]
+    fn resize_storm_tracker_bursts_close_and_summarize() {
+        let t0 = Instant::now();
+        // 孤立/双发不足 MIN_BURST:收口不输出。
+        let mut storm = ResizeStormTrack::default();
+        assert!(storm.on_resized(t0).is_none());
+        assert!(storm.on_resized(t0 + Duration::from_millis(55)).is_none());
+        assert!(storm.close("settled").is_none(), "孤立 resize 不算风暴");
+        // 5 连发 55ms 间隔:n=5 / span=220ms / max_gap=55ms。
+        let mut storm = ResizeStormTrack::default();
+        for i in 0..5 {
+            let now = t0 + Duration::from_millis(55 * i);
+            assert!(storm.on_resized(now).is_none(), "第 {i} 拍不应触发收口");
+        }
+        let summary = storm.close("settled").expect("5 连发应输出风暴摘要");
+        assert!(summary.contains("RESIZE-STORM n=5"), "{summary}");
+        assert!(summary.contains("span_ms=220"), "{summary}");
+        assert!(summary.contains("max_gap_ms=55"), "{summary}");
+        // 间隔 >250ms:上一场自动收口并开新风暴。
+        let mut storm = ResizeStormTrack::default();
+        for i in 0..3 {
+            let _ = storm.on_resized(t0 + Duration::from_millis(55 * i));
+        }
+        let closed = storm
+            .on_resized(t0 + Duration::from_millis(110 + 400))
+            .expect("间隔 400ms 应先收口上一场");
+        assert!(closed.contains("RESIZE-STORM n=3"), "{closed}");
+        assert!(
+            storm.close("settled").is_none(),
+            "新风暴仅 1 拍,不足输出门槛"
+        );
     }
 
     #[test]

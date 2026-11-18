@@ -187,6 +187,11 @@
 >   `preferred_height` 互不冲顶 + 默认值不受影响。
 > - ✅ **F3 评论/关联虚拟化**(2026-11-19):评论区/相关推荐整表 KeyedView 循环
 >   换成缓存的 `VirtualSource`+`ItemsRepeater`(配方同首页,见 §6 实测记录)。
+> - ✅ **E14 拖框风暴量化场景**(2026-11-19):app 侧 `RESIZE-STORM` 计数器
+>   (shell.rs `ResizeStormTrack`,WindowResized 入口归并连续 resize,settled/gap
+>   收口输出 n/span_ms/max_gap_ms)+ `ui-edge.ps1` 新场景 E14(30×55ms 快速伸缩
+>   + 24×30ms 慢速拖框 + 分相位进程 CPU 采样)。首轮数据见 §6。
+>   **F2 结论导向**:瓶颈在单 pass 成本而非采样密度,16ms 采样继续搁置。
 > - ⏳ **F4 MPE/弹幕层常驻单实例**:待做。协调前提已变化——v0.3 线已收口出包
 >   (933667e,worktree 干净),但其新增 `docs/dev-notes/persistent-mpe.md`
 >   显示 MPE 方向仍有并行动作;动工前先读该文档对齐,避免撞车。
@@ -232,7 +237,22 @@
   - **E11(mpv 播放,同风暴)**:三轮采样亮度 119.5/121.3/107.2,全程无黑屏,
     合并改动未伤挂载协议。
   - 拖框主观体感:待用户真机复核(本 harness 无法量帧)。
-- (待填)F1+F2 前后 render_view 次数(E14 计数器方案 §5)
+- **2026-11-19 E14 首轮量化**(`feat/v0.4.0` `5c33e0f` 之后,debug@opt-level 1/2,
+  mpv 引擎,BV1GJ411x7h7,8 逻辑核):
+  - 相位 A(30×55ms 快速伸缩 55%↔100%):`RESIZE-STORM n=29 span_ms=6013
+    max_gap_ms=233` → 单次伸缩 UI 线程往返 ≈**200ms**(SetWindowPos 同步阻塞
+    + 55ms 步进反推);相位 B(24×30ms ±40px 慢速拖框):`n=24 span_ms=1067
+    max_gap_ms=50` → ≈**44ms/次**。伸缩幅度与单 pass 成本强相关(大摆幅整树
+    重排,小步幅便宜)。
+  - `n≈produced`(29/30、24/24):跨进程 SetWindowPos 为同步投递,排队窗口小,
+    F1 合并器在该路径几乎无合并机会——**这不构成 F1 无效的证据**:真实鼠标拖框
+    走模态循环 + UI 线程忙碌时才产生排队合并窗口,E15/真机复测需另行构造。
+  - 亮度回归:风暴后 0s/2s 视频区 124.3/113.8,无黑屏;进程 CPU 峰值
+    A=24.3% / B=13.3%(全核折算)。stderr 无引擎错误锚点。
+  - **F2 判定**:单 pass 成本(≈200ms@debug 大摆幅)而非消息采样密度是瓶颈;
+    16ms 采样继续搁置,待 release 档对比与真机拖框数据再议。
+  - 未验证(诚实清单):release 档未对比;真实鼠标拖框(模态循环)未单独构造;
+    200ms 的分解(view 重跑/引擎 ResizeBuffers/框架布局)未做 ETW 归因。
 - (待填)TitleBar 自绘备胎对比(仅当开关方案体感不足时)
 - **共享 reactor 注记(2026-11-18 深夜)**:本批次落在 master `335c541`;
   v0.3 会话随后在其上叠了 `fix/titlebar-ghost-rectchanged`(幽灵回调防护 +

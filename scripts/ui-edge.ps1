@@ -691,6 +691,118 @@ try {
 if ($global:E13Fail) { throw "E13 FAIL: native SMTC/弹幕绘制链验证失败(详见 $stderrLog)" }
 }
 
+# ---------- 场景 E14：拖框风暴 UI 线程量化（RESIZE-STORM 计数器 + CPU 峰值 + 亮度回归） ----------
+# 量化拖框期 UI 线程节拍：快速伸缩(30×55ms,复用 E11 节奏)+ 慢速 ±40px 往返(模拟人手拖框)。
+# app 侧在 WindowResized 入口按连续间隔归并风暴并输出 `RESIZE-STORM n=… span_ms=… max_gap_ms=…`；
+# n = 风暴期实际消费的消息数,F1 合并生效度 = 产出步数(30/24) − n。§5 验收 2/5 的数据源。
+if (Should-RunScenario "E14") {
+Write-Host "[E14] 拖框风暴量化（QAQ_BX_VIDEO 直开播放页：快速伸缩 + 慢速拖框,CPU/计数器采样）" -ForegroundColor Cyan
+$global:E14Fail = $false
+$stderrLog = Join-Path $OutRoot "e14-stderr.log"
+$proc = $null
+$sink = $null; $task = $null
+try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.WorkingDirectory = (Split-Path $exe)
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables["QAQ_BX_VIDEO"] = "BV1GJ411x7h7"
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $sink = $proc.StandardError
+    $task = $sink.ReadToEndAsync()
+    $hwnd = Wait-MainWindow $proc
+    Start-Sleep -Milliseconds 4500 # 起播出画
+    [void][UiEdgeNative]::SetWindowPos($hwnd, [IntPtr](-1), 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0010)
+    Start-Sleep -Milliseconds 400
+    $rect = New-Object UiEdgeNative+RECT
+    [void][UiEdgeNative]::GetWindowRect($hwnd, [ref]$rect)
+    $baseW = $rect.Right - $rect.Left; $baseH = $rect.Bottom - $rect.Top
+    $baseX = $rect.Left; $baseY = $rect.Top
+    $cores = [Math]::Max(1, [int]$env:NUMBER_OF_PROCESSORS)
+
+    # 相位 A：快速伸缩 30×55ms(55%↔100%)。
+    Write-Host "[E14] phase A: rapid resize 30x55ms" -ForegroundColor Cyan
+    $cpu0 = $proc.TotalProcessorTime.TotalMilliseconds
+    $wall0 = [DateTime]::UtcNow
+    for ($i = 1; $i -le 30; $i++) {
+        if ($i % 2 -eq 1) { $w = [int]($baseW * 0.55); $h = [int]($baseH * 0.55) }
+        else { $w = $baseW; $h = $baseH }
+        [void][UiEdgeNative]::SetWindowPos($hwnd, [IntPtr]::Zero, $baseX, $baseY, $w, $h, [UiEdgeNative]::SWP_NOZORDER)
+        Start-Sleep -Milliseconds 55
+    }
+    Start-Sleep -Milliseconds 500 # settled(150ms) 收口相位 A 风暴
+    $cpu1 = $proc.TotalProcessorTime.TotalMilliseconds
+    $wall1 = [DateTime]::UtcNow
+
+    # 相位 B：慢速 ±40px 往返 24×30ms(模拟人手拖框)。
+    Write-Host "[E14] phase B: slow drag 24x30ms ±40px" -ForegroundColor Cyan
+    for ($i = 1; $i -le 24; $i++) {
+        $offset = if ($i % 2 -eq 1) { 40 } else { 0 }
+        [void][UiEdgeNative]::SetWindowPos($hwnd, [IntPtr]::Zero, $baseX, $baseY, $baseW + $offset, $baseH, [UiEdgeNative]::SWP_NOZORDER)
+        Start-Sleep -Milliseconds 30
+    }
+    $cpu2 = $proc.TotalProcessorTime.TotalMilliseconds
+    $wall2 = [DateTime]::UtcNow
+    Start-Sleep -Milliseconds 900 # settled + 画面回稳
+
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e14-0-after-storm.png"
+    Start-Sleep -Milliseconds 2000
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e14-1-after-storm-2s.png"
+
+    # 进程 CPU 峰值(全核折算):分相位记录,数据回填研究文档 §6。
+    $cpuPctA = [Math]::Round((($cpu1 - $cpu0) / ((($wall1 - $wall0).TotalMilliseconds) * $cores)) * 100, 1)
+    $cpuPctB = [Math]::Round((($cpu2 - $cpu1) / ((($wall2 - $wall1).TotalMilliseconds) * $cores)) * 100, 1)
+    Write-Host "[E14] process CPU: phase A=$cpuPctA% phase B=$cpuPctB% (logical cores=$cores)" -ForegroundColor Cyan
+
+    function Test-RegionBlackE14 {
+        param([string]$File, [double]$X0, [double]$Y0, [double]$X1, [double]$Y1)
+        $bmp = New-Object System.Drawing.Bitmap($File)
+        $x0 = [int]($bmp.Width * $X0); $y0 = [int]($bmp.Height * $Y0)
+        $x1 = [int]($bmp.Width * $X1); $y1 = [int]($bmp.Height * $Y1)
+        $sum = 0.0; $n = 0
+        for ($y = $y0; $y -lt $y1; $y += 4) {
+            for ($x = $x0; $x -lt $x1; $x += 4) {
+                $p = $bmp.GetPixel($x, $y)
+                $sum += ($p.R + $p.G + $p.B) / 3.0; $n++
+            }
+        }
+        $bmp.Dispose()
+        return [Math]::Round($sum / [Math]::Max(1, $n), 1)
+    }
+    foreach ($f in @("e14-0-after-storm.png","e14-1-after-storm-2s.png")) {
+        $lum = Test-RegionBlackE14 -File (Join-Path $FramesDir $f) -X0 0.10 -Y0 0.10 -X1 0.50 -Y1 0.45
+        Write-Host "[E14] $f video-region mean luminance = $lum" -ForegroundColor $(if ($lum -lt 12) { "Red" } else { "Green" })
+        if ($lum -lt 12) { $global:E14Fail = $true }
+    }
+
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "E14: 进程提前退出 ($($proc.ExitCode))" }
+} finally {
+    Remove-Item Env:QAQ_BX_VIDEO -ErrorAction SilentlyContinue
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    try {
+        if ($sink) { $sink.Close() }
+        if ($task.Wait(3000)) {
+            $text = $task.Result
+            $text | Set-Content -Path $stderrLog -Encoding UTF8
+            Write-Host "[E14] stderr → $stderrLog" -ForegroundColor DarkCyan
+            $storms = [regex]::Matches($text, "RESIZE-STORM n=(\d+) span_ms=(\d+) max_gap_ms=(\d+)")
+            if ($storms.Count -eq 0) {
+                Write-Host "[E14] FAIL: 未见 RESIZE-STORM 计数锚点(计数器未生效或风暴未触发)" -ForegroundColor Red
+                $global:E14Fail = $true
+            } else {
+                $produced = 30 + 24
+                $consumed = 0
+                foreach ($m in $storms) { Write-Host "[E14] storm: n=$($m.Groups[1].Value) span_ms=$($m.Groups[2].Value) max_gap_ms=$($m.Groups[3].Value)" -ForegroundColor Cyan; $consumed += [int]$m.Groups[1].Value }
+                Write-Host "[E14] consumed=$consumed / produced≈$produced (F1 合并生效度)" -ForegroundColor Cyan
+            }
+        }
+    } catch {}
+}
+if ($global:E14Fail) { throw "E14 FAIL: 拖框风暴量化未达判据(详见 $stderrLog)" }
+}
+
 function Get-WindowGeometry {
     param([IntPtr]$Hwnd)
     $wr = New-Object UiEdgeNative+RECT
