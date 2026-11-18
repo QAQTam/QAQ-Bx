@@ -231,6 +231,11 @@
   - 拖框主观体感:待用户真机复核(本 harness 无法量帧)。
 - (待填)F1+F2 前后 render_view 次数(E14 计数器方案 §5)
 - (待填)TitleBar 自绘备胎对比(仅当开关方案体感不足时)
+- **共享 reactor 注记(2026-11-18 深夜)**:本批次落在 master `335c541`;
+  v0.3 会话随后在其上叠了 `fix/titlebar-ghost-rectchanged`(幽灵回调防护 +
+  `RecomputeDragRegions` 句柄 + `element_ref` 贯通,正交且互补)。本 worktree
+  全部验证(E11/E12/单测)在 `335c541` 上完成;对分支 tip 复验 `cargo check` 通过。
+  应用侧「档位翻转后手动重算」现已具备句柄通道,等该分支并入 master 后接线。
 
 ## 7. 本次未验证项(诚实清单)
 
