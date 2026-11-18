@@ -6,9 +6,10 @@
 
 ## M. 系统媒体引擎正式化(MediaPlayerElement + Windows.Media DASH 管线)✅
 
-分支 `feat/v0.3-native-player`;环境变量 `QAQ_BX_NATIVE=1` 门控,**默认仍走 mpv**
-(直播 FLV 必须 mpv,Media Foundation 不支持)。依赖 fork `qaq-winui-reactor`
-(`MediaPlayerElement` 绑定 + `ImperativeRequest::SetMediaSourceGetPlayer`)。
+分支 `feat/v0.3-native-player`;引擎选择自 M7 起是**设置项**「播放引擎」(默认 mpv),
+`QAQ_BX_NATIVE` 降级为强制覆盖(自动化/调试用);直播 FLV 必须 mpv(Media Foundation
+不支持)。依赖 fork `qaq-winui-reactor`(`MediaPlayerElement` 绑定 +
+`ImperativeRequest::SetMediaSourceGetPlayer`)。
 
 | 项 | 内容 | 落点 / 证据 |
 |---|---|---|
@@ -18,6 +19,7 @@
 | M4 弹幕独立透明层 | native 模式 mpv 引擎 idle ⇒ 弹幕改由**自建预乘 alpha composition swapchain** 层承接(`docs/video-channel.md` §2 原设计):独立 D3D device + 层线程,复用 `engine.rs` 同一套 D2D 轨道排版/描边/屏蔽过滤/时基外推原语;resize 只 ResizeBuffers(不需重挂) | `qaq-bx-video/src/stage.rs`、`qaq-bx-ui/src/widgets/danmaku_surface.rs`、`pages/player.rs`/`pages/fullscreen.rs` 同 cell 层叠;锚点 `STAGE-A`(层就位)/`STAGE-B`(首帧绘制),E13 断言 |
 | M5 SMTC 切原生 | 展示状态与时间轴交回 `MediaPlayer.SystemMediaTransportControls`(系统管线自写,我们不再手写 `SetPlaybackStatus`,只补 B 站标题/UP 主/封面);输入通道(媒体键、控制栏按钮)仍走窗口级 interop 桥;控制指令统一到 `apply_playback_want`(UI/快捷键/SMTC 一条语义路径) | `qaq-bx-ui/src/smtc.rs` `NativeSmtc`;`shell.rs` `ensure_window_smtc`/`apply_playback_want`;E13 真机:系统媒体键 → `smtc native: status=Playing→NotPlaying` |
 | M6 登录态 1080P / 换画质真机验证 | 登录态下选到 `qn=80 codec=avc1.640032 w=1920 h=1080` 并真实开画;UIA 驱动画质 ComboBox 换到 `qn=32` ⇒ `build_source ok(seq=2,autoplay=true,start=19.7)`(定点续播)+ 二次 `native media opened` + 零 `media failed`。令牌副本测后已删除(原件未动) | `scripts/ui-edge.ps1` E12/E13 场景;截图 `frames-edge/e14-0-1080p-playing.png`(1080P 画面 + 透明层弹幕同屏) |
+| M7 「播放引擎」设置项(产品化 env 开关) | 设置页新增「播放引擎」二选一(默认 **mpv 兼容优先** / 原生 Windows Media),持久化到 `settings.json`;老配置缺字段走 serde default 回落 mpv。`QAQ_BX_NATIVE` 降级为**强制覆盖**:`1`=钉死原生、`0`=钉死 mpv(E11/E12/E13 自动化靠它不受 settings.json 漂移影响)。变更**只记账、不打断在播通路**(本应用「离开播放页即关播」,见已知限制),下一次打开视频按新引擎装载;切回 mpv 时把 native 附属资源整体下线(透明层线程 + 独立 D3D device + SMTC 写权);直播(FLV)即使设成 native 也永不接管 | `qaq-bx-core/src/settings.rs` `PlayerEngine`(单测:老配置回落/下标稳定/覆盖双向);`qaq-bx-ui/src/shell.rs` `effective_player_engine`/`switch_player_engine`/`engine_teardown_action`(单测);`pages/settings.rs` ComboBox(automation_id `settings-player-engine`);selftest 场景 `engine`(真实直播打开,native 设置下 `native_playback` 恒 false);E15(UIA 改引擎 → 下一次打开按新引擎装载 → 切回 mpv 资源下线) |
 
 **分流不变量**:`native_playback` 单标志控制"控制/弹幕/视图"三路分流;直播路径
 (`start_live_playback`)显式把它打回 false,残留的 `native_player` 不得劫持 mpv 控制。
@@ -25,6 +27,14 @@
 **已知限制(不在本轮)**:native 模式没有后台播放——`MediaPlayerElement` 卸载即停,
 切页/全屏靠 M3 的断点重建续上(有数百毫秒黑屏);单实例常驻 MPE(挂在窗口根视觉)
 是后续解法。画质切换后的首帧仍会短暂复用旧帧(MPE 自身管线行为)。
+
+**M7 口径(2026-11-19 决策)**:「播放引擎」切换**只记账,下一次打开视频才生效**,
+不做"正在播原地换引擎续播"。原因:本应用 `reconcile_playback_visibility` 规定
+**离开播放页即关播**(进设置页时当前流已被 `stop_playback` 关闭并释放引擎),原地
+续播无从谈起;为其单独开"设置页保活/自动回跳播放页"两条路都动关播规则,风险大于
+收益。切回 mpv 时的资源收口(透明层/SMTC 写权/分流标志)仍即时生效,`stop_playback`
+(关播)也统一下线 native 附属资源。E15 按此口径断言(切换锚点必须早于 native 装载
+锚点;native 生效段内不得再出现 mpv loadfile)。
 
 ---
 

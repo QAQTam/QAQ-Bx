@@ -27,7 +27,7 @@ use qaq_bx_core::player::{
 };
 use qaq_bx_core::reply::{ReplyClient, ReplyCursor, ReplyItem, ReplyPage, ReplySort, SubReplyPage};
 use qaq_bx_core::search::{SearchClient, SearchVideo};
-use qaq_bx_core::settings::{AppSettings, FileSettingsStore, SETTINGS_FILE};
+use qaq_bx_core::settings::{AppSettings, FileSettingsStore, PlayerEngine, SETTINGS_FILE};
 use qaq_bx_video::engine::{DanmakuFilter, OverlayDanmaku, VideoConfig, VideoEngine};
 use qaq_bx_video::native::NativePlayer;
 use qaq_bx_video::stage::DanmakuStage;
@@ -81,6 +81,8 @@ const PLAYBACK_TICK: Duration = Duration::from_millis(250);
 const GRID_REBUILD_DEBOUNCE: Duration = Duration::from_millis(150);
 /// 设置滑块（音量/透明度）去抖落盘窗口。
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
+/// M7:直播间播放项 bvid 前缀(真实稿件不会以此开头;直播恒 mpv 的判据)。
+const LIVE_BVID_PREFIX: &str = "live:";
 
 /// 升级 https 并对 B 站图床追加 `@480w_270h_1c.{webp|jpg}` 缩略图后缀,
 /// 把单张封面流量与 WinUI 解码像素面积压缩到原图的 ~1/16–1/46。
@@ -441,6 +443,10 @@ pub struct ShellProbe {
     pub live_rooms: usize,
     /// 直播页首房 roomid(U4;0 = 未加载)。
     pub live_first_roomid: u64,
+    /// M7:生效播放引擎标签(env 强制覆盖 > 设置项;`mpv` / `native`)。
+    pub player_engine: String,
+    /// M7:系统媒体引擎是否正在驱动播放(控制/弹幕/视图三路分流单源)。
+    pub native_playback: bool,
 }
 
 pub struct AppShell {
@@ -589,10 +595,11 @@ pub struct AppShell {
     video_loading: bool,
     /// 视频引擎(SwapChainPanel 渲染 + mpv;惰性按需创建，关闭迷你条即释放全部解码/D3D 内存)。
     engine: Option<Arc<VideoEngine>>,
-    /// v0.3 spike:系统媒体引擎(QAQ_BX_NATIVE=1 启用;与 mpv 引擎互斥生效,
-    /// 解析/控制路径按 native_active 分流)。
+    /// v0.3:M7 系统媒体引擎实例(装载/控制;是否生效见 `native_enabled()`)。
     native_player: Option<Arc<NativePlayer>>,
-    native_enabled: bool,
+    /// `QAQ_BX_NATIVE` 强制覆盖(Some = 覆盖设置项;None = 按设置项)。
+    /// E11/E12/E13 自动化靠它把引擎钉死在一条通路上,不受 settings.json 影响。
+    engine_env_override: Option<PlayerEngine>,
     /// v0.3:native 模式的弹幕透明层(mpv 路径不用——弹幕仍由视频引擎同帧叠画)。
     native_stage: Option<Arc<DanmakuStage>>,
     /// 系统媒体引擎是否正在驱动播放:控制分流(暂停/seek/音量/状态心跳)与弹幕
@@ -677,6 +684,30 @@ pub struct AppShell {
 /// 纯函数便于单测锁行为,视图侧 `on_preview_key_down` 只做「判定→投递→handled」。
 pub(crate) fn search_enter_submits(ev: &KeyEventInfo) -> bool {
     !ev.status.is_released && (ev.key == VirtualKey::ENTER || ev.original_key == VirtualKey::ENTER)
+}
+
+/// M7:播放引擎设置变更后的收口动作(纯判定,单测覆盖)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EngineTeardown {
+    /// 新引擎 = native:只记账。当前通路一律不打断(本应用离开播放页即关播),
+    /// 透明层/自持控件等附属资源由下一次装载建立。
+    RecordOnly,
+    /// 正在播直播:新引擎永不接管这条 FLV(即使设成 native),但 native 侧已经
+    /// 建起来的附属资源要下线。
+    LiveKeepMpv,
+    /// 新引擎 = mpv:native 侧附属资源整体下线(透明层 / SMTC 写权 / 分流标志)。
+    TeardownNative,
+}
+
+/// M7:收口动作判定 —— 优先级:直播豁免 > 新引擎方向。
+fn engine_teardown_action(to_native: bool, live: bool) -> EngineTeardown {
+    if live {
+        EngineTeardown::LiveKeepMpv
+    } else if to_native {
+        EngineTeardown::RecordOnly
+    } else {
+        EngineTeardown::TeardownNative
+    }
 }
 
 #[derive(Clone)]
@@ -1089,6 +1120,8 @@ impl AppShell {
         out.current_qn = self.current_qn;
         out.live_rooms = self.live.cards.len();
         out.live_first_roomid = self.live.cards.first().map_or(0, |c| c.room.roomid);
+        out.player_engine = self.effective_player_engine().tag().to_string();
+        out.native_playback = self.native_playback;
     }
 
     fn submit_search(&mut self, context: &ComponentContext<Self>) {
@@ -1278,9 +1311,26 @@ impl AppShell {
         engine
     }
 
-    /// v0.3 spike:native 引擎是否接管播放控制(QAQ_BX_NATIVE=1)。
+    /// M7:当前**生效**播放引擎(env 强制覆盖 > 设置项)。
+    fn effective_player_engine(&self) -> PlayerEngine {
+        PlayerEngine::resolve(self.engine_env_override, self.settings.player_engine)
+    }
+
+    /// M7:生效引擎是否为系统媒体引擎。直播装载不看它(见 `start_live_playback`)。
+    fn native_enabled(&self) -> bool {
+        self.effective_player_engine() == PlayerEngine::Native
+    }
+
+    /// M7:正在播的是否为直播间(FLV;唯一不受播放引擎设置影响的通路)。
+    fn current_is_live(&self) -> bool {
+        self.now_playing
+            .as_ref()
+            .is_some_and(|item| item.bvid.starts_with(LIVE_BVID_PREFIX))
+    }
+
+    /// 播放页画质/分P 换流时 native 是否接管(与装载入口同一闸)。
     fn native_active(&self) -> bool {
-        self.native_enabled
+        self.native_enabled()
     }
 
     /// v0.3:native 引擎接管装载(系统 DASH 管线;UI 线程只提交请求)。
@@ -1293,7 +1343,7 @@ impl AppShell {
         autoplay: bool,
         start_secs: f64,
     ) -> bool {
-        if !self.native_enabled {
+        if !self.native_enabled() {
             return false;
         }
         let player = match &self.native_player {
@@ -1341,7 +1391,7 @@ impl AppShell {
     /// v0.3:native 弹幕透明层懒创建(native 未启用返回 None)。创建时按当前
     /// 设置下发一次样式/规则,之后一切变更走 `danmaku_*` 分流口,杜绝两侧漂移。
     fn ensure_stage(&mut self) -> Option<Arc<DanmakuStage>> {
-        if !self.native_enabled {
+        if !self.native_enabled() {
             return None;
         }
         if self.native_stage.is_none() {
@@ -1413,6 +1463,68 @@ impl AppShell {
         } else {
             None
         }
+    }
+
+    /// M7:播放引擎设置变更的收口。**生效时机 = 下一次装载**:本应用「离开播放页即
+    /// 关播」(`reconcile_playback_visibility` → `stop_playback`),改引擎时用户必然在
+    /// 设置页,当前流早已关播;为了不动不动就重开/打断任何在播通路,这里绝不重载,
+    /// 只把 native 侧的附属资源收干净(见 `EngineTeardown`):
+    /// ① 弹幕透明层(常驻层线程 + 独立 D3D device)释放,不在 mpv 通路上白占;
+    /// ② SMTC 写权交回窗口级桥,player 自持控件收尾(否则锁屏/控制栏留残卡);
+    /// ③ `native_playback` 归零 —— 控制/弹幕/视图三路分流整体回到 mpv。
+    /// 直播(FLV,MF 不支持)即使设成 native 也永不接管。
+    fn switch_player_engine(&mut self, context: &ComponentContext<Self>) {
+        let to_native = self.native_enabled();
+        let target = self.effective_player_engine().tag();
+        match engine_teardown_action(to_native, self.current_is_live()) {
+            EngineTeardown::RecordOnly => {
+                eprintln!("[qaq-bx-ui] player engine -> {target}(记账完成,下一次装载生效)");
+            }
+            EngineTeardown::LiveKeepMpv => {
+                self.teardown_native_side(context);
+                eprintln!("[qaq-bx-ui] player engine -> {target}(直播恒 mpv,不接管当前流)");
+            }
+            EngineTeardown::TeardownNative => {
+                self.teardown_native_side(context);
+                eprintln!("[qaq-bx-ui] player engine -> {target}(native 侧已下线,下一次装载生效)");
+            }
+        }
+    }
+
+    /// M7:把 native 通路的附属资源整体下线(切回 mpv / 直播在播时共用)。
+    fn teardown_native_side(&mut self, context: &ComponentContext<Self>) {
+        if self.native_playback
+            && let Some(player) = self.native_player.clone()
+        {
+            let _ = player.pause();
+        }
+        self.native_playback = false;
+        self.release_stage();
+        self.reset_smtc_writer(false);
+        self.sync_smtc(context);
+    }
+
+    /// M7:释放弹幕透明层(层线程 + 独立 D3D device 随引擎下线)。
+    fn release_stage(&mut self) {
+        if self.native_stage.take().is_some() {
+            eprintln!("[qaq-bx-ui] native danmaku stage: 已释放(层线程下线)");
+        }
+    }
+
+    /// M7:SMTC 写权交接:切走的一方必须停止手写状态并收尾(否则锁屏/控制栏留残卡
+    /// 或不再更新)。native→mpv 交回窗口级桥;mpv→native 交回 player 自持控件
+    /// (窗口级桥继续只当输入通道);直播按 mpv 一侧接管。
+    fn reset_smtc_writer(&mut self, to_native: bool) {
+        if let Some(bound) = self.smtc_native.take() {
+            bound.set_stopped();
+        }
+        if to_native
+            && let Some(smtc) = &self.smtc
+        {
+            smtc.set_stopped();
+        }
+        self.smtc_bvid = None;
+        self.smtc_playing = None;
     }
 
     fn current_row_revision(&self) -> u64 {
@@ -1969,10 +2081,11 @@ impl AppShell {
         self.playback_avatar_timer = None;
         // 直播恒走 mpv(FLV,MF 不支持):弹幕必须送回视频引擎,透明层不接管。
         self.native_playback = false;
+        self.release_stage();
         self.ensure_engine().set_danmaku(Vec::new());
         self.comment_draft.clear();
         self.composer_notice = None;
-        let mut item = minimal_video_item(&format!("live:{roomid}"), &title);
+        let mut item = minimal_video_item(&format!("{LIVE_BVID_PREFIX}{roomid}"), &title);
         item.author = uname;
         self.now_playing = Some(item);
         self.playing = self.settings.autoplay;
@@ -2722,6 +2835,10 @@ impl AppShell {
             engine.stop();
             drop(engine);
         }
+        // M7:关播即下线 native 附属资源(常驻层线程 + 独立 D3D device;直播/设置页
+        // 走不到引擎切换收口,这里统一收)。
+        self.native_playback = false;
+        self.release_stage();
         self.sync_smtc(context);
     }
 
@@ -3709,7 +3826,9 @@ impl Component for AppShell {
             video_loading,
             engine,
             native_player: None,
-            native_enabled: std::env::var("QAQ_BX_NATIVE").as_deref() == Ok("1"),
+            engine_env_override: PlayerEngine::env_override(
+                std::env::var("QAQ_BX_NATIVE").ok().as_deref(),
+            ),
             native_stage: None,
             native_playback: false,
             current_meta: None,
@@ -5131,6 +5250,8 @@ impl Component for AppShell {
                 if next == self.settings {
                     return;
                 }
+                // M7:切引擎要在写入新设置**之后**判定(生效引擎取自 settings)。
+                let engine_before = self.effective_player_engine();
                 if next.volume != self.settings.volume {
                     self.volume = next.volume;
                     if let Some(player) = self.native_sink() {
@@ -5165,6 +5286,10 @@ impl Component for AppShell {
                     self.danmaku_filter(danmaku_filter_from(&next));
                 }
                 self.settings = next;
+                // M7:播放引擎变更 → 收口(只记账,下一次装载按新引擎;直播不受影响)。
+                if self.effective_player_engine() != engine_before {
+                    self.switch_player_engine(context);
+                }
                 self.schedule_settings_save(context);
             }
             Message::FlushSettingsSave => {
@@ -6121,6 +6246,27 @@ mod tests {
             .take(10)
             .collect();
         assert_eq!(chain, vec![1]);
+    }
+
+    /// M7:引擎设置变更的收口判定 —— 直播豁免优先;切 native 只记账;切 mpv 下线
+    /// native 附属资源(透明层 / SMTC 写权 / 分流标志)。
+    #[test]
+    fn engine_teardown_action_pins_live_and_flips_side_resources() {
+        use EngineTeardown::*;
+        // 直播:即使设成 native 也不接管,只做 native 侧下线。
+        assert_eq!(engine_teardown_action(true, true), LiveKeepMpv);
+        assert_eq!(engine_teardown_action(false, true), LiveKeepMpv);
+        // 非直播:两个方向分别是「记账」与「整体下线」。
+        assert_eq!(engine_teardown_action(true, false), RecordOnly);
+        assert_eq!(engine_teardown_action(false, false), TeardownNative);
+    }
+
+    /// M7:直播判定只认 `live:` 前缀(真实稿件 bvid 恒以 BV 开头,不得误判)。
+    #[test]
+    fn live_prefix_matches_live_room_items_only() {
+        assert!(minimal_video_item(&format!("{LIVE_BVID_PREFIX}123"), "直播").bvid
+            .starts_with(LIVE_BVID_PREFIX));
+        assert!(!minimal_video_item("BV1GJ411x7h7", "稿件").bvid.starts_with(LIVE_BVID_PREFIX));
     }
 
     #[test]

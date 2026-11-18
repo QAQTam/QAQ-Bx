@@ -440,6 +440,9 @@ try {
     $psi.UseShellExecute = $false
     $psi.RedirectStandardError = $true
     $psi.EnvironmentVariables["QAQ_BX_VIDEO"] = "BV1GJ411x7h7"
+    # M7:播放引擎已产品化为设置项;E11 走 mpv 通路必须显式钉死(env 覆盖优先于
+    # settings.json，否则上一次走查留下的 native 会让本场景静默改道)。
+    $psi.EnvironmentVariables["QAQ_BX_NATIVE"] = "0"
     $proc = [System.Diagnostics.Process]::Start($psi)
     $stderrSink = $proc.StandardError
     $stderrTask = $stderrSink.ReadToEndAsync()
@@ -691,6 +694,78 @@ try {
 if ($global:E13Fail) { throw "E13 FAIL: native SMTC/弹幕绘制链验证失败(详见 $stderrLog)" }
 }
 
+function Invoke-UiaElement {
+    # 返回按钮一类控件在锁屏桌面可能报 ElementNotEnabledException；退到坐标点击。
+    param([System.Windows.Automation.AutomationElement]$Element, [string]$What)
+    try {
+        $Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+        return $true
+    } catch {
+        Write-Host "[uia] $What InvokePattern 失败($($_.Exception.GetType().Name))，退坐标点击" -ForegroundColor Yellow
+    }
+    $r = $Element.Current.BoundingRectangle
+    if ($r.Width -le 0 -or $r.Height -le 0) { return $false }
+    Click-Fast -X ([int]($r.X + $r.Width / 2)) -Y ([int]($r.Y + $r.Height / 2))
+    return $true
+}
+
+function Find-UiaByAutomationId {
+    param([System.Windows.Automation.AutomationElement]$Root, [string]$Id)
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, $Id
+    )
+    return $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+}
+
+function Find-UiaByName {
+    param([System.Windows.Automation.AutomationElement]$Root, [string]$Name)
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::NameProperty, $Name
+    )
+    return $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+}
+
+function Select-UiaNav {
+    # 导航项按 ListItem + Name 定位（页面标题也是同名 Text，必须排除）。
+    param([System.Windows.Automation.AutomationElement]$Root, [string]$Name)
+    $condName = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::NameProperty, $Name
+    )
+    $condType = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::ListItem
+    )
+    $cond = New-Object System.Windows.Automation.AndCondition($condName, $condType)
+    $item = $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+    if (-not $item) { Write-Host "[uia] 导航项 '$Name' 缺失" -ForegroundColor Red; return $false }
+    $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    return $true
+}
+
+function Select-UiaEngineItem {
+    # 设置页「播放引擎」下拉：WinUI 的下拉项只有 Expand 之后才进 UIA 树。
+    param([System.Windows.Automation.AutomationElement]$Root, [string]$ItemPattern)
+    $combo = Find-UiaByAutomationId -Root $Root -Id "settings-player-engine"
+    if (-not $combo) { Write-Host "[uia] 未找到 settings-player-engine 下拉框" -ForegroundColor Red; return $false }
+    try {
+        $combo.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    } catch { Write-Host "[uia] 展开播放引擎下拉失败: $($_.Exception.Message)" -ForegroundColor Red; return $false }
+    Start-Sleep -Milliseconds 800
+    $condList = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::ListItem
+    )
+    $items = $Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condList)
+    $pick = $null
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        if ($items[$i].Current.Name -match $ItemPattern) { $pick = $items[$i] }
+    }
+    if (-not $pick) { Write-Host "[uia] 播放引擎下拉内未找到 '$ItemPattern' 项" -ForegroundColor Red; return $false }
+    Write-Host "[uia] 选中播放引擎项: '$($pick.Current.Name)'" -ForegroundColor DarkCyan
+    $pick.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    return $true
+}
+
 function Get-WindowGeometry {
     param([IntPtr]$Hwnd)
     $wr = New-Object UiEdgeNative+RECT
@@ -854,8 +929,151 @@ try {
 }
 }
 
-Write-Host "[done] 极端场景走查完成，截图位于 $FramesDir" -ForegroundColor Green
+# ---------- 场景 E15：设置页改「播放引擎」→ 下一次打开视频按新引擎装载（M7） ----------
+# 口径（与 docs/Update-0.3.0.md M7 行一致）：本应用「离开播放页即关播」，改引擎时当前
+# 流早已停止，所以切换只记账、绝不偷偷重开或打断在播通路；新引擎在**下一次打开视频**
+# 生效。判据全走 stderr 锚点（截图像素在 TOPMOST/前台竞争下不可靠，见 dev-notes）：
+# native 侧装载锚点必须整段落在「切换锚点之后」，且 native 生效段内不得再出现 mpv loadfile。
+if (Should-RunScenario "E15") {
+Write-Host "[E15] 播放引擎设置项（UIA 改引擎 -> 下一次打开按新引擎装载 -> 切回 mpv）" -ForegroundColor Cyan
+$global:E15Fail = $false
+$stderrLog = Join-Path $OutRoot "e15-stderr.log"
+$settingsPath = Join-Path $dataDir "settings.json"
+$settingsBak = "$settingsPath.e15-bak"
+$script:settingsSeeded = $false
+$proc = $null
+try {
+    if (Test-Path $settingsPath) { Copy-Item -Path $settingsPath -Destination $settingsBak -Force }
+    # 无 BOM 写入：Set-Content -Encoding UTF8（PowerShell 5.1）带 BOM，serde 解析失败会
+    # 整份退默认，场景起点就不确定；另外显式钉成 mpv，避免上一次走查留下的 native。
+    [System.IO.File]::WriteAllText(
+        $settingsPath,
+        '{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"FullPlayer","danmaku_enabled":true,"autoplay":true,"hardware_decode":true,"volume":60,"player_engine":"Mpv"}'
+    )
+    $script:settingsSeeded = $true
 
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.WorkingDirectory = (Split-Path $exe)
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables["QAQ_BX_ROUTE"] = "popular"
+    # 故意不设 QAQ_BX_NATIVE：引擎必须由设置项决定，这才是产品路径。
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stderrSink = $proc.StandardError
+    $stderrTask = $stderrSink.ReadToEndAsync()
+    $hwnd = Wait-MainWindow $proc
+    [void][UiEdgeNative]::SetWindowPos($hwnd, [IntPtr](-1), 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0010)
+    $rect = New-Object UiEdgeNative+RECT
+    [void][UiEdgeNative]::GetWindowRect($hwnd, [ref]$rect)
+    $winX = $rect.Left; $winY = $rect.Top
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    Start-Sleep -Seconds 6   # 热门页真实数据 + 首行卡片就位
+
+    # 1) mpv 打开首卡（设置项默认引擎）
+    Click-Fast -X ($winX + 330) -Y ($winY + 360)
+    Start-Sleep -Seconds 16
+    Capture-WindowFrame -Hwnd $hwnd -Mode screen -FileName "e15-0-mpv-playing.png"
+
+    # 2) 设置页改引擎 -> 原生 Windows Media（只记账）
+    if (-not (Select-UiaNav -Root $root -Name "设置")) { throw "E15 FAIL: 导航栏未找到「设置」项" }
+    Start-Sleep -Seconds 3
+    if (-not (Select-UiaEngineItem -Root $root -ItemPattern "原生")) { throw "E15 FAIL: 无法在设置页选中原生引擎" }
+    Start-Sleep -Seconds 4
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e15-1-settings-native.png"
+
+    # 3) 回热门页再开一张卡：这一次装载必须走系统媒体引擎
+    if (-not (Select-UiaNav -Root $root -Name "热门")) { throw "E15 FAIL: 导航栏未找到「热门」项" }
+    Start-Sleep -Seconds 4
+    Click-Fast -X ($winX + 620) -Y ($winY + 360)
+    Start-Sleep -Seconds 26   # 解析 + 装载线程 + MPE 注入开画 + 弹幕分段到货
+    Capture-WindowFrame -Hwnd $hwnd -Mode screen -FileName "e15-2-native-playing.png"
+
+    # 4) 切回 mpv：native 附属资源下线，下一次打开回到 mpv
+    if (-not (Select-UiaNav -Root $root -Name "设置")) { throw "E15 FAIL: 导航栏未找到「设置」项(二次)" }
+    Start-Sleep -Seconds 3
+    if (-not (Select-UiaEngineItem -Root $root -ItemPattern "mpv")) { throw "E15 FAIL: 无法在设置页选回 mpv" }
+    Start-Sleep -Seconds 4
+    if (-not (Select-UiaNav -Root $root -Name "热门")) { throw "E15 FAIL: 导航栏未找到「热门」项(二次)" }
+    Start-Sleep -Seconds 4
+    Click-Fast -X ($winX + 900) -Y ($winY + 360)
+    Start-Sleep -Seconds 18
+    Capture-WindowFrame -Hwnd $hwnd -Mode screen -FileName "e15-3-back-to-mpv.png"
+
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "E15: 进程提前退出 ($($proc.ExitCode))" }
+} finally {
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    if ($script:settingsSeeded) {
+        if (Test-Path $settingsBak) { Copy-Item -Path $settingsBak -Destination $settingsPath -Force }
+        else { Remove-Item -Path $settingsPath -Force -ErrorAction SilentlyContinue }
+        Remove-Item -Path $settingsBak -Force -ErrorAction SilentlyContinue
+    }
+    try {
+        if ($stderrSink) { $stderrSink.Close() }
+        if ($stderrTask.Wait(5000)) {
+            $text = $stderrTask.Result
+            $text | Set-Content -Path $stderrLog -Encoding UTF8
+            Write-Host "[E15] stderr -> $stderrLog" -ForegroundColor DarkCyan
+            # 按两个切换锚点把 stderr 切成三段：起点(mpv) / native 生效期 / 切回 mpv 之后。
+            $partsN = @($text -split "player engine -> native")
+            $fail = {
+                param($msg)
+                Write-Host "[E15] FAIL: $msg" -ForegroundColor Red
+                $global:E15Fail = $true
+            }
+            if ($partsN.Count -lt 2) {
+                & $fail "设置页没记账出 native 引擎锚点"
+            } elseif ($text -notmatch "loadfile start=") {
+                & $fail "起点没走 mpv loadfile（默认引擎不是 mpv）"
+            } elseif ($text -match "native engine (init|load) failed|native build_source failed|native media failed|native engine attach failed|danmaku stage: (device|swapchain|begin_draw|present|ResizeBuffers)") {
+                & $fail "native 通路装载/接管报错（见 stderr）"
+            } else {
+                $afterNative = $partsN[1]
+                $partsM = @($afterNative -split "player engine -> mpv")
+                $nativeWindow = $partsM[0]
+                $afterMpv = if ($partsM.Count -gt 1) { $partsM[1] } else { $null }
+                if ($nativeWindow -notmatch "native load qn=") {
+                    & $fail "切换后的下一次打开没走系统媒体引擎装载"
+                } elseif ($nativeWindow -match "loadfile start=") {
+                    & $fail "native 生效期里又出现 mpv loadfile（引擎分流没翻转）"
+                } elseif ($nativeWindow -notmatch "native build_source ok") {
+                    & $fail "装载线程没产出 MediaSource"
+                } elseif ($nativeWindow -notmatch "native attach") {
+                    & $fail "MPE 未接管 player（视图分支未翻转）"
+                } elseif ($nativeWindow -notmatch "native media opened") {
+                    & $fail "换引擎后系统媒体管线没开画"
+                } elseif ($nativeWindow -notmatch "native danmaku stage: 透明层已创建") {
+                    & $fail "弹幕没随 native 通路建立透明层"
+                } elseif ($nativeWindow -notmatch "STAGE-A: danmaku surface ok") {
+                    & $fail "透明层 swapchain 未产出"
+                } elseif ($nativeWindow -notmatch "smtc native: 控件已绑定") {
+                    & $fail "SMTC 写权没交接给 player 自持控件"
+                } elseif (-not $afterMpv) {
+                    & $fail "没看到切回 mpv 的记账锚点"
+                } elseif (-not ($text -match "native danmaku stage: 透明层已创建") -or $text.IndexOf("native danmaku stage: 已释放") -lt $text.IndexOf("native danmaku stage: 透明层已创建")) {
+                    # 释放时机是「关播/切引擎」二选一(离开播放页即关播),所以只断言
+                    # 「建过的透明层都被释放」,不锁死它在切回 mpv 锚点之后。
+                    & $fail "弹幕透明层没有随 native 通路下线(层线程/D3D device 白占)"
+                } elseif ($afterMpv -notmatch "loadfile start=") {
+                    & $fail "切回 mpv 后下一次打开没走 mpv loadfile"
+                } else {
+                    Write-Host "[E15] PASS: 引擎设置只记账（不打断在播通路），下一次打开按新引擎装载，切回 mpv 后 native 附属资源全部下线" -ForegroundColor Green
+                }
+            }
+        } else {
+            Write-Host "[E15] FAIL: 没拿到 stderr" -ForegroundColor Red
+            $global:E15Fail = $true
+        }
+    } catch {
+        Write-Host "[E15] FAIL: stderr 判定异常 $($_.Exception.Message)" -ForegroundColor Red
+        $global:E15Fail = $true
+    }
+}
+if ($global:E15Fail) { throw "E15 FAIL: 播放引擎设置项验证失败（详见 $stderrLog）" }
+}
+
+Write-Host "[done] 极端场景走查完成，截图位于 $FramesDir" -ForegroundColor Green
 # ---------- 场景 E16:退出全屏→拖拽标题栏风暴(0x359595 幽灵回调修复回归,§8.4) ----------
 if (Should-RunScenario "E16") {
 Write-Host "[E16] 退出全屏后立刻拖拽标题条 20 次(WindowRectChanged 幽灵路径防护)" -ForegroundColor Cyan

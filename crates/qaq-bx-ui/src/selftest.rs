@@ -2,7 +2,7 @@
 //! AppShell 组件树并派发 Message,断言壳层状态。覆盖「鼠标模拟测不到」
 //! 的路径:快速切视频的播放代次取消、评论双桶缓存、导航历史栈。
 //!
-//! 用法:`qaq-bx-ui.exe --selftest [all|boot|nav|comments|rapid-switch|stress|search|popular|live|unplayable|half-pane|codec]`
+//! 用法:`qaq-bx-ui.exe --selftest [all|boot|nav|comments|rapid-switch|stress|search|popular|live|unplayable|half-pane|mobile|fullscreen|engine]`
 //! 前置:`cargo build -p qaq-bx-ui --features selftest`;需要真实网络与
 //! 本地凭据(nav 探测 / feed / 评论均走真实接口)。
 
@@ -18,6 +18,7 @@ use crate::pages::account::NotifyTab;
 use crate::pages::player::CommentSort;
 use crate::router::Route;
 use crate::shell::{AppShell, Message, ResolveProfileKey, ShellInput, ShellProbe};
+use qaq_bx_core::settings::{AppSettings, PlayerEngine};
 
 /// 可解析真实媒体的测试稿件（open_video 走最小模型 + video_meta 解析管线，不依赖任何种子数据）。
 const TEST_BV: &str = "BV1GJ411x7h7";
@@ -645,6 +646,66 @@ fn unplayable(s: &mut Scenario) -> Result<(), String> {
     Ok(())
 }
 
+/// 场景 14:播放引擎设置项(M7)。走真实 settings.json(不含 `player_engine` 字段 ⇒
+/// 老配置必须默认 mpv)、真实 `UpdateSettings` 路径与真实直播打开路径:
+/// ① 切 native 只记账 —— 没有装载时 `native_playback` 必须保持 false(引擎切换
+///    不得偷偷重开/接管任何通路);
+/// ② 直播即使设成 native 也永不接管 —— 控制/弹幕/视图三路分流单标志不被劫持,
+///    否则进度与音量会打到已卸载的系统媒体引擎上;
+/// ③ 切回 mpv 的收口不炸(透明层与 SMTC 写权此时本就未建立)。
+fn engine(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert_eq!(p.player_engine, "mpv", "老配置缺 player_engine 必须回落 mpv");
+        assert!(!p.native_playback, "未装载不得由 native 驱动");
+    }
+
+    s.send(Message::UpdateSettings(AppSettings {
+        player_engine: PlayerEngine::Native,
+        ..AppSettings::default()
+    }))?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert_eq!(p.player_engine, "native", "设置项改完生效引擎必须立刻翻转");
+        assert!(
+            !p.native_playback,
+            "只记账口径:切换不得接管任何在播通路"
+        );
+    }
+
+    // 直播(FLV):即使设置项是 native,也必须整条留在 mpv。
+    s.send(Message::NavTagSelected(Some("live".into())))?;
+    s.wait_for(Duration::from_secs(30), |p| p.route_tag == "live" && p.live_rooms > 0)
+        .map_err(|err| format!("直播数据未就绪:{err}"))?;
+    let roomid = s.probe.borrow().live_first_roomid;
+    assert!(roomid > 0, "直播首房缺少 roomid");
+    s.send(Message::LiveRoomSelected(roomid, "引擎自测房间".into(), "UP".into()))?;
+    let expect = format!("live:{roomid}");
+    s.wait_for(Duration::from_secs(60), |p| {
+        p.route_tag == "player" && p.now_playing_bvid.as_deref() == Some(expect.as_str())
+    })
+    .map_err(|err| format!("直播首房打开失败:{err}"))?;
+    {
+        let p = s.probe.borrow();
+        assert_eq!(p.player_engine, "native", "直播不应改动生效引擎");
+        assert!(!p.native_playback, "直播被 native 劫持:控制/弹幕会打到已卸载引擎");
+    }
+
+    s.send(Message::UpdateSettings(AppSettings {
+        player_engine: PlayerEngine::Mpv,
+        ..AppSettings::default()
+    }))?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert_eq!(p.player_engine, "mpv", "切回 mpv 后生效引擎应回到 mpv");
+        assert!(!p.native_playback, "切回 mpv 后三路分流必须整体下线 native");
+    }
+    Ok(())
+}
+
 const SCENARIOS: &[(&str, &str, fn(&mut Scenario) -> Result<(), String>)] = &[
     ("boot", "FullPlayer", boot),
     ("nav", "FullPlayer", nav),
@@ -659,6 +720,7 @@ const SCENARIOS: &[(&str, &str, fn(&mut Scenario) -> Result<(), String>)] = &[
     ("half-pane", "HalfPane", half_pane_pulse),
     ("mobile", "HalfPane", mobile),
     ("fullscreen", "FullPlayer", fullscreen),
+    ("engine", "FullPlayer", engine),
 ];
 
 /// 解析 `--selftest [scenario]`;非 selftest 调用返回 `None` 走正常启动。

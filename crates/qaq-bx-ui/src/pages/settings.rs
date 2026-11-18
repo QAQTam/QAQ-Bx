@@ -2,7 +2,9 @@
 
 use std::rc::Rc;
 
-use qaq_bx_core::settings::{AppSettings, CodecPref, DANMAKU_FONTS, HomeOpenMode, QualityPref};
+use qaq_bx_core::settings::{
+    AppSettings, CodecPref, DANMAKU_FONTS, HomeOpenMode, PlayerEngine, QualityPref,
+};
 use windows_reactor::*;
 
 use crate::layout::ViewportLayout;
@@ -18,6 +20,8 @@ pub fn settings_page(
     let quality_labels: Vec<&'static str> = QualityPref::ALL.iter().map(|q| q.label()).collect();
     let codec_labels: Vec<&'static str> = CodecPref::ALL.iter().map(|c| c.label()).collect();
     let open_mode_labels: Vec<&'static str> = HomeOpenMode::ALL.iter().map(|m| m.label()).collect();
+    let engine_labels: Vec<&'static str> =
+        PlayerEngine::ALL.iter().map(|e| e.label()).collect();
     let opacity_pct = (settings.danmaku_opacity * 100.0)
         .round()
         .clamp(10.0, 100.0) as i32;
@@ -240,6 +244,22 @@ pub fn settings_page(
         }
     };
 
+    // M7:播放引擎(默认 mpv 兼容优先;原生 Windows Media = 系统媒体引擎)。
+    // 改当次即生效:正在播的 VOD 由 shell 换引擎续播,直播不受影响。
+    let on_engine = {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |idx: Option<usize>| {
+            if let Some(engine) = idx.and_then(PlayerEngine::from_index)
+                && engine != base.player_engine
+            {
+                let mut next = base.clone();
+                next.player_engine = engine;
+                cb.call(next);
+            }
+        }
+    };
+
     let card_padding = if layout.is_mobile() { 16.0 } else { 24.0 };
     let card = |content: StackPanel| {
         Border::new()
@@ -268,6 +288,12 @@ pub fn settings_page(
                 .items_source(open_mode_labels)
                 .selected_index(settings.home_open_mode.index())
                 .on_selection_changed(on_open_mode),
+            ComboBox::new()
+                .header("播放引擎")
+                .automation_id("settings-player-engine")
+                .items_source(engine_labels)
+                .selected_index(settings.player_engine.index())
+                .on_selection_changed(on_engine),
             ToggleSwitch::new()
                 .header("自动播放")
                 .on_content("开")

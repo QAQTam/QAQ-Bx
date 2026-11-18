@@ -144,6 +144,63 @@ impl CodecPref {
     }
 }
 
+/// 播放引擎(默认 mpv:兼容性优先;原生 Windows Media 走系统媒体管线)。
+///
+/// `QAQ_BX_NATIVE` 只作**强制覆盖**(自动化 / 开发调试),不参与持久化:
+/// `"1"` → 强制原生,`"0"` → 强制 mpv,其余取值按本设置项。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlayerEngine {
+    /// libmpv 自绘(D3D11 同帧叠弹幕;直播唯一通道)。
+    #[default]
+    Mpv,
+    /// 系统媒体引擎(MediaFoundation MediaPlayerElement + 弹幕透明层)。
+    Native,
+}
+
+impl PlayerEngine {
+    /// UI 列表固定顺序(与 `index()` / `from_index()` 一一对应)。
+    pub const ALL: [Self; 2] = [Self::Mpv, Self::Native];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Mpv => "1. mpv（兼容性优先）",
+            Self::Native => "2. 原生 Windows Media",
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Mpv => 0,
+            Self::Native => 1,
+        }
+    }
+
+    pub fn from_index(index: usize) -> Option<Self> {
+        Self::ALL.get(index).copied()
+    }
+
+    /// `QAQ_BX_NATIVE` 覆盖值 → 强制引擎;`None` = 不设覆盖(按设置项)。
+    pub fn env_override(value: Option<&str>) -> Option<Self> {
+        match value {
+            Some("1") => Some(Self::Native),
+            Some("0") => Some(Self::Mpv),
+            _ => None,
+        }
+    }
+
+    /// 生效引擎:环境变量强制覆盖 > 设置项。
+    pub fn resolve(forced: Option<Self>, saved: Self) -> Self {
+        forced.unwrap_or(saved)
+    }
+
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Mpv => "mpv",
+            Self::Native => "native",
+        }
+    }
+}
+
 /// 可选窗口位置记忆（物理像素外框 + 最大化态，与 `WindowPlacement` 对齐）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowBounds {
@@ -221,6 +278,8 @@ pub struct AppSettings {
     pub autoplay: bool,
     pub hardware_decode: bool,
     pub volume: u32,
+    /// 播放引擎(M7;旧配置缺失 → `PlayerEngine::default()` = mpv)。
+    pub player_engine: PlayerEngine,
     /// WebP 解码器缺失提示是否已展示过(仅弹一次)。
     pub webp_hint_shown: bool,
     pub window: Option<WindowBounds>,
@@ -248,6 +307,7 @@ impl Default for AppSettings {
             autoplay: true,
             hardware_decode: true,
             volume: 80,
+            player_engine: PlayerEngine::default(),
             webp_hint_shown: false,
             window: None,
         }
@@ -368,6 +428,7 @@ mod tests {
             autoplay: false,
             hardware_decode: false,
             volume: 45,
+            player_engine: PlayerEngine::Native,
             webp_hint_shown: true,
             window: Some(WindowBounds {
                 x: 100,
@@ -467,4 +528,64 @@ fn danmaku_filter_defaults_for_legacy_configs_and_weight_clamped() {
     .normalized();
     assert_eq!(weird.danmaku_weight_min, 10);
     assert_eq!(weird.danmaku_filter_rules, "前方高能");
+}
+
+/// M7:播放引擎设置项 —— 旧配置缺字段必须回落 mpv(兼容优先),不得因反序列化
+/// 失败而整份配置回退默认;非法取值同样按缺省处理(normalized 不改枚举)。
+#[test]
+fn player_engine_defaults_to_mpv_for_legacy_configs() {
+    let legacy: AppSettings = serde_json::from_str("{}").unwrap();
+    assert_eq!(legacy.player_engine, PlayerEngine::Mpv);
+
+    // 只写了一半的老配置:缺 player_engine → mpv,其余字段照常读出。
+    let partial: AppSettings =
+        serde_json::from_str(r#"{"volume": 42, "autoplay": false}"#).unwrap();
+    assert_eq!(partial.player_engine, PlayerEngine::Mpv);
+    assert_eq!(partial.volume, 42);
+    assert!(!partial.autoplay);
+
+    // 原生引擎可写可读,且 normalized 不改它。
+    let native: AppSettings = serde_json::from_str(r#"{"player_engine": "Native"}"#).unwrap();
+    assert_eq!(native.player_engine, PlayerEngine::Native);
+    assert_eq!(native.normalized().player_engine, PlayerEngine::Native);
+}
+
+/// M7:引擎列表顺序 / 标签 / 下标必须一一对应(设置页 ComboBox 下发按 index)。
+#[test]
+fn player_engine_index_and_label_order_is_stable() {
+    assert_eq!(PlayerEngine::ALL[0], PlayerEngine::Mpv);
+    assert_eq!(PlayerEngine::ALL[1], PlayerEngine::Native);
+    for engine in PlayerEngine::ALL {
+        assert_eq!(PlayerEngine::from_index(engine.index()), Some(engine));
+        assert!(engine.label().starts_with(&format!("{}.", engine.index() + 1)));
+    }
+    assert_eq!(PlayerEngine::from_index(2), None);
+    assert_eq!(PlayerEngine::Mpv.tag(), "mpv");
+    assert_eq!(PlayerEngine::Native.tag(), "native");
+}
+
+/// M7:`QAQ_BX_NATIVE` 是强制覆盖而非默认值 —— 1 强制原生 / 0 强制 mpv,
+/// 未设与非法值都按设置项(E11/E12/E13 自动化依赖这套口径)。
+#[test]
+fn player_engine_env_override_pins_both_directions() {
+    assert_eq!(PlayerEngine::env_override(Some("1")), Some(PlayerEngine::Native));
+    assert_eq!(PlayerEngine::env_override(Some("0")), Some(PlayerEngine::Mpv));
+    for junk in [Some("true"), Some(""), Some("2"), None] {
+        assert_eq!(PlayerEngine::env_override(junk), None, "{junk:?} 不构成覆盖");
+    }
+
+    // 覆盖优先;无覆盖时设置项生效。
+    assert_eq!(
+        PlayerEngine::resolve(Some(PlayerEngine::Native), PlayerEngine::Mpv),
+        PlayerEngine::Native
+    );
+    assert_eq!(
+        PlayerEngine::resolve(Some(PlayerEngine::Mpv), PlayerEngine::Native),
+        PlayerEngine::Mpv
+    );
+    assert_eq!(
+        PlayerEngine::resolve(None, PlayerEngine::Native),
+        PlayerEngine::Native
+    );
+    assert_eq!(PlayerEngine::resolve(None, PlayerEngine::Mpv), PlayerEngine::Mpv);
 }

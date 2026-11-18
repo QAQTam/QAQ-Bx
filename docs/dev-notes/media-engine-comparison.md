@@ -117,4 +117,33 @@
    `native surface detached/remount`、`smtc native: 控件已绑定/status=`、
    `STAGE-A/STAGE-B`。E12/E13 的断言全部以这些锚点为准,不用像素。
 
+## 8. 播放引擎设置项(M7)实测(2026-11-19,分支 feat/v0.3-native-player)
 
+把 `QAQ_BX_NATIVE` env 开关产品化成设置页「播放引擎」时的坑与判据:
+
+1. **「离开播放页即关播」是硬约束,不是坑。** `view()` 每帧跑
+   `reconcile_playback_visibility`:`now_playing.is_some() && !is_player_visible()`
+   ⇒ `stop_playback`(清 now_playing、`engine.take()` 丢掉整个 mpv 引擎、把 Player
+   从 history 抹掉——所以进设置页后标题栏返回按钮是**禁用**的,UIA Invoke 报
+   `ElementNotEnabledException`)。推论:改引擎时用户必然在设置页,当前流早已关播,
+   「正在播原地换引擎续播」无从谈起 ⇒ 2026-11-19 拍板**只记账、下一次打开生效**,
+   E15 按此断言(切换锚点必须早于 `native load qn=`;native 生效段内不得再出现
+   `loadfile start=`)。想打破它 = 动关播规则(设置页保活或自动回跳播放页),另立项。
+2. **`QAQ_BX_NATIVE` 必须双向覆盖**(`1`=钉 native,`0`=钉 mpv):E11 走 mpv 通路,
+   但设置项持久化在 `target/debug/data/settings.json`,上一次 E15 会把它写成 native;
+   只认 `1` 的话 E11 会被静默改道。读法:`PlayerEngine::env_override(Some("1"/"0"))`,
+   其余值(含未设)按设置项。
+3. **settings.json 种子不能用 `Set-Content -Encoding UTF8`**(PowerShell 5.1 写 BOM),
+   serde 解析失败整份退默认,场景起点漂移;用 `[IO.File]::WriteAllText`(无 BOM)。
+4. **直播豁免要留在分流层而不是设置层**:`LiveReady` 永不经 `native_load_choice`,
+   `start_live_playback` 把 `native_playback` 打回 false 并顺手 `release_stage()`;
+   selftest 场景 `engine` 用真实直播打开断言 `player_engine=native` 时
+   `native_playback` 仍为 false(控制/弹幕不被已卸载引擎劫持)。
+5. **关播也要收 native 侧资源**:`stop_playback` 原本只丢 mpv 引擎;M7 起补
+   `native_playback=false` + `release_stage()`(常驻层线程 + 独立 D3D device,4c8g
+   不能白占)。透明层释放锚 `native danmaku stage: 已释放(层线程下线)` 可能在
+   「关播」而非「切引擎」时出现——E15 断言只锁「建过的层都被释放」,不锁死时机。
+6. **UIA 定位设置项**:ComboBox 用 `automation_id("settings-player-engine")` 显式
+   钉死(页面上还有别的无 id ComboBox);导航项按 `ControlType.ListItem + Name` 找
+   (页面标题是同名 Text,不能裸按 Name);下拉项依旧要 Expand 后才进树(见 §7 第 4 条)。
+7. **诊断锚(新增,勿删)**:`player engine -> native|mpv(...)`(记账/下线收口)。
