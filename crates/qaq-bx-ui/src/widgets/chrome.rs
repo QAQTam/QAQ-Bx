@@ -32,6 +32,8 @@ pub fn title_search_box_width(window_width: f64) -> f64 {
 pub fn build_title_bar(
     layout: ViewportLayout,
     title_bar_ref: &ElementRef<TitleBar>,
+    portrait_mode: bool,
+    on_toggle_dock: Callback<()>,
     app_icon_png: &'static [u8],
     app_name: &str,
     route_subtitle: &str,
@@ -119,6 +121,19 @@ pub fn build_title_bar(
     }
 
     let mut right_items: Vec<View> = Vec::new();
+    if portrait_mode {
+        // 竖屏模式:系统最大化钮已被 presenter 级没收(SetIsMaximizable(false),
+        // 控件将其置灰),这里补「贴边最大化」钮——右缘贴边 × 工作区全高,再点还原。
+        // 放 right_items 最右(紧邻 caption 钮);right_header 是单值 relation,
+        // 必须并入下方统一构建,否则会被搜索/通知钮覆盖。
+        right_items.push(
+            Button::new()
+                .style(ButtonStyle::Subtle)
+                .on_click(on_toggle_dock)
+                .content(SymbolIcon::new().symbol(Symbol::DockRight))
+                .into(),
+        );
+    }
     if layout.shows_title_search_button() {
         right_items.push(
             Button::new()

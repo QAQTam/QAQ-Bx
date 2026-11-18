@@ -223,6 +223,9 @@ pub struct AppSettings {
     pub volume: u32,
     /// WebP 解码器缺失提示是否已展示过(仅弹一次)。
     pub webp_hint_shown: bool,
+    /// 竖屏模式(实验):窗口客户区钳制在底栏边界带 [390, 860) DIP,没收系统
+    /// 最大化钮并改供「贴边最大化」(右缘贴边 × 工作区全高)。移动布局自动接管。
+    pub portrait_mode: bool,
     pub window: Option<WindowBounds>,
 }
 
@@ -249,6 +252,7 @@ impl Default for AppSettings {
             hardware_decode: true,
             volume: 80,
             webp_hint_shown: false,
+            portrait_mode: false,
             window: None,
         }
     }
@@ -369,6 +373,7 @@ mod tests {
             hardware_decode: false,
             volume: 45,
             webp_hint_shown: true,
+            portrait_mode: true,
             window: Some(WindowBounds {
                 x: 100,
                 y: 80,
@@ -467,4 +472,17 @@ fn danmaku_filter_defaults_for_legacy_configs_and_weight_clamped() {
     .normalized();
     assert_eq!(weird.danmaku_weight_min, 10);
     assert_eq!(weird.danmaku_filter_rules, "前方高能");
+}
+
+/// 竖屏模式(实验):旧配置缺字段必须缺省关;置位后 serde 往返保真。
+#[test]
+fn portrait_mode_defaults_off_and_roundtrips() {
+    let legacy: AppSettings = serde_json::from_str("{}").unwrap();
+    assert!(!legacy.portrait_mode, "旧配置无此字段必须缺省关");
+
+    let mut next = AppSettings::default();
+    next.portrait_mode = true;
+    let parsed: AppSettings =
+        serde_json::from_str(&serde_json::to_string(&next).unwrap()).unwrap();
+    assert!(parsed.portrait_mode, "serde 往返必须保真");
 }

@@ -80,6 +80,11 @@ const PLAYBACK_TICK: Duration = Duration::from_millis(250);
 /// P1 网格重建去抖:拖拽期间 VirtualSource 重建延迟到窗口静止后 150ms 一次。
 const GRID_REBUILD_DEBOUNCE: Duration = Duration::from_millis(150);
 
+/// 竖屏模式(实验):客户区宽度带上限 = 底栏出现边界 − 1(layout.rs
+/// `ShellChromeMode::from_width` 对 860 用严格 `<`,859 保证 Mobile chrome
+/// 与底栏在任意 DPI 取整下都在)。下限沿用 `MIN_WINDOW_WIDTH`。
+const PORTRAIT_MAX_WIDTH_DIPS: f64 = layout::MOBILE_BREAKPOINT - 1.0;
+
 /// E14:拖框风暴跟踪——连续 `WindowResized`(间隔 ≤250ms)视为一次风暴;收口时输出
 /// `RESIZE-STORM n=… span_ms=… max_gap_ms=…` 到 stderr,供 E14 场景量化 UI 线程
 /// 节拍(F1 合并生效度:n 即风暴期实际消费的消息数,对比脚本侧产出的步数)。
@@ -157,6 +162,17 @@ fn title_bar_tier_signature(layout: ViewportLayout) -> u32 {
     u32::from(layout.is_mobile())
         | (u32::from(layout.shows_inline_title_search()) << 1)
         | (u32::from(layout.shows_title_search_button()) << 2)
+}
+
+/// 竖屏模式窗口约束:客户区宽度钳制在底栏边界带 [390, 860) DIP,高度不设限
+/// (presenter 级硬钳制,reactor `WindowConstraints` → `SetPreferredMaximumWidth`)。
+fn portrait_window_constraints() -> WindowConstraints {
+    WindowConstraints {
+        min_width: Some(layout::MIN_WINDOW_WIDTH),
+        min_height: Some(layout::MIN_WINDOW_HEIGHT),
+        max_width: Some(PORTRAIT_MAX_WIDTH_DIPS),
+        max_height: None,
+    }
 }
 /// 设置滑块（音量/透明度）去抖落盘窗口。
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -660,6 +676,12 @@ pub struct AppShell {
     title_bar_ref: ElementRef<TitleBar>,
     /// §8.2:上次 settled 时的内容结构档位签名(见 `title_bar_tier_signature`)。
     title_bar_tier: u32,
+    /// 竖屏模式(实验):贴边停靠态(仅 `settings.portrait_mode` 时有意义)。
+    portrait_docked: bool,
+    /// 竖屏模式:贴边前外框几何(物理像素,供还原;`None` = 无记录)。
+    portrait_dock_restore: Option<(i32, i32, i32, i32)>,
+    /// 竖屏模式:系统最大化没收待执行(None = 已同步);窗口未就绪时逐消息重试。
+    maximizable_pending: Option<bool>,
     playing: bool,
     position: u32,
     mount_tick: u32,
@@ -806,6 +828,13 @@ pub enum Message {
         gen_id: u64,
         active: bool,
     },
+    /// 竖屏模式(实验):窗口策略 presenter 手术回执(贴边态对账)。
+    PortraitSynced {
+        docked: bool,
+        restore: Option<(i32, i32, i32, i32)>,
+    },
+    /// 竖屏模式:贴边最大化钮 → 切换停靠态。
+    TogglePortraitDock,
     PlayerHotkey(pages::fullscreen::PlayerHotkey),
     /// 引擎状态节拍(250ms;读引擎快照刷新 UI 单源)。
     PositionTick,
@@ -1748,6 +1777,23 @@ impl AppShell {
     fn close_resize_storm(&mut self, reason: &str) {
         if let Some(summary) = self.resize_storm.close(reason) {
             eprintln!("{summary}");
+        }
+    }
+
+    /// 竖屏模式:应用/恢复系统最大化没收(presenter 级;窗口未就绪时逐消息重试)。
+    fn sync_portrait_maximizable(&mut self, context: &ComponentContext<Self>) {
+        let Some(enabled) = self.maximizable_pending else {
+            return;
+        };
+        self.maximizable_pending = None;
+        let docked = self.portrait_docked;
+        let restore = self.portrait_dock_restore;
+        let started = context.run_window(move |window| {
+            crate::winrt_ext::set_maximizable(window.as_raw(), enabled);
+            Message::PortraitSynced { docked, restore }
+        });
+        if !started {
+            self.maximizable_pending = Some(enabled);
         }
     }
 
@@ -2768,8 +2814,14 @@ impl AppShell {
     fn sync_window_fullscreen(&mut self, fullscreen: bool, context: &ComponentContext<Self>) {
         self.fullscreen_gen = self.fullscreen_gen.wrapping_add(1);
         let gen_id = self.fullscreen_gen;
+        let portrait = self.settings.portrait_mode;
         let started = context.run_window(move |window| {
             crate::winrt_ext::set_window_fullscreen(window.as_raw(), fullscreen);
+            // 全屏 presenter 与 OverlappedPresenter 的最大化开关正交,但退出回
+            // Default presenter 时 presenter 设置可能复位——进出都重按一次(幂等)。
+            if portrait {
+                crate::winrt_ext::set_maximizable(window.as_raw(), false);
+            }
             Message::FullscreenSynced {
                 gen_id,
                 active: fullscreen,
@@ -3812,6 +3864,9 @@ impl Component for AppShell {
             resize_storm: ResizeStormTrack::default(),
             title_bar_ref: ElementRef::new(),
             title_bar_tier: 0,
+            portrait_docked: false,
+            portrait_dock_restore: None,
+            maximizable_pending: if settings.portrait_mode { Some(false) } else { None },
             playing: false,
             position: 0,
             mount_tick: 0,
@@ -3874,6 +3929,9 @@ impl Component for AppShell {
         self.refresh_probe();
         #[cfg(feature = "probe")]
         crate::probe::pump();
+        // 竖屏模式:窗口就绪后补上 presenter 级最大化没收(run_window 失败则
+        // 留待下一条消息重试;启动期由首条消息驱动)。
+        self.sync_portrait_maximizable(context);
         match message {
             Message::Back => {
                 if self.is_fullscreen {
@@ -5250,10 +5308,67 @@ impl Component for AppShell {
             }
 
             // ---- 设置 ----
+            Message::TogglePortraitDock => {
+                if !self.settings.portrait_mode {
+                    return;
+                }
+                let docked = !self.portrait_docked;
+                let restore = self.portrait_dock_restore.take();
+                let current_dips = self.viewport_layout.window_width;
+                let target_dips = PORTRAIT_MAX_WIDTH_DIPS;
+                context.run_window(move |window| {
+                    let raw = window.as_raw();
+                    if docked {
+                        let prev = crate::winrt_ext::dock_window_right(
+                            raw,
+                            target_dips,
+                            current_dips,
+                        )
+                        .or(restore);
+                        Message::PortraitSynced {
+                            docked: true,
+                            restore: prev,
+                        }
+                    } else if let Some(prev) = restore {
+                        crate::winrt_ext::restore_window_bounds(raw, prev);
+                        Message::PortraitSynced {
+                            docked: false,
+                            restore: None,
+                        }
+                    } else {
+                        Message::PortraitSynced {
+                            docked: false,
+                            restore: None,
+                        }
+                    }
+                });
+            }
+            Message::PortraitSynced { docked, restore } => {
+                self.portrait_docked = docked;
+                self.portrait_dock_restore = restore;
+            }
             Message::UpdateSettings(next) => {
                 let next = next.normalized();
                 if next == self.settings {
                     return;
+                }
+                // 竖屏模式(实验)翻转:切换系统最大化没收;关闭时若在贴边态
+                // 先还原贴边前几何,再交由 pending 恢复最大化钮。
+                if next.portrait_mode != self.settings.portrait_mode {
+                    self.maximizable_pending = Some(!next.portrait_mode);
+                    if !next.portrait_mode && self.portrait_docked {
+                        let restore = self.portrait_dock_restore.take();
+                        self.portrait_docked = false;
+                        if let Some(prev) = restore {
+                            context.run_window(move |window| {
+                                crate::winrt_ext::restore_window_bounds(window.as_raw(), prev);
+                                Message::PortraitSynced {
+                                    docked: false,
+                                    restore: None,
+                                }
+                            });
+                        }
+                    }
                 }
                 if next.volume != self.settings.volume {
                     self.volume = next.volume;
@@ -5725,16 +5840,31 @@ impl Component for AppShell {
 
     fn view(&self, _input: &ShellInput, context: &mut ViewContext<Self>) -> View {
         context.window_title(crate::notifications::APP_DISPLAY_NAME);
+        let portrait = self.settings.portrait_mode;
+        let (client_w, client_h) = if portrait {
+            (PORTRAIT_MAX_WIDTH_DIPS, layout::DEFAULT_WINDOW_HEIGHT)
+        } else {
+            (layout::DEFAULT_WINDOW_WIDTH, layout::DEFAULT_WINDOW_HEIGHT)
+        };
         let mut visuals = WindowVisuals::new()
             .backdrop(WindowBackdrop::Mica)
-            .client_size(layout::DEFAULT_WINDOW_WIDTH, layout::DEFAULT_WINDOW_HEIGHT)
-            .constraints(WindowConstraints {
-                min_width: Some(layout::MIN_WINDOW_WIDTH),
-                min_height: Some(layout::MIN_WINDOW_HEIGHT),
-                max_width: None,
-                max_height: None,
+            .client_size(client_w, client_h)
+            // 竖屏模式:宽度钳制在底栏边界带 [390, 860) DIP——presenter 级
+            // 硬钳制,拖到上限物理拖不动;高度不设限。
+            .constraints(if portrait {
+                portrait_window_constraints()
+            } else {
+                WindowConstraints {
+                    min_width: Some(layout::MIN_WINDOW_WIDTH),
+                    min_height: Some(layout::MIN_WINDOW_HEIGHT),
+                    max_width: None,
+                    max_height: None,
+                }
             });
-        if self.demo.is_none()
+        // 竖屏模式下不恢复上次的(可能超带)窗口位置——初始几何交给
+        // client_size 声明,贴边态由用户主动点钮进入。
+        if !portrait
+            && self.demo.is_none()
             && let Some(bounds) = self.settings.window
         {
             let bounds = clamp_window_bounds(bounds);
@@ -6025,6 +6155,8 @@ impl Component for AppShell {
         let title_bar = chrome::build_title_bar(
             layout,
             &self.title_bar_ref,
+            self.settings.portrait_mode,
+            context.message(Message::TogglePortraitDock),
             APP_ICON_48_PNG,
             crate::notifications::APP_DISPLAY_NAME,
             route_subtitle,
@@ -6271,6 +6403,22 @@ mod tests {
             title_bar_tier_signature(wide_b),
             "档内宽度变化不得触发补算"
         );
+    }
+
+    #[test]
+    fn portrait_window_constraints_stay_inside_bottom_bar_band() {
+        let constraints = portrait_window_constraints();
+        assert_eq!(
+            constraints.min_width,
+            Some(layout::MIN_WINDOW_WIDTH),
+            "下限沿用既有最小窗宽"
+        );
+        assert_eq!(constraints.max_width, Some(PORTRAIT_MAX_WIDTH_DIPS));
+        assert!(
+            constraints.max_width.unwrap() < crate::layout::MOBILE_BREAKPOINT,
+            "上限必须严格保持在底栏边界之内(任意 DPI 取整后仍不出带)"
+        );
+        assert!(constraints.max_height.is_none(), "高度不设限");
     }
 
     #[test]
