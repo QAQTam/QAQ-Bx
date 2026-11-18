@@ -149,6 +149,15 @@ impl ResizeStormTrack {
         }
     }
 }
+
+/// §8.2:TitleBar 内容结构档位签名——只有会改变标题栏内容结构的档位
+/// (Mobile 砍副标题/盘钮、Medium 搜索浮窗钮、Expanded 内敛搜索框)才翻签名;
+/// 档内宽度变化不翻,补算不跟每次 resize 走。
+fn title_bar_tier_signature(layout: ViewportLayout) -> u32 {
+    u32::from(layout.is_mobile())
+        | (u32::from(layout.shows_inline_title_search()) << 1)
+        | (u32::from(layout.shows_title_search_button()) << 2)
+}
 /// 设置滑块（音量/透明度）去抖落盘窗口。
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -647,6 +656,10 @@ pub struct AppShell {
     playback_avatar_timer: Option<ComponentTimer>,
     /// E14:拖框风暴计数器(见 `ResizeStormTrack`;只观测,不改路径)。
     resize_storm: ResizeStormTrack,
+    /// §8.2:TitleBar 元素句柄(声明面绑定;档位翻转时补算拖拽区)。
+    title_bar_ref: ElementRef<TitleBar>,
+    /// §8.2:上次 settled 时的内容结构档位签名(见 `title_bar_tier_signature`)。
+    title_bar_tier: u32,
     playing: bool,
     position: u32,
     mount_tick: u32,
@@ -3797,6 +3810,8 @@ impl Component for AppShell {
             playback_avatar_dirty: false,
             playback_avatar_timer: None,
             resize_storm: ResizeStormTrack::default(),
+            title_bar_ref: ElementRef::new(),
+            title_bar_tier: 0,
             playing: false,
             position: 0,
             mount_tick: 0,
@@ -4926,6 +4941,14 @@ impl Component for AppShell {
             }
             Message::WindowResizeSettled => {
                 self.close_resize_storm("settled");
+                // §8.2 收口:auto_refresh 关闭后,内容结构档位翻转不经 TitleBar
+                // 自身尺寸/属性变化;settled(150ms 静止)时新内容已渲染,这里
+                // 补算一次拖拽区。元素未发布/已退役时 reactor 侧静默忽略。
+                let tier = title_bar_tier_signature(self.viewport_layout);
+                if tier != self.title_bar_tier {
+                    self.title_bar_tier = tier;
+                    let _ = self.title_bar_ref.recompute_drag_regions();
+                }
                 self.grid_rebuild_timer = None;
                 if self.pending_grid_rebuild {
                     self.pending_grid_rebuild = false;
@@ -6001,6 +6024,7 @@ impl Component for AppShell {
         );
         let title_bar = chrome::build_title_bar(
             layout,
+            &self.title_bar_ref,
             APP_ICON_48_PNG,
             crate::notifications::APP_DISPLAY_NAME,
             route_subtitle,
@@ -6220,6 +6244,32 @@ mod tests {
         assert!(
             storm.close("settled").is_none(),
             "新风暴仅 1 拍,不足输出门槛"
+        );
+    }
+
+    #[test]
+    fn title_bar_tier_signature_tracks_content_structure_tiers() {
+        use crate::layout::{COMPACT_CONTENT_BREAKPOINT, EXPANDED_BREAKPOINT, MOBILE_BREAKPOINT};
+        // chrome 阈值(860)高于 content 阈值(600):Mobile chrome 段内仍有
+        // Compact/Medium 两个内容档,三档签名 = 1 / 5 / 2。
+        let mobile = ViewportLayout::from_window_size(COMPACT_CONTENT_BREAKPOINT - 100.0, 800.0);
+        let medium = ViewportLayout::from_window_size(MOBILE_BREAKPOINT.min(800.0) - 60.0, 800.0);
+        let expanded = ViewportLayout::from_window_size(EXPANDED_BREAKPOINT + 20.0, 800.0);
+        let signatures = (
+            title_bar_tier_signature(mobile),
+            title_bar_tier_signature(medium),
+            title_bar_tier_signature(expanded),
+        );
+        assert_ne!(signatures.0, signatures.1, "Mobile 档应翻转签名");
+        assert_ne!(signatures.1, signatures.2, "Medium→Expanded 应翻转签名");
+        assert_ne!(signatures.0, signatures.2, "Mobile→Expanded 应翻转签名");
+        // 同档不同宽(Expanded 档内加宽)不翻签名:补算不跟每次 resize 走。
+        let wide_a = ViewportLayout::from_window_size(EXPANDED_BREAKPOINT + 100.0, 800.0);
+        let wide_b = ViewportLayout::from_window_size(EXPANDED_BREAKPOINT + 260.0, 800.0);
+        assert_eq!(
+            title_bar_tier_signature(wide_a),
+            title_bar_tier_signature(wide_b),
+            "档内宽度变化不得触发补算"
         );
     }
 

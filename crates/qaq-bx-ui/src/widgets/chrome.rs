@@ -31,6 +31,7 @@ pub fn title_search_box_width(window_width: f64) -> f64 {
 #[allow(clippy::too_many_arguments)]
 pub fn build_title_bar(
     layout: ViewportLayout,
+    title_bar_ref: &ElementRef<TitleBar>,
     app_icon_png: &'static [u8],
     app_name: &str,
     route_subtitle: &str,
@@ -53,6 +54,9 @@ pub fn build_title_bar(
         // 的逐布局 pass 拖拽区全树重算;控件仍会在自身尺寸/属性变化时刷新,
         // 覆盖我们档位切换(搜索框进/出 Content)的主要路径。
         .auto_refresh_drag_regions(false)
+        // §8.2 收口:声明面挂 element_ref,shell 在内容结构档位翻转(窗口静止后)
+        // 经此句柄补算一次拖拽区,兜住不经 TitleBar 自身尺寸/属性变化的残余路径。
+        .element_ref(title_bar_ref)
         .icon(Icon::image_data(EncodedImage::from_static(app_icon_png)))
         .title(app_name)
         .subtitle(if layout.is_mobile() {

@@ -280,6 +280,14 @@
     精度未实测;拖框期 view() 重跑的实际降耗未量化(待 E14 计数器)。
   - 注记追记:`fix/titlebar-ghost-rectchanged` 已并入 reactor master
     (`7c448c1`),应用侧手动 RecomputeDragRegions 接线条件已满足(本轮未接线)。
+- **2026-11-19 §8.2 手动补算接线落地**(chrome.rs + shell.rs):TitleBar 声明面挂
+  `element_ref`(reactor `reference_methods!(TitleBar)`,generated_declarations.rs:2880),
+  AppShell 持 `ElementRef<TitleBar>`;内容结构档位签名
+  `title_bar_tier_signature`(Mobile/Medium/Expanded 三档互异)在
+  **WindowResizeSettled**(150ms 静止,新内容已渲染)比对翻转后补算一次
+  `recompute_drag_regions`——补算不跟每次 resize 走,route 副标题等 TitleBar
+  属性变化由控件自身刷新覆盖,不接。单测钉三档互异 + 档内加宽不翻签名;
+  selftest boot 实机挂载验证绑定。
 
 ## 7. 本次未验证项(诚实清单)
 
