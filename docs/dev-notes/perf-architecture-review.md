@@ -138,9 +138,8 @@
 - 影响:每次 root 尺寸变化在框架 DLL 内做一轮拖拽区几何重算(推断亚 ms 级,
   未实证);更重要的是它和 0x359595 崩溃(「卡顿数秒后闪退」)共用同一
   高频路径——拖框风暴正是「半拆除态被读 XamlRoot」的温床。
-- 建议:低成本试验 = 实测确认耗时占比;根治 = 标题栏改 `Border` 自绘 +
-  窗口集成走 `AppWindow.TitleBar.ExtendsContentIntoTitleBar` 手动设
-  drag rect(reactor 已有 WinUI 集成层,可评估)。
+- 建议:首选 §8.2 的「保留控件、关 AutoRefresh、低频手动 Recompute」
+  (半天级,性能+崩溃面同治);自绘标题栏降级为备胎。
 
 ### R6+F6 debug 包在扛日常负载 —— **白捡的 2–20×**
 - 证据:workspace `Cargo.toml` 无 `[profile]`(0 处匹配);`just dev` =
