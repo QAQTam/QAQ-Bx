@@ -645,6 +645,10 @@ pub struct AppShell {
     home_half_pane: bool,
     /// 全屏播放状态、同步代次与全局键盘隧道上下文。
     is_fullscreen: bool,
+    /// B 模式 TitleBar 句柄(view() 声明挂 element_ref,供按需重算拖拽区)。
+    title_bar_ref: ElementRef<TitleBar>,
+    /// 拖拽区重算结构指纹(路由 tag 长度/首字节、全屏、搜索展开、宽度桶):变化才补算。
+    last_title_bar_sig: Cell<(u8, u8, bool, bool, u32)>,
     fullscreen_gen: u64,
     fullscreen_sync_in_flight: bool,
     key_route_ctx: Rc<Cell<(bool, bool)>>,
@@ -3735,6 +3739,8 @@ impl Component for AppShell {
             home_focus_idx: 0,
             home_half_pane: false,
             is_fullscreen: false,
+            title_bar_ref: ElementRef::default(),
+            last_title_bar_sig: Cell::new((0, 0, false, false, 0)),
             fullscreen_gen: 0,
             fullscreen_sync_in_flight: false,
             key_route_ctx,
@@ -5908,7 +5914,21 @@ impl Component for AppShell {
             context.message(Message::SearchSubmitted),
             context.message(Message::ToggleSearchOverlay),
             context.message(Message::OpenNotifications),
+            &self.title_bar_ref,
         );
+        // B 模式重算口:结构指纹变化(路由/全屏/搜索展开/宽度桶)时按需补算一次
+        // 拖拽区;imperative 队列跑在本轮 reconcile 之后,元素必已发布。
+        let tag = self.route.tag();
+        let sig = (
+            tag.len() as u8,
+            tag.as_bytes().first().copied().unwrap_or(0),
+            self.is_fullscreen,
+            self.search_overlay_open,
+            (layout.window_width / 64.0).max(0.0) as u32,
+        );
+        if self.last_title_bar_sig.replace(sig) != sig {
+            let _ = self.title_bar_ref.recompute_drag_regions();
+        }
 
         if is_mobile {
             let content_host = Grid::new().grid_row(1).keyed_children({

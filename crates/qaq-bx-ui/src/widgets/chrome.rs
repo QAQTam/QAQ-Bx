@@ -46,9 +46,15 @@ pub fn build_title_bar(
     on_search_submit: Callback<()>,
     on_toggle_search_overlay: Callback<()>,
     on_open_notifications: Callback<()>,
+    reference: &ElementRef<TitleBar>,
 ) -> TitleBar {
     let mut bar = TitleBar::new()
         .preferred_height(WindowTitleBarHeight::Tall)
+        // 上游风暴规避(QAQ-Bx docs/dev-notes/crash-0x359595-xamlroot.md §8.4-B):
+        // 关闭 AutoRefresh 后 TitleBar 仅首帧算一次拖拽区即退订 LayoutUpdated,
+        // 结构变化改由 AppShell 经 reference 按需 RecomputeDragRegions 一次。
+        .auto_refresh_drag_regions(false)
+        .element_ref(reference)
         .icon(Icon::image_data(EncodedImage::from_static(app_icon_png)))
         .title(app_name)
         .subtitle(if layout.is_mobile() {

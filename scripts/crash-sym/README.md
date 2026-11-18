@@ -24,17 +24,31 @@ python scripts/crash-sym/symbolize.py <dll> 359595 --disasm     # 反汇编故�
 - 原理:纯 Python 解析 MSF 7.00(PDB)流目录 → DBI → publics 记录链
   (S_PUB32,本仓库适配的布局为 flags(4)+off(4)+sect(2)+name),全程无 SDK。
 
-## 配套:崩溃转储捕获(已配置,2026-11-18)
+## 配套:崩溃转储捕获(HKLM,已实测生效,2026-11-18 23:00)
 
-WER LocalDumps(HKCU,用户级,无需管理员)已为 `qaq-bx-ui.exe` 开启:
+**HKCU LocalDumps 对打包应用无效**(三次真实崩溃均 `EtwNonCollectReason=1`、
+零 dump)。官方文档确认 LocalDumps 只读 HKLM 且需管理员。已配置:
 
 ```powershell
-reg query "HKCU\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\qaq-bx-ui.exe"
-# DumpFolder = D:\QAQ-Bx\data\crash-dumps   DumpType = 2(full)   DumpCount = 10
+# HKLM\...\Windows Error Reporting\LocalDumps\qaq-bx-ui.exe
+#   DumpFolder = D:\QAQ-Bx\data\crash-dumps  DumpType = 2(full)  DumpCount = 10
+# 写入脚本(需 UAC):setup-hklm-localdumps.ps1
+# 目录 ACL(打包进程 AppContainer 落盘必需,用户级即可):
+#   icacls D:\QAQ-Bx\data\crash-dumps /grant *S-1-15-2-2:(OI)(CI)M
 ```
 
-下一次任何原生崩溃都会在此目录留下完整 .dmp;时间戳与 `data/ui-trace.log`
-(页面切换轨迹)配对即可还原现场。拿到 dump 后用 WinDbg/cdb 打开:
+链路已用 `capture_gate.rs` 受控自崩实测打通(0.2.0.13):dump 命名
+`qaq-bx-ui.exe.<pid>.dmp`;时间戳与包内 `ui-trace.log`
+(`%LOCALAPPDATA%\Packages\QAQ-Bx-Dev_ptzv47e0cg1m0\LocalCache\Local\QAQ-Bx\data\`)
+配对即可还原现场。拿到 dump 先粗读(无依赖):
+
+```powershell
+python scripts/crash-sym/minidump-info.py data/crash-dumps/qaq-bx-ui.exe.<pid>.dmp
+```
+
+打印异常码/ExceptionAddress/故障模块+RVA。**坑**:线程 CONTEXT 的 Rip 可能是
+WerFault 交接点(实测在 ntdll),以 ExceptionStream 的 ExceptionAddress 为准。
+故障 RVA 可直接喂 symbolize.py(本地 PDB 用 `--cache target/debug`)。再用 WinDbg/cdb 深挖:
 
 ```
 !sym noisy; .reload; !analyze -v   (符号: srv*D:\qaqh-sym*https://msdl.microsoft.com/download/symbols)

@@ -4,6 +4,7 @@
 #![cfg_attr(not(feature = "selftest"), windows_subsystem = "windows")]
 
 mod auth;
+mod capture_gate;
 mod codec;
 mod data;
 mod demo;
@@ -80,6 +81,10 @@ fn main() {
         std::process::id(),
         std::env::args().collect::<Vec<_>>()
     ));
+    // WER LocalDumps 链路自检:数据目录存在哨兵文件时主动 AV(见模块注释)。
+    if capture_gate::requested(&qaq_bx_core::resolve_data_dir()) {
+        capture_gate::fire();
+    }
     let _identity = notifications::init_process_identity();
     if let Err(err) =
         windows_reactor::App::run_component::<shell::AppShell>(shell::ShellInput::default())

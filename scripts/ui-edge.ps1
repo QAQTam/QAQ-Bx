@@ -855,3 +855,50 @@ try {
 }
 
 Write-Host "[done] 极端场景走查完成，截图位于 $FramesDir" -ForegroundColor Green
+
+# ---------- 场景 E16:退出全屏→拖拽标题栏风暴(0x359595 幽灵回调修复回归,§8.4) ----------
+if (Should-RunScenario "E16") {
+Write-Host "[E16] 退出全屏后立刻拖拽标题条 20 次(WindowRectChanged 幽灵路径防护)" -ForegroundColor Cyan
+$env:QAQ_BX_VIDEO = "BV1GJ411x7h7"
+$dumpDir = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) "data\crash-dumps"
+$dumpBefore = @(Get-ChildItem $dumpDir -Filter "qaq-bx-ui.exe.*.dmp" -ErrorAction SilentlyContinue).Count
+$proc = $null
+try {
+    $proc = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -PassThru
+    $hwnd = Wait-MainWindow $proc
+    Start-Sleep -Milliseconds 4200 # 等媒体解析与首帧(同 E10)
+
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    $fsBtn = Find-PlayerFullscreenButton -Root $root
+    if (-not $fsBtn) { throw "E16 FAIL: 播放页未定位到全屏按钮" }
+    $fsBtn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Start-Sleep -Milliseconds 600
+    Assert-FullscreenBounds -Hwnd $hwnd -StepName "进入全屏"
+    $exitBtn = Find-HudExitButton -Root $root
+    if (-not $exitBtn) { throw "E16 FAIL: HUD 未展示退出全屏按钮" }
+    $exitBtn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+
+    # 退出全屏后立刻真实鼠标拖框(经 user32 modal 循环,复现死亡窗口事件风暴)。
+    for ($i = 1; $i -le 20; $i++) {
+        $g = Get-WindowGeometry -Hwnd $hwnd
+        # 起点取右侧副标题空带(避开左侧返回/分栏按钮与系统按钮簇),y 在 Tall 标题条内
+        $grabX = $g.X + $g.W - 320
+        $grabY = $g.Y + 24
+        $dx = if ($i % 2) { 420 } else { -420 }
+        Drag-WindowEdge -StartX $grabX -StartY $grabY -EndX ($grabX + $dx) -EndY $grabY
+        if ($proc.HasExited) { throw "E16 FAIL: 拖框 #$i 进程退出(exit=$($proc.ExitCode)),幽灵回调路径回归" }
+    }
+    Start-Sleep -Milliseconds 600
+    if ($proc.HasExited) { throw "E16 FAIL: 进程迟滞退出(exit=$($proc.ExitCode))" }
+    $g2 = Get-WindowGeometry -Hwnd $hwnd
+    if ([Math]::Abs($g2.X - $g.X) -lt 40) {
+        Write-Host "[E16] 注意:拖框后窗口位移不显著($($g.X)→$($g2.X)),拖拽可能未命中可拖区(桌面非前台?)" -ForegroundColor Yellow
+    }
+    $dumpAfter = @(Get-ChildItem $dumpDir -Filter "qaq-bx-ui.exe.*.dmp" -ErrorAction SilentlyContinue).Count
+    if ($dumpAfter -ne $dumpBefore) { throw "E16 FAIL: 拖框过程新增崩溃 dump($dumpBefore→$dumpAfter)" }
+    Write-Host "[E16] PASS: 退出全屏→20 次标题条拖框,进程存活、无新 dump" -ForegroundColor Green
+} finally {
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+    Remove-Item Env:QAQ_BX_VIDEO -ErrorAction SilentlyContinue
+}
+}

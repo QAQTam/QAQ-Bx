@@ -52,4 +52,53 @@
   顺带:E10 全屏二次进入断言失败(用户在途 engine.rs 重构相关,另行排查);
   有并行编辑(用户 IDE)曾致 player.rs/engine.rs 编译错误,已由用户自行修复。
   workspace 测试全绿(core 56/ui 60/video 9)。
+- 追加 3(22:39,第三次崩溃):0.2.0.12(11:47Z 构建)再次同偏移 0x359595
+  (WER `AppCrash_QAQ-Bx-Dev_0.2.0_5c939a...6ac20c1e`,BucketId 8b0d44f2…)。
+  **HKCU LocalDumps 对打包应用无效**(EtwNonCollectReason=1,无 dump 落袋)——
+  需 HKLM 管理员项或改测打包外运行;打包应用的 ui-trace.log 写到包内 LocalState
+  (%LOCALAPPDATA%\Packages\QAQ-Bx-Dev_ptzv47e0cg1m0\…),22:39 崩溃前的面包屑在
+  那里,先翻它。详见 docs/dev-notes/crash-0x359595-xamlroot.md §4.5/§4.6。
+- 追加 4(23:0x,**dump 捕获链路已实测打通**):HKCU 确被打包应用忽略(官方文档
+  确认 LocalDumps 只认 HKLM)。已经用户 UAC 授权写入 HKLM LocalDumps 三值
+  (脚本 `scripts/crash-sym/setup-hklm-localdumps.ps1`),转储目录补
+  ALL APPLICATION PACKAGES 写 ACL(打包进程 AppContainer 落盘必需,零成本预防)。
+  新增 `capture_gate.rs`(常开;数据目录哨兵文件 `selftest-av.flag` 触发,绕开
+  打包应用不带参的限制;单测 2 项覆盖触发判定)→ just dev 出 0.2.0.13 安装 →
+  放 flag → 拉起 → **0xC0000005(写空指针)崩溃,88MB full dump 落
+  `data/crash-dumps/qaq-bx-ui.exe.14744.dmp`**;用新工具
+  `scripts/crash-sym/minidump-info.py` 纯 Python 解析(exception 流字段序为
+  EXCEPTION_RECORD 序:addr@+16,非 MS 头声明顺序),故障 RVA 0x19054c 用本地
+  PDB 符号化 = `capture_gate::fire+0xDC`,证据链完全自洽。flag 已删,回归启动
+  无误触发。**现在唯一等的是下一次自然崩溃的真实 dump。**
+  现场面包屑另证:22:39 崩溃会话仅存活 169 秒、零 route 事件(崩在默认路由,
+  没进播放器)——§4.7 已修正嫌疑面;19 点档的 `AppCrash_qaq_bx_ui-f3580a` 群
+  为 cargo 测试 harness 崩溃,与本案无关。
+- 追加 5(23:1x,**根因闭环 §8**):用户给出确定性复现(全屏退出→立刻拖窗→卡死
+  →崩)并触发真崩溃,pid 10476 落 1.0GB full dump。栈走查
+  (`scripts/crash-sym/minidump-stackscan.py` 新工具)实锤调用链 =
+  `TitleBar::OnWindowRectChanged→UpdateIconRegion→GetInputNonClientPointerSource
+  →GetAppWindowId→XamlRoot()@RVA 0x359595`(同三次历史崩溃同指令)。
+  **主因=上游 TitleBar::UpdateIcon 用裸 this 订阅窗口级
+  InputNonClientPointerSource.WindowRectChanged 且 ~TitleBar() 不撤销**
+  (main@11-17 仍未修;撤销唯一门=IconSource 置 null)→ TitleBar 死后
+  拖框事件回调幽灵对象。**共因=reactor 硬编码
+  `SetAutoRefreshDragRegions(true)`(fork window/mod.rs:636)布局风暴**(同事
+  0.4.0 前瞻分析证实,对应「卡死」;RecomputeDragRegions 逃生舱 2.6.5 二进制
+  实测存在,bindings.txt 需补方法绑定——put_ 半边已在:157)。
+  app 触发面:chrome.rs:52 设 icon + shell.rs 双组合结构切换 retire TitleBar。
+  探针未测出的原因:探针持强引用,对象从未死亡。
+  修复三件套(§8.4,待落地):A[fork 治本]退役前 SetIconSource(null)+
+  SetTitleBar(null);B[fork+app]翻 AutoRefresh=false + 手动 Recompute
+  (路由/档位/resize settle);C[上游 issue 要素已齐]+ ui-edge E12 回归
+  (全屏→退出→连移窗口 20 次)。E10 与本缺陷同窗,预期修好一并转绿。
+- 追加 6(23:5x,**A+B 已落地,待复现裁决**):fork 分支
+  `fix/titlebar-ghost-rectchanged` 两个 commit(1ac775d: clear 前
+  SetIconSource(null) 走官方撤销门 + bindings 补 ITitleBar2::RecomputeDragRegions
+  + ImperativeRequest/ElementRef 贯通,347 绿;68fb482: schema reference=true
+  使 TitleBar 声明可挂 element_ref)。app:chrome 声明 false、shell view() 结构
+  指纹变化按需重算。线程取证:崩溃线程=user32 帧最多的 UI 线程(跨线程候选排除)。
+  已装 0.2.0.15(工作树含用户 v0.3 在途;bin 绿,cargo test 的 10 个编译错误全部
+  来自用户 shell.rs test block 未完成的 EngineSwitchAction,与本修复无关)。
+  **待用户跑复现步骤裁决;E16(ui-edge)已入库;C(upstream issue)待写。**
+
 

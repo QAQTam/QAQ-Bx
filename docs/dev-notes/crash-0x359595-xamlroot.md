@@ -1,7 +1,12 @@
 # 崩溃根因分析:Microsoft.UI.Xaml.Controls.dll RVA 0x359595(0xC0000005)
 
 > 记录时间:2026-11-18。分析人:QAQ(自动化会话)。
-> 结论状态:**故障指令已定位并符号化;触发链需要下一次崩溃的完整转储才能闭环**(转储捕获已布好)。
+> 结论状态:**根因已闭环(§8)**——用户给出确定性复现步骤(全屏退出后立刻拖窗),
+> 真实 dump 栈实锤调用链 `TitleBar::OnWindowRectChanged→UpdateIconRegion→
+> GetInputNonClientPointerSource→GetAppWindowId→XamlRoot()@0x359595`;
+> 主因=上游 TitleBar `WindowRectChanged` 订阅泄漏(析构不撤销→幽灵回调),
+> 共因=reactor 硬编码 `AutoRefreshDragRegions(true)` 的布局风暴。
+> 修复与上报方案见 §8.4。
 
 ## 1. 现象与事件
 
@@ -131,19 +136,89 @@ PipsPager/…)折叠到同一函数体,因此**不能**凭 public 名锁定是�
    engine.rs 重构相关,另有会话在编辑 player.rs/engine.rs(曾致编译错误,
    已由其自行修复,未代劳)。
 
+## 4.7 崩溃账本与 22:39 现场面包屑(2026-11-18 夜,包内数据目录取证)
+
+打包应用 `resolve_data_dir()` 实际落在
+`%LOCALAPPDATA%\Packages\QAQ-Bx-Dev_ptzv47e0cg1m0\LocalCache\Local\QAQ-Bx\data\`,
+仓库 `D:/QAQ-Bx/data` 对它无效。该目录里的 `ui-trace.log` 即崩溃现场记录。
+
+**完整崩溃账本**(WER ReportArchive,时间均为本地 UTC+8):
+
+| 报告 | 版本 | 时间 | 故障模块/偏移 | dump |
+|---|---|---|---|---|
+| e11119c1 | 0.2.0.2 | 11-17 22:36:34 | Microsoft.UI.Xaml.Controls.dll 3.3.0.0 + 0x359595 (c0000005) | 无(EtwNonCollectReason=1) |
+| d7158897 | 0.2.0.6 | 11-18 05:44:53 | 同上,同偏移(PE 时间戳 6afc9e23) | 无 |
+| 6ac20c1e | 0.2.0.12 | 11-18 22:39:08 | 同上,同偏移(PE 时间戳 6afd9061) | 无 |
+
+三份报告 `LoadedModule` 无 dump 附件;`data/crash-dumps\` 与 WER 全目录零 `.dmp`。
+
+**22:39 崩溃现场(ui-trace.log + 文件 mtime 配对)**:
+
+- 22:36:19.981 app start pid=9240(0.2.0.12)→ 22:39:08 崩溃,**存活仅 ~169 秒**;
+- 该会话 **零条 route 事件**——用户没有进入播放页,崩在启动后的默认路由上;
+  上一条 route(打开视频)属于当天上午的 0.2.0.7 会话,与本次崩溃无关;
+- 22:37 settings.json 被重写一次(会话内某设置落盘或自动保存),随后崩溃;
+- 同日 0.2.0.9 会话(17:46 启动)也只有 app start 一条、无 route,但正常退出无报告。
+
+**推论修正**:此前 §4 把「播放页高频创建销毁 + 半屏/全屏切换」当主嫌疑场景;
+本次数据显示崩溃可以在**完全不进播放器**的首页/窗口集成场景下发生。嫌疑面应
+维持 §4.5 的两条(TitleBar 属性/布局风暴、首页 ScrollPresenter 布局路径)且不再
+偏向播放器侧。候选 (a) UAF / (b) 框架内部跨线程续体 的区分仍然只能靠 dump。
+
+**排除噪声**(防误判):
+
+- 11-17 15:24 的 0.0.1 报告(`AppCrash_QAQ-Bx-Dev_0.0.1_*`)+包内 `crash.log`:
+  Rust「panic in a function that cannot unwind」abort,栈含
+  WinUICreateDispatcherQueueController——另一条独立旧事故,与 0x359595 无关;
+- 11-18 19:01–19:06 的 6+ 份 `AppCrash_qaq_bx_ui-f3580a_*`:崩溃模块是 cargo
+  **测试 harness exe**(`target\debug\build\qaq-bx-ui\f3580a93b0123191\out\*.exe`,
+  即 `cargo test -p qaq-bx-ui` 的运行体,本次跑测试复核确认同一路径),
+  故障偏移发散(0x34c36/0x3b9fc/0x3411f4/0x4ebda…),非同一故障点,与打包应用
+  AV 无关(疑为并行编辑会话期间的失败测试运行)。
+
 ## 5. 已布置的捕获与工具(本仓库)
 
-1. **WER LocalDumps(已生效)**:`HKCU\...\LocalDumps\qaq-bx-ui.exe`
-   → `D:\QAQ-Bx\data\crash-dumps`,DumpType=2(full),DumpCount=10。
-   下一次崩溃(哪怕再隔一周)会自动留完整 dump。
+1. **WER LocalDumps(HKLM,2026-11-18 22:54 已写入并回读确认)**:`HKCU\...\LocalDumps\qaq-bx-ui.exe`
+   已配置但**对打包(MoAppCrash)应用被忽略**——三次崩溃的报告全部带
+   `EtwNonCollectReason=1`。官方文档(Collecting User-Mode Dumps)确认该特性
+   仅读 `HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps`,
+   需管理员权限。HKLM 三值已由提权脚本写入(脚本入库
+   `scripts/crash-sym/setup-hklm-localdumps.ps1`):`DumpFolder`
+   (REG_EXPAND_SZ, `D:\QAQ-Bx\data\crash-dumps`)、`DumpType=2`、`DumpCount=10`。
+   转储目录 ACL 已补:`icacls D:\QAQ-Bx\data\crash-dumps /grant *S-1-15-2-2:(OI)(CI)M`
+   (打包进程在 AppContainer 内写目录所需,文档明确提示)。
+   无需管理员的兜底方案:procdump `-ma -e -w qaq-bx-ui.exe` 常驻监视(Dev Mode
+   已开,同用户 attach 可行),可挂计划任务;若 HKLM 方案对 MoAppCrash 仍不生效则启用。
+   **HKLM 方案已实测对 MoAppCrash 生效(见 §5.4 自检),procdump 兜底不再需要。**
 2. **UI 轨迹日志**:`crates/qaq-bx-ui/src/trace.rs` → `data/ui-trace.log`,
    记录 app start + 全部 11 处 route 切换(带来源标注),512KiB 上限截断;
    与 dump 时间戳配对还原现场。
 3. **符号化工具**:`scripts/crash-sym/symbolize.py`(用法见该目录 README),
    已用本案例验证:输入模块路径 + 偏移即可输出故障符号与反汇编。
+   配套新增 `scripts/crash-sym/minidump-info.py`:纯 Python 粗读 full dump
+   (异常码/ExceptionAddress/故障模块+RVA/崩溃线程栈范围),自检实测可用。
+4. **捕获链路自检门**:`crates/qaq-bx-ui/src/capture_gate.rs`(常开,无特性门控;
+   触发条件是数据目录哨兵文件 `selftest-av.flag`,非命令行参数,绕开打包应用
+   激活不带参的限制)。命中后 UI 启动前 `write_volatile` 空指针写 → 0xC0000005,
+   与线上崩溃同异常码、同 WER 路径。单元测试覆盖触发判定(2 项)。
+   用法:`touch '<包LocalCache>/QAQ-Bx/data/selftest-av.flag'` → 启动应用 →
+   检查 `D:\QAQ-Bx\data\crash-dumps\*.dmp` → **删除哨兵文件**。
+   **2026-11-18 23:00 实测通过(0.2.0.13)**:flag → 崩溃 → WER 落
+   `qaq-bx-ui.exe.14744.dmp`(full,88MB);exception 流 code=0xc0000005、
+   info[0]=1(写)、info[1]=0(空指针),故障 RVA=0x19054c,本地 PDB 符号化
+   `capture_gate::fire+0xDC`——全链路自洽。删 flag 后回归启动正常(无误触发)。
+   dump 命名规律:`<exe名>.<pid>.dmp`,DumpCount=10 滚动覆盖。
+   本次自检 dump 已改名留证:
+   `data/crash-dumps/SELFTEST-PROOF-2026-11-18-qaq-bx-ui.exe.14744.dmp`
+   (真实崩溃 dump 到达时不会与此混淆)。
 
 ## 6. 下一步(拿到 dump 后)
 
+0. 先用本机无依赖工具粗读:`python scripts/crash-sym/minidump-info.py <dmp>`
+   ——打印异常码/ExceptionAddress/故障模块+RVA/崩溃线程。
+   **坑(自检实测)**:线程 CONTEXT 里的 Rip 可能不是故障点——WerFault 落盘时
+   该线程已停在 WER 交接路径(实测 Rip 指向 ntdll);**以 ExceptionStream 的
+   ExceptionAddress 为准**。
 1. `data/crash-dumps/*.dmp` → WinDbg `!analyze -v`(符号路径
    `srv*D:\qaqh-sym*https://msdl.microsoft.com/download/symbols`)。
 2. 读故障线程栈:确认调用方(哪个框架子系统:Tooltip/Popup/Focus/
@@ -158,6 +233,104 @@ PipsPager/…)折叠到同一函数体,因此**不能**凭 public 名锁定是�
 ## 7. 本次未验证项
 
 - 未能确认崩溃时用户正在哪个页面(无轨迹日志的历史数据)。
+  【已由 §4.7 部分解决:0.2.0.12 崩溃会话零 route 事件;§8 起有 100% 复现步骤】
 - 未尝试主动复现(用户明确说复现难;优先布好捕获而非盲试)。
+  【已失效:2026-11-18 23:08 用户提供确定性复现步骤,见 §8】
 - GUID `c3c01020-320c-5cf6-9d24-d396bbfa4d8b` 对应的具体 WinRT 接口
   版本未确认(不影响结论,拿到 dump 后自然明确)。
+
+## 8. 根因闭环(2026-11-18 23:08,真实崩溃 dump + 栈走查 + 上游源码对齐)
+
+**复现步骤(用户提供,确定性)**:全屏播放 → 退出全屏 → 立刻拖动窗口移动位置
+→ 卡死 → 崩溃。dump 已捕获:`data/crash-dumps/qaq-bx-ui.exe.10476.dmp`
+(0.2.0.13,full,1.0GB)。
+
+### 8.1 dump 证据
+
+- exception: `0xc0000005` **读 NULL**(info[0]=0, info[1]=0x0),
+  故障 `Microsoft.UI.Xaml.Controls.dll RVA 0x359595`(PE_ts 8b577a7c,
+  与 0.2.0.2/0.2.0.6/0.2.0.12 三次历史崩溃**同指令同偏移**);Rip==ExceptionAddress,
+  崩溃线程 9248(UI 线程)。
+- 启发式栈走查(`scripts/crash-sym/minidump-stackscan.py` + 本地缓存 PDB 符号化),
+  故障点向外的调用链(sp 从低到高 = 子→父):
+
+  | sp | 模块内 RVA | 符号(最近 public) |
+  |---|---|---|
+  | fault | 0x359595 | `consume_IUIElement<D>::XamlRoot()`(§3 故障指令) |
+  | +0x0058 | 0x4cb733 | `TitleBar::GetAppWindowId+0x1F` |
+  | +0x0098 | 0x4cbb43 | `TitleBar::GetInputNonClientPointerSource+0x27` |
+  | +0x00F8 | 0x4ceebe | `TitleBar::UpdateIconRegion+0x22` |
+  | +0x0118 | 0x4cd65a | `TitleBar::OnWindowRectChanged+0x1A` |
+
+  → 调用链逐字对应上游源码
+  `OnWindowRectChanged → UpdateIconRegion → GetInputNonClientPointerSource
+  → GetAppWindowId → XamlRoot()`(controls/dev/TitleBar/TitleBar.cpp)。
+
+### 8.2 上游缺陷(主因):`WindowRectChanged` 订阅泄漏 → 幽灵回调
+
+main@2026-11-17 与 2.6.5 二进制同构,源码事实:
+
+1. `UpdateIcon()`(设 IconSource 时)用**裸 this** 订阅
+   `InputNonClientPointerSource.WindowRectChanged({this,&TitleBar::OnWindowRectChanged})`,
+   **非 auto_revoke**;
+2. 撤销的唯一门 = 再次进 `UpdateIcon` 且 IconSource 为空(else 分支 revoke token);
+3. **`~TitleBar()` 不撤销 `m_windowRectChangedToken`**(它只 revoke
+   size/flowDirection/InputActivation);
+4. 事件源 `InputNonClientPointerSource` 是**窗口级系统对象,寿命 ≫ TitleBar**
+   ⇒ TitleBar 析构(或析构中)后事件仍回调死 this;
+5. 幽灵回调走到 `GetAppWindowId` 里的 `XamlRoot()`:source 层
+   `if (auto xamlRoot = XamlRoot())` 的判空**救不了**——炸点在 winrt
+   consume 生成模板内部(§3 反汇编:成员判空后的空分支错误 fall-through +
+   QI HRESULT 未检查即解引用),对象半拆除时成员槽已清零 ⇒ AV。
+
+### 8.3 我们的放大器(共因,非直接肇因)
+
+- **reactor fork 硬编码** `SetAutoRefreshDragRegions(true)`
+  (`crates/libs/reactor/src/native/winui/window/mod.rs:636`,`put_` 半边绑定
+  已在 `bindings.txt:157`):LayoutUpdated 常驻订阅,每次布局 pass 全子树遍历
+  `UpdateInteractableElementsList` + 逐元素 `GetBounds`(内含 XamlRoot)
+  —— 拖框 60~125Hz 事件风暴下 CPU 打满 = 用户感知的「卡顿/卡死」;
+  同时放大在鬼对象上执行代码的窗口期。同事 0.4.0 前瞻锁定的正是这一半。
+- **app 触发面**:`chrome.rs:52` 设了应用图标(订阅门成立);
+  `shell.rs` 存在两套含 title_bar 的组合结构,结构切换 + reactor 延迟
+  fade-out retirement 制造「TitleBar 正死、RectChanged 正来」的窗口。
+- 为什么探针没测出(§4.6):探针持强引用、对象从未死亡;幽灵需要
+  「TitleBar 先死 + 事件源活着」这个探针未覆盖的组合。
+
+### 8.4 修复方案(分层;A 是断头, B/C 降概率与去风暴)
+
+**落地状态(2026-11-18 23:5x)**:A+B 已实现,打包 **0.2.0.15** 已安装待复现验证;
+C 未动。fork 分支 `fix/titlebar-ghost-rectchanged`(基于同事 335c541):
+`1ac775d`(撤销门+Recompute 贯通,347 测试绿)、`68fb482`(TitleBar 声明面补
+element_ref)。app 侧:chrome.rs 声明 `auto_refresh_drag_regions(false)`+挂引用;
+shell.rs view() 结构指纹(路由/全屏/搜索展开/宽度桶)变化时按需 Recompute 一次
+——imperative 队列跑在 reconcile 后,元素必已发布。回归场景 **E16**(ui-edge:
+全屏→退出→真鼠标拖标题条×20,断言存活+无新 dump)。回滚=fork/主仓各自
+checkout 丢弃(同事 WIP 已安全在 master)。
+
+- **A[fork,治本]**:reactor 释放/退役 TitleBar 投影前,显式
+  `SetIconSource(null)`(走官方撤销门)+ `window.SetTitleBar(null)`,再放引用。
+  上游修复(destructor 改 auto_revoke revoker)落地前这是唯一可靠防护。
+- **B[fork+app,治「卡顿」]**:翻默认 `AutoRefreshDragRegions=false`;
+  `bindings.txt` 增补 `ITitleBar2::RecomputeDragRegions`(实测 2.6.5 二进制存在,
+  PDB/DLL 符号确认;当前 bindings.rs 0 命中)→ tool-reactor 再生 →
+  app 仅在路由切换/档位翻转/WindowResizeSettled 手动 Recompute 一次。
+  窗口移动本身不改 Content 相对矩形,无需重算——正好掐掉拖框风暴。
+- **C[上游 issue,要素齐备]**:标题建议
+  "TitleBar leaks WindowRectChanged subscription; callback into destroyed
+  TitleBar crashes in consume_IUIElement::XamlRoot (unchecked QI HRESULT)";
+  附:复现步骤(全屏退出后立刻拖窗,打包应用 WinAppSDK 2.6.5/OS 26300)、
+  §8.1 栈表、§3 反汇编、源码引文(§8.2)、dump 可复现符号化命令。
+  修复建议:成员化 `winrt::auto_revoke` revoker 或 destructor revoke。
+- **回归测试**:ui-edge 新场景 E12:全屏→退出→`MoveWindow` 连续 20 次
+  (间隔 ≤100ms)→ 断言进程存活 + 窗口位置生效 + 无 UI 线程挂起;
+  当前 E10(全屏二次进入)失败与本案同窗,修好后应一并转绿。
+
+### 8.5 归因终版(替代 §4 表)
+
+| 假设 | 判定 |
+|---|---|
+| 我们代码直接越界 | 排除(故障在框架 DLL,调用方也是框架 handler) |
+| reactor 硬编码 AutoRefresh=true | **成立,共因/放大器**(卡顿风暴 + 扩大死亡窗口暴露面) |
+| WinAppSDK 2.6 TitleBar 订阅泄漏 | **成立,主因**(dump 栈 + 源码双重实锤,main 分支至 2026-11-17 仍未修) |
+| consume_IUIElement::XamlRoot 防御缺失 | 成立,次要(bad-null fall-through + QI 未检查) |
