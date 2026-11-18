@@ -6174,7 +6174,12 @@ impl Component for AppShell {
         );
 
         if is_mobile {
-            let content_host = Grid::new().grid_row(1).keyed_children({
+            // iOS 26 悬浮底栏:内容跨行铺到 row1+row2,底栏胶囊浮在内容
+            // 之上——composition backdrop 采样到的才是滚动内容(玻璃有物可折)。
+            let content_host = Grid::new()
+                .grid_row(1)
+                .grid_row_span(2)
+                .keyed_children({
                 let mut layers = if self.route == Route::Player {
                     vec![
                         keyed("home", self.home_view(context)),
@@ -6231,7 +6236,11 @@ impl Component for AppShell {
 
             let shell_root = Grid::new()
                 .rows([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
-                .children((title_bar, content_host, bottom_bar.grid_row(2)));
+                .children((
+                    title_bar,
+                    content_host,
+                    Grid::new().grid_row(2).children((bottom_bar,)),
+                ));
 
             return Border::new()
                 .on_preview_key_down(self.global_key_handler.clone())

@@ -63,6 +63,42 @@ fn main() {
             "Microsoft.Windows.AppNotifications.AppNotificationManager.Unregister",
             "Microsoft.Windows.AppNotifications.AppNotificationManager.NotificationInvoked",
             "Microsoft.Windows.AppNotifications.AppNotificationActivatedEventArgs",
+            // 液态玻璃(iOS 26 风格)路线 0:stock composition effect graph
+            // (Compositor 效果刷 + 圆角 ShapeVisual;经 fork imperative
+            // SetCompositionChildVisual 垫到底栏内容网格之下)。
+            "Microsoft.UI.Composition.Compositor.CreateBackdropBrush",
+            "Microsoft.UI.Composition.Compositor.CreateColorBrush",
+            "Microsoft.UI.Composition.Compositor.CreateSpriteVisual",
+            "Microsoft.UI.Composition.Compositor.CreateContainerVisual",
+            "Microsoft.UI.Composition.ContainerVisual.Children",
+            "Microsoft.UI.Composition.IVisualCollection.InsertAtBottom",
+            "Microsoft.UI.Composition.Compositor.CreateGeometricClip",
+            "Microsoft.UI.Composition.CompositionGeometricClip.Geometry",
+            "Microsoft.UI.Composition.Visual.Clip",
+            "Microsoft.UI.Composition.CompositionColorBrush",
+            "Microsoft.UI.Composition.CompositionColorBrush.Color",
+            "Microsoft.UI.Composition.SpriteVisual.Brush",
+            "Microsoft.UI.Composition.CompositionEffectSourceParameter",
+            "Microsoft.UI.Composition.ICompositionEffectSourceParameterFactory",
+            "Windows.Foundation.PropertyValue.CreateSingle",
+            "Windows.Foundation.PropertyValue.CreateUInt32",
+            "Microsoft.UI.Composition.Compositor.CreateEffectFactory",
+            "Microsoft.UI.Composition.Compositor.CreateShapeVisual",
+            "Microsoft.UI.Composition.Compositor.CreateSpriteShape",
+            "Microsoft.UI.Composition.Compositor.CreateRoundedRectangleGeometry",
+            "Microsoft.UI.Composition.CompositionEffectFactory.CreateBrush",
+            "Microsoft.UI.Composition.CompositionEffectBrush.SetSourceParameter",
+            "Microsoft.UI.Composition.CompositionPropertySet.InsertScalar",
+            "Microsoft.UI.Composition.CompositionPropertySet.InsertColor",
+            "Microsoft.UI.Composition.Visual.Size",
+            "Microsoft.UI.Composition.ShapeVisual.Shapes",
+            "Microsoft.UI.Composition.CompositionSpriteShape.Geometry",
+            "Microsoft.UI.Composition.CompositionSpriteShape.FillBrush",
+            "Microsoft.UI.Composition.CompositionRoundedRectangleGeometry.Size",
+            "Microsoft.UI.Composition.CompositionRoundedRectangleGeometry.CornerRadius",
+            // 注:Microsoft.UI.Composition.Effects 效果结构体(GaussianBlur 等)
+            // 不在 fork curated winmd 中(阶段 2 模糊需手工实现 IGraphicsEffect,
+            // 见 widgets/glass.rs 文档)。
         ])
         .write();
 }

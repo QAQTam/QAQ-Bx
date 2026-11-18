@@ -1099,6 +1099,7 @@ dependencies = [
  "windows-canvas",
  "windows-collections",
  "windows-core",
+ "windows-numerics",
  "windows-reactor",
  "windows-reactor-setup",
  "windows-reference",

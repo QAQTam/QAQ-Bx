@@ -249,12 +249,16 @@ pub fn floating_search_layers(
 }
 
 /// Android Material 3 × Fluent Mobile 底部 5-Tab 导航栏（推荐 / 热门 / 搜索 / 我的 / 更多）。
+///
+/// iOS 26「悬浮液态玻璃」形态：脱离边缘的悬浮胶囊 + `widgets::glass` 的
+/// composition 玻璃宿主（胶囊内容由 `GlassBar` 组件承载,backdrop/tint
+/// 圆角视觉垫到 Tab 行之下,见 `widgets/glass.rs`）。
 pub fn compact_bottom_bar(
     active_route: Route,
     more_open: bool,
     on_navigate: impl Fn(Route) -> Callback<()> + Clone,
     on_toggle_more: Callback<()>,
-) -> Grid {
+) -> View {
     let primary: [(Route, &str); 4] = [
         (Route::Home, "推荐"),
         (Route::Popular, "热门"),
@@ -336,22 +340,35 @@ pub fn compact_bottom_bar(
 
     children.push(tab_btn(4, Symbol::More, "更多", more_active, on_toggle_more).into());
 
+    use crate::widgets::glass::{capsule, GlassBar, GlassBarInput};
     Grid::new().children((Border::new()
-        .height(64.0)
-        .background(ThemeBrush::CardBackground)
+        .height(capsule::HEIGHT)
+        .margin(Thickness::new(
+            capsule::FLOAT_MARGIN,
+            0.0,
+            capsule::FLOAT_MARGIN,
+            capsule::FLOAT_MARGIN,
+        ))
+        .corner_radius(capsule::OUTER_RADIUS)
         .border_brush(ThemeBrush::CardStroke)
-        .border_thickness(Thickness::new(0.0, 1.0, 0.0, 0.0))
+        .border_thickness(Thickness::new(1.0, 1.0, 1.0, 1.0))
         .content(
-            Grid::new()
-                .columns([
-                    GridLength::Star(1.0),
-                    GridLength::Star(1.0),
-                    GridLength::Star(1.0),
-                    GridLength::Star(1.0),
-                    GridLength::Star(1.0),
-                ])
-                .children(children),
+            // 玻璃宿主组件:composition 圆角玻璃(backdrop+tint)垫在本网格
+            // 视觉栈底,Tab 行浮在其上(见 widgets/glass.rs)。
+            View::component::<GlassBar>(GlassBarInput {
+                content: Grid::new()
+                    .columns([
+                        GridLength::Star(1.0),
+                        GridLength::Star(1.0),
+                        GridLength::Star(1.0),
+                        GridLength::Star(1.0),
+                        GridLength::Star(1.0),
+                    ])
+                    .children(children)
+                    .into(),
+            }),
         ),))
+    .into()
 }
 
 /// Mobile 底栏右侧向上展开的 2×3 悬浮菜单（覆盖全部 6 个二级目的地）。
