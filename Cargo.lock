@@ -1037,7 +1037,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "qaq-bx-cli"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "image",
@@ -1054,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "qaq-bx-core"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -1069,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "qaq-bx-plugin-login"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "qaq-bx-ui"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "qaq-bx-core",
  "qaq-bx-plugin-login",
@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "qaq-bx-video"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "regex",
  "thiserror",
