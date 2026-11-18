@@ -208,3 +208,80 @@
   (interface 在 `reactor/component/tasks.rs:8`,实现在 `native/app` 侧,
   本轮未展开)。
 - 3 个并行研究子代理因运行时故障未产出,本文全部结论为主会话直读所得。
+
+## 8. 载体选型盘点(2026-11-18 追补:「有没有更好的控件承载现有设施?」)
+
+> 证据源:本机 WinAppSDK **2.6.5** winmd 元数据(strings 全量扫
+> `~/.nuget/packages/microsoft.windowsappsdk.winui/2.6.5/metadata/Microsoft.UI.Xaml.winmd`)、
+> 上游源码 `D:/Projects/microsoft-ui-xaml`(controls/dev + dxaml/xcp)、
+> reactor `bindings.rs` 已绑全表(`pub struct` 提取 258 类)。
+
+### 8.1 结论矩阵
+
+| 现有设施 | 更优载体? | 判定 |
+|---|---|---|
+| `TitleBar` 控件 | **同一控件,换用法**(关 AutoRefresh + 手动 `RecomputeDragRegions`) | ✅ 首推,半天级改动,连性能带崩溃面一起治 |
+| 评论/关联裸 for 循环 | **已绑的 `VirtualSource`+`ItemsRepeater`**(首页在用) | ✅ 零新绑定,R3 就地解决 |
+| `ItemsView`(2.6.5 有,reactor 未绑) | 可选 | ⏸ 与 VirtualSource 收益重叠,不阻塞本轮 |
+| 弹幕层 SwapChainPanel+自建 D3D | 无更好的(XAML winmd 无更新载体;ContainerVisualFactory 不在 WinAppSDK 面) | ❌ 维持现状,Win2D 引入否决 |
+| 视频层 MPE | 系统面唯一正解;结构性修法=常驻单实例(§4-F4) | ❌ 不换控件,换挂载策略 |
+| `ScrollViewer`(全应用) | `ScrollView`(1.6+,已绑)是官方后继,**但**其 ScrollPresenter 布局路径正是崩溃双嫌疑之一 | ⚠ 崩溃闭环前**不要**迁移 |
+| Mica backdrop | 无替代需要;拖拽 A/B 试 `None` 即可 | ⏸ 观测项 |
+
+### 8.2 TitleBar:真正的病灶与新用法(本轮最有价值发现)
+
+上游 `TitleBar` 控件(MUX_PUBLIC_V11,2.6.5 内含)源码实锤:
+
+1. **reactor 硬编码 `SetAutoRefreshDragRegions(true)`**
+   (`reactor/native/winui/window/mod.rs:631-632`)⇒ 控件对 `Content` 挂
+   `LayoutUpdated` 常驻订阅(上游 `TitleBar.cpp:601-604` 注释:关开关则是
+   one-shot「首帧算完即退订,避免重复树遍历」)——**拖框/动画期间每次布局
+   pass 都会**:`UpdateInteractableElementsList()` 全子树遍历
+   + 每个可交互元素 `GetBounds()`(`= TransformToVisual + XamlRoot()
+   .RasterizationScale`,上游 `TitleBar.cpp:636`,**XamlRoot 无判空**,
+   即崩溃文档 §4.5 锁定的 `TitleBar.cpp:647`(2.6.5 行号)同源指令)
+   + 脏比较后 `InputNonClientPointerSource.SetRegionRects`。
+   我们 TitleBar 子树有搜索框+铃铛+头像+back+pane-toggle ≈ 5-7 个交互元素,
+   每个每布局 pass 一次跨接口调用。
+2. **官方逃生舱已公开**:`AutoRefreshDragRegions`(get/set)与
+   `RecomputeDragRegions()`(内含同步 `UpdateLayout`,只宜低频调用,
+   上游 `TitleBar.cpp:823-834`)。
+3. 修法(绑定成本=bindings.txt 一行 + `cargo run -p tool-reactor` 再生,
+   `ITitleBar2::put_AutoRefreshDragRegions` 已在清单第 157 行,补
+   `RecomputeDragRegions`/`get_AutoRefreshDragRegions` 即可):
+   - reactor `apply_title_bar_to_window` 改 `SetAutoRefreshDragRegions(false)`
+     (或暴露开关给 app);
+   - app 在「内容真正变化」的节点手动 `RecomputeDragRegions()`:路由切换、
+     布局档位翻转(搜索框进/出 TitleBar)、`WindowResizeSettled`(150ms
+     去抖已有)。**窗口移动不改相对矩形,无需重算**——正好掐掉拖框风暴。
+   - 注意 OnSizeChanged(上游 191 行)仍会按尺寸变化跑
+     `UpdateDragRegion`(有 rect 脏比较,遍历不在该路径)——量级可接受。
+
+### 8.3 顺带的选型红利(已绑未用,零绑定成本)
+
+- `VirtualSource`+`ItemsRepeater`(声明层 `declaration.rs:1622`,首页
+  `video_card.rs:67-98` 实战)→ 评论/关联列表直接套同款配方。
+- `SelectorBar`/`SelectorBarItem`(WinAppSDK 1.6+ 底部选项卡)→ Mobile
+  布局底栏可从手搓 chip 升级,系统视觉与 RTL/键盘全免。
+- `Expander` → 评论楼中楼「展开 N 条回复」可换系统控件(现手搓),
+  顺带让拆除路径进框架自维护的视觉态。**注意**与 8.1 的 ScrollView 同理,
+  涉及框架布局拆除竞态的迁移,等 dump 闭环后再批量做。
+- `SvgImageSource` 已绑 → 图标可去 Symbol 字体限制(外观项,不急)。
+- `DesktopWindowXamlSource`+`DesktopChildSiteBridge` 已绑 → 未来若需
+  独立「迷你悬浮窗」可用 XAML 岛,不必再拿 SwapChainPanel 硬凑。
+
+### 8.4 否决清单(调研过,不采用,防止后人再翻)
+
+- **WebView2 承载播放/弹幕**:全 web 栈内存 ×2-3,4c8T/8G 约束下否决。
+- **Win2D(Microsoft.Graphics.Win2D)**:CanvasSwapChain 与现有自建
+  D3D+D2D 层等价,白增一层 WinRT 依赖与设备争用面。
+- **CompositionDrawingSurface/ContainerVisualFactory 类「新合成载体」**:
+  2.6.5 的 Microsoft.UI.Xaml.winmd 中不存在(全量 strings 核对),
+  属 Windows.UI.Composition/Win11 系统面,自包含打包不可依赖。
+- **ItemsView 替换 VirtualSource**:能力重叠,迁移面(键/回收/测量协议)
+  全新,无本季度收益;留作 reactor 上游对齐项。
+- **自绘 Border 标题栏 + InputNonClientPointerSource 手动 pass-through**:
+  是 8.2 方案不可行时的备胎(全手工,回归面大);先用开关方案。
+- **ScrollViewer→ScrollView 迁移**:崩溃文档 §4.5 的两个无判空点
+  (ScrollPresenter.cpp:1259 / TitleBar.cpp:647)都在 Controls.dll;
+  在拿到 dump 闭环前迁移=从一条嫌疑路径搬进另一条。**冻结**。
