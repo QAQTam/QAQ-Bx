@@ -334,3 +334,31 @@ checkout 丢弃(同事 WIP 已安全在 master)。
 | reactor 硬编码 AutoRefresh=true | **成立,共因/放大器**(卡顿风暴 + 扩大死亡窗口暴露面) |
 | WinAppSDK 2.6 TitleBar 订阅泄漏 | **成立,主因**(dump 栈 + 源码双重实锤,main 分支至 2026-11-17 仍未修) |
 | consume_IUIElement::XamlRoot 防御缺失 | 成立,次要(bad-null fall-through + QI 未检查) |
+
+## 9. C# 最小复刻实验(2026-11-19 00:32–00:47,结论:无定论)
+
+工程:`D:/QAQ-Work/titlebar-rectleak-repro`(unpackaged WinUI 3, WinAppSDK **2.6.5**
+同款,code-behind 无 XAML UI;模式 swap/drag-safe/drag/children-only)。
+
+| 实验 | 结果 |
+|---|---|
+| swap:SetTitleBar(A→B)+ 放引用 + GC.Collect×2,程序化移动 ×60/80 | **未崩** |
+| children-only 对照(换 children 不动属性) | **未崩** |
+| drag:SendInput 真拖框 | 未崩(repro bug:坐标打到用户桌面/自身 modal 阻塞 pump,数据无效) |
+
+机制修正(实验逼出来的关键认知):`Window.SetTitleBar(A)` 的属性引用**本身就把
+native peer 钉活**——C# 侧 GC 只能杀 managed wrapper,不杀原生对象
+(`post-GC alive=False` 测的是 wrapper 壳)。我们的 fork 用 windows-rs **强引用**
+TitleBar 元素:diff retire 时 Rust drop = COM Release → **原生对象真死**,
+而泄漏的 WindowRectChanged token 仍挂在窗口级事件源上 → 幽灵回调 → AV。
+即:**框架泄漏(必要) × 消费者原生生命周期管理(触发) = 崩溃**;
+reactive 架构(任何语言,只要持原生强引用)都是暴露面,C# XAML 惯例几乎
+不会进入该状态——这同时解释了上游无人报告与我们必现。
+
+对上游的表述相应修正(不删 §8,它记录证据链的演化):issue 弹药 =
+dump 栈 + 源码泄漏 + **生产应用确定性复现**;「托管语言最小工程复现」
+被机制分析判定为天然难复现(这是设计特性,不是我们的缺陷),被质疑时
+以此回应,并可承诺 C++/WinRT 原生强引用级最小复现作为升级弹药。
+
+遗留清理:repro 进程 15416/15948 未确认杀除(提权 UAC 在 PTY 会话中不可见);
+`MainWindowTitle` 存在说明其循环未死,普通 kill 应可达,重启自然消失,无副作用。

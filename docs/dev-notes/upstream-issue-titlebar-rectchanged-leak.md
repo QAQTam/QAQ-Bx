@@ -1,11 +1,12 @@
 # Upstream Issue 草稿 — microsoft/microsoft-ui-xaml(待提交,按 bug_report.yaml 模板)
 
-> 提交策略(据 CONTRIBUTING 与 #12459/#12671 惯例):
-> 1. **先提本 issue**(模板会自动打 `bug`+`needs-triage`,我们没法自选 label,正文尽量含 area-TitleBar 关键词);
-> 2. issue 里声明 **愿意提 PR**(PR 必须 `Fixes #<本 issue>`,否则可能直接 close;CLA 一次性签署);
-> 3. 若被要 "minimal repro project" → 用文末 C# code-behind 复刻方案补(gallery 之外他们接受独立小仓库,#12459 先例)。
-> 标题建议:
-> **TitleBar leaks its WindowRectChanged subscription; a later window-move event calls back into the destroyed control and AVs in `consume_IUIElement::XamlRoot` (unchecked QI HRESULT)**
+> 提交策略(据 CONTRIBUTING 与 #12459/#12671 惯例,并经 §9 C# 复刻实验后修订):
+> 1. **先提本 issue**(模板自动打 `bug`+`needs-triage`;正文含 area-TitleBar 关键词);
+> 2. issue 里声明 **愿意提 PR**(PR 必须 `Fixes #<issue>`;CLA 一次性);
+> 3. ~~C# 最小复刻~~ → 实验证明托管 GC 路径天然无法进入触发状态(§9),
+>    issue 直接以此为机制论据;若被索要,升级弹药 = C++/WinRT 原生强引用最小复现。
+> 标题:
+> **TitleBar leaks its WindowRectChanged subscription; a later window-move event calls back into the destroyed control and AVs in `consume_IUIElement::XamlRoot` (unchecked QI output)**
 
 ---
 
