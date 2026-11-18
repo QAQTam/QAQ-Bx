@@ -601,8 +601,9 @@ pub struct AppShell {
     /// `QAQ_BX_NATIVE` 强制覆盖(Some = 覆盖设置项;None = 按设置项)。
     /// E11/E12/E13 自动化靠它把引擎钉死在一条通路上,不受 settings.json 影响。
     engine_env_override: Option<PlayerEngine>,
-    /// S2 tier1:「离开播放页即垫底」——播放层常驻,组件与 MPE 不过渡卸载
-    /// (后台播放);显式关播/开新稿件才真正下线。
+    /// S2 tier1 常驻播放层能力(**产品默认关**):`QAQ_BX_PARK=1` 才启用
+    /// 「离开播放页即垫底」(后台播放)。2026-11-19 用户决策:后台播放暂不
+    /// 面向用户(部分用户不喜欢),能力与 E17 场景保留,随时可翻默认。
     park_playback: bool,
     /// S4:本会话内 native 解码失败过的视频 codec 前缀(hevc/av01/…)——
     /// 系统扩展缺失时同桶不再重试 native,直接走 mpv;不持久化(装了扩展即恢复)。
@@ -3062,8 +3063,8 @@ impl AppShell {
         }
         if self.now_playing.is_some() && !self.is_player_visible() {
             if self.park_playback {
-                // S2 tier1:离开播放页不再关播——播放层垫底继续解码/出声,
-                // 回播放页(Back/重开同一稿件)原样续上;资源随显式关播统一下线。
+                // S2 tier1(park 开启时):离开播放页不关播——播放层垫底继续
+                // 解码/出声,回播放页原样续上。产品默认关(用户决策),走 else 关播。
             } else {
                 self.stop_playback(context);
             }
@@ -4049,7 +4050,7 @@ impl Component for AppShell {
             engine_env_override: PlayerEngine::env_override(
                 std::env::var("QAQ_BX_NATIVE").ok().as_deref(),
             ),
-            park_playback: true,
+            park_playback: std::env::var("QAQ_BX_PARK").as_deref() == Ok("1"),
             native_fallback_codecs: Vec::new(),
             native_stage: None,
             native_playback: false,

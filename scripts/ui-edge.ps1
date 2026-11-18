@@ -1126,6 +1126,8 @@ try {
     $psi.UseShellExecute = $false
     $psi.RedirectStandardError = $true
     $psi.EnvironmentVariables["QAQ_BX_ROUTE"] = "popular"
+    # E17 验的是常驻层能力:park 产品默认关,场景内显式开启。
+    $psi.EnvironmentVariables["QAQ_BX_PARK"] = "1"
     $proc = [System.Diagnostics.Process]::Start($psi)
     $stderrSink = $proc.StandardError
     $stderrTask = $stderrSink.ReadToEndAsync()

@@ -91,3 +91,7 @@ selftest 14 场景全通过(`engine` + park 语义断言已改写);cargo test --
   `switch_to_mpv_now` 路径兜底。
 - park 层渲染整个播放页(含评论/相关推荐),内存占用与可见时一致;后续可换
   轻量占位内容(只保留 surface 子树)。
+- **产品门禁**:2026-11-19 用户决策后台播放暂缓(部分用户不喜欢)——`park_playback`
+  默认 **false**(`QAQ_BX_PARK=1` 可开)。关闭时 `reconcile` 走回 `stop_playback`,
+  引擎切换自动回落「只记账」(`engine_switch_plan` 的 has_session 在关播后为 false),
+  两套语义的断言都在(selftest park-off + E17 park-on)。

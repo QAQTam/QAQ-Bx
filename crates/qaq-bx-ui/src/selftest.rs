@@ -158,11 +158,10 @@ fn comments(s: &mut Scenario) -> Result<(), String> {
     {
         let probe = s.probe.borrow();
         assert_eq!(probe.route_tag, "home", "播放页 Back 应回首页");
-        // S2 tier1:Back 离开播放页不再关播 —— 播放层垫底,后台播放继续。
-        assert_eq!(
-            probe.now_playing_bvid.as_deref(),
-            Some(TEST_BV),
-            "park 语义:离开播放页应保留在播会话(后台播放)"
+        // 后台播放(park)产品默认关:离开播放页即关播并释放会话。
+        assert!(
+            probe.now_playing_bvid.is_none(),
+            "离开播放页应停止播放并释放当前视频"
         );
     }
     Ok(())
@@ -578,8 +577,8 @@ fn fullscreen(s: &mut Scenario) -> Result<(), String> {
         let p = s.probe.borrow();
         assert!(!p.is_fullscreen, "导航离开应自动退出全屏");
         assert_eq!(p.route_tag, "home");
-        // S2 tier1:导航离开不再关播 —— 后台播放继续(park)。
-        assert_eq!(p.now_playing_bvid.as_deref(), Some(TEST_BV));
+        // 后台播放(park)产品默认关:导航离开即关播并释放会话。
+        assert!(p.now_playing_bvid.is_none());
         }
 
     Ok(())
