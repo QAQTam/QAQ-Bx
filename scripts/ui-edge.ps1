@@ -584,19 +584,111 @@ try {
             $text = $stderrTask.Result
             $text | Set-Content -Path $stderrLog -Encoding UTF8
             Write-Host "[E12] stderr → $stderrLog" -ForegroundColor DarkCyan
-            if ($text -match "native engine (init|load) failed|native engine attach failed") {
-                Write-Host "[E12] FAIL: native 引擎装载/接管失败(见 stderr)" -ForegroundColor Red
+            if ($text -match "native engine (init|load) failed|native engine attach failed|native build_source failed|native media failed|danmaku stage: (device|swapchain|begin_draw|present|ResizeBuffers)") {
+                Write-Host "[E12] FAIL: native 引擎装载/接管/弹幕透明层出错(见 stderr)" -ForegroundColor Red
+                $global:E12Fail = $true
+            } elseif ($text -notmatch "native build_source ok") {
+                Write-Host "[E12] FAIL: 未见装载线程产出锚点(build_source 未在后台线程完成)" -ForegroundColor Red
                 $global:E12Fail = $true
             } elseif ($text -notmatch "native attach") {
                 Write-Host "[E12] FAIL: 未见 MPE player 接管锚点(attach 链未走通)" -ForegroundColor Red
                 $global:E12Fail = $true
+            } elseif ($text -notmatch "native media opened") {
+                Write-Host "[E12] FAIL: 系统媒体管线未开画(MediaOpened 未到)" -ForegroundColor Red
+                $global:E12Fail = $true
+            } elseif ($text -notmatch "STAGE-A: danmaku surface ok") {
+                Write-Host "[E12] FAIL: 弹幕透明层未建立(层线程未产出 swapchain)" -ForegroundColor Red
+                $global:E12Fail = $true
+            } elseif ($text -match "native surface (detached|remount)" -and $text -notmatch "native surface remount") {
+                # 面板重建必须走「换新源」路径;只拆不建 = 旧源被作废 player 绑走后失联
+                Write-Host "[E12] FAIL: 面板拆走后未看到换源续播(重建链断在 detach 侧)" -ForegroundColor Red
+                $global:E12Fail = $true
             } else {
-                Write-Host "[E12] PASS: attach 接管成功且无装载失败" -ForegroundColor Green
+                Write-Host "[E12] PASS: 后台装载 + attach 接管 + 管线开画 + 弹幕透明层就位" -ForegroundColor Green
             }
         }
     } catch {}
 }
 if ($global:E12Fail) { throw "E12 FAIL: native 引擎装载失败(详见 $stderrLog)" }
+}
+
+# ---------- 场景 E13：系统媒体引擎的 SMTC(系统媒体控件)与弹幕绘制链验证 ----------
+# 不做窗口伸缩,保证 stderr 里「Playing → NotPlaying」的状态翻转只能来自系统媒体键,
+# 即锁屏/控制栏的播放暂停按钮真的作用到了我们的播放器上(宪法 #4 的模块级自动化)。
+if (Should-RunScenario "E13") {
+Write-Host "[E13] native SMTC + 弹幕绘制链验证（QAQ_BX_NATIVE=1，静置不起伸缩）" -ForegroundColor Cyan
+$global:E13Fail = $false
+$stderrLog = Join-Path $OutRoot "e13-stderr.log"
+$proc = $null
+try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.WorkingDirectory = (Split-Path $exe)
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables["QAQ_BX_VIDEO"] = "BV1GJ411x7h7"
+    $psi.EnvironmentVariables["QAQ_BX_NATIVE"] = "1"
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stderrSink = $proc.StandardError
+    $stderrTask = $stderrSink.ReadToEndAsync()
+    $hwnd = Wait-MainWindow $proc
+    [void][UiEdgeNative]::SetWindowPos($hwnd, [IntPtr](-1), 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0010)
+    Start-Sleep -Seconds 10   # 装载 + 开画 + 弹幕分段到货
+    Capture-WindowFrame -Hwnd $hwnd -Mode screen -FileName "e13-0-native-playing.png"
+
+    Write-Host "[E13] press system media play/pause key" -ForegroundColor Cyan
+    [UiEdgeNative]::keybd_event(0xB3, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 40
+    [UiEdgeNative]::keybd_event(0xB3, 0, 2, [UIntPtr]::Zero)
+    Start-Sleep -Seconds 4
+    Capture-WindowFrame -Hwnd $hwnd -Mode screen -FileName "e13-1-after-media-key.png"
+
+    # 再按一次恢复播放(状态应回到 Playing;顺带验 resume 语义没把播放意愿弄丢)
+    [UiEdgeNative]::keybd_event(0xB3, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 40
+    [UiEdgeNative]::keybd_event(0xB3, 0, 2, [UIntPtr]::Zero)
+    Start-Sleep -Seconds 4
+
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "E13: 进程提前退出 ($($proc.ExitCode))" }
+} finally {
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    try {
+        if ($stderrSink) { $stderrSink.Close() }
+        if ($stderrTask.Wait(3000)) {
+            $text = $stderrTask.Result
+            $text | Set-Content -Path $stderrLog -Encoding UTF8
+            Write-Host "[E13] stderr → $stderrLog" -ForegroundColor DarkCyan
+            # 「第一次 Playing 之后」是否出现 NotPlaying:即系统媒体键真的把播放
+            # 按停了(键由 MediaPlayer 自持 CommandManager 直接消化,不需要我们转发)。
+            $playSegs = $text -split "smtc native: status=Playing"
+            $keyPaused = ($playSegs.Count -ge 2) -and ($playSegs[1] -match "status=NotPlaying")
+            $keyResumed = $false
+            if ($keyPaused) {
+                $keyResumed = ($playSegs[1] -match "status=NotPlaying[\s\S]*status=Playing")
+            }
+            if ($text -match "native media failed|native engine (init|load) failed|native engine attach failed") {
+                Write-Host "[E13] FAIL: native 播放链报错(见 stderr)" -ForegroundColor Red
+                $global:E13Fail = $true
+            } elseif ($text -notmatch "smtc native: 控件已绑定") {
+                Write-Host "[E13] FAIL: 未见 MediaPlayer 自持 SMTC 绑定锚点" -ForegroundColor Red
+                $global:E13Fail = $true
+            } elseif ($text -notmatch "smtc native: status=Playing") {
+                Write-Host "[E13] FAIL: 系统媒体控件未进入 Playing(锁屏/控制栏不会显示在播)" -ForegroundColor Red
+                $global:E13Fail = $true
+            } elseif ($text -notmatch "STAGE-B: danmaku 首帧已绘制") {
+                Write-Host "[E13] FAIL: 弹幕透明层没有画出首帧(数据链或绘制链断了)" -ForegroundColor Red
+                $global:E13Fail = $true
+            } elseif (-not $keyPaused) {
+                Write-Host "[E13] FAIL: 系统媒体键没能暂停播放(SMTC 指令通道未作用到 player)" -ForegroundColor Red
+                $global:E13Fail = $true
+            } else {
+                Write-Host "[E13] PASS: SMTC 绑定/在播状态/弹幕首帧/系统媒体键全部到位(二次按键恢复播放=$keyResumed)" -ForegroundColor Green
+            }
+        }
+    } catch {}
+}
+if ($global:E13Fail) { throw "E13 FAIL: native SMTC/弹幕绘制链验证失败(详见 $stderrLog)" }
 }
 
 function Get-WindowGeometry {

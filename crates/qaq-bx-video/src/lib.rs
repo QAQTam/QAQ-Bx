@@ -9,5 +9,6 @@ pub mod error;
 pub mod ffi;
 pub mod native;
 pub mod player;
+pub mod stage;
 
 pub use error::BiliVideoError;

@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use qaq_bx_video::engine::VideoEngine;
+use qaq_bx_video::native::NativePlayer;
+use qaq_bx_video::stage::DanmakuStage;
 use windows_reactor::*;
 
 use crate::data::VideoItem;
@@ -13,6 +15,8 @@ use crate::pages::player::{
     time_label,
 };
 use crate::widgets::video_surface::{VideoSurface, VideoSurfaceInput};
+use crate::widgets::danmaku_surface::{DanmakuSurface, DanmakuSurfaceInput};
+use crate::widgets::native_surface::{NativeSurface, NativeSurfaceInput};
 
 const HUD_AUTO_HIDE_DELAY: Duration = Duration::from_secs(3);
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(380);
@@ -165,6 +169,10 @@ pub struct FullscreenInput {
     pub loading: bool,
     pub window_width: f64,
     pub engine: Arc<VideoEngine>,
+    /// v0.3:native 系统媒体引擎(QAQ_BX_NATIVE=1 时全屏页也走 MPE + 透明弹幕层;
+    /// 面板重建由引擎的断点续播协议接管)。
+    pub native: Option<Arc<NativePlayer>>,
+    pub stage: Option<Arc<DanmakuStage>>,
     pub on_toggle: Callback<()>,
     pub on_seek: Callback<f64>,
     pub on_volume: Callback<f64>,
@@ -189,6 +197,16 @@ impl PartialEq for FullscreenInput {
             && self.loading == other.loading
             && (self.window_width - other.window_width).abs() < 0.5
             && Arc::ptr_eq(&self.engine, &other.engine)
+            && match (&self.native, &other.native) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&self.stage, &other.stage) {
+                (Some(a), Some(b)) => a == b,
+                (None, None) => true,
+                _ => false,
+            }
             && self.on_toggle == other.on_toggle
             && self.on_seek == other.on_seek
             && self.on_volume == other.on_volume
@@ -393,6 +411,27 @@ impl Component for FullscreenPlayer {
                         )),
                 )
                 .into()
+        } else if let Some(native) = &input.native {
+            // v0.3:native 渲染面(MPE)+ 同 cell 弹幕透明层(结构固定,不随
+            // 弹幕开关翻转,避免视图树重建把面板拆走)。
+            let mut views: Vec<View> = Vec::with_capacity(2);
+            views.push(
+                View::component::<NativeSurface>(NativeSurfaceInput {
+                    player: native.clone(),
+                    tick: input.mount_tick,
+                })
+                .into(),
+            );
+            if let Some(stage) = &input.stage {
+                views.push(
+                    View::component::<DanmakuSurface>(DanmakuSurfaceInput {
+                        stage: stage.clone(),
+                        tick: input.mount_tick,
+                    })
+                    .into(),
+                );
+            }
+            Grid::new().children(views).into()
         } else {
             View::component::<VideoSurface>(VideoSurfaceInput {
                 engine: input.engine.clone(),

@@ -41,7 +41,7 @@ const INITIAL_HEIGHT: u32 = 720;
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// 弹幕活动期渲染节拍预算:实际帧率由 Present(1) 的 vsync 阻塞决定
 /// (60/120/144Hz 跟随显示器满刷新),该预算仅在 Present 不阻塞时防空转。
-const RENDER_BUDGET: Duration = Duration::from_millis(8);
+pub(crate) const RENDER_BUDGET: Duration = Duration::from_millis(8);
 /// P1 resize 合并窗口:拖拽期间的真实 ResizeBuffers 至多每此间隔一次,
 /// 静止后应用最终尺寸并重挂一次;拖拽过程 0 次重挂(消除卡顿主因)。
 const RESIZE_COALESCE: Duration = Duration::from_millis(120);
@@ -50,12 +50,17 @@ const RESIZE_COALESCE: Duration = Duration::from_millis(120);
 /// UI 侧 `IUnknown::from_raw` 接管(接手方 Drop 正确 Release,引用计数闭合)。
 /// 两侧现同用 fork 的 windows-core 0.101;仍走裸指针是为跨线程传递 +
 /// 与 canvas/reactor 各自的 bindings 类型解耦,不再是版本不互通。
-struct SendRaw(*mut c_void);
+pub(crate) struct SendRaw(*mut c_void);
 unsafe impl Send for SendRaw {}
 unsafe impl Sync for SendRaw {}
 
 impl SendRaw {
-    fn into_raw(self) -> *mut c_void {
+    /// 包裹裸指针(视频通道与弹幕透明层共用挂载协议;所有权与 `into_raw` 对侧闭合)。
+    pub(crate) fn new(raw: *mut c_void) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) fn into_raw(self) -> *mut c_void {
         let raw = self.0;
         std::mem::forget(self);
         raw
@@ -115,7 +120,7 @@ pub fn compute_surface_metrics(
     })
 }
 
-fn configure_swap_chain(chain: &mut SwapChain, scale_x: f32, scale_y: f32) {
+pub(crate) fn configure_swap_chain(chain: &mut SwapChain, scale_x: f32, scale_y: f32) {
     chain.set_dpi(96.0 * scale_x, 96.0 * scale_y);
     chain.set_composition_scale(scale_x, scale_y);
 }
@@ -269,7 +274,7 @@ const REPEAT_WINDOW_MS: i32 = 4_000;
 const DEDUP_MAP_CAP: usize = 8192;
 
 /// 编译后的过滤规则(引擎线程私有;正则编译失败丢弃该条规则)。
-struct CompiledDanmakuFilter {
+pub(crate) struct CompiledDanmakuFilter {
     cfg: DanmakuFilter,
     keywords: Vec<String>,
     regexes: Vec<regex::Regex>,
@@ -277,7 +282,7 @@ struct CompiledDanmakuFilter {
 }
 
 impl CompiledDanmakuFilter {
-    fn compile(cfg: &DanmakuFilter) -> Self {
+    pub(crate) fn compile(cfg: &DanmakuFilter) -> Self {
         let mut keywords = Vec::new();
         let mut regexes = Vec::new();
         let mut users = Vec::new();
@@ -359,7 +364,7 @@ impl CompiledDanmakuFilter {
 
     /// 批量过滤:先按 progress 升序(保证去重窗口语义:保留首条),再逐条
     /// 规则匹配 + 窗口去重;`dedup` 跨批持久(分段预存链逐段到货共用)。
-    fn filter_batch(
+    pub(crate) fn filter_batch(
         &self,
         mut items: Vec<OverlayDanmaku>,
         dedup: &mut HashMap<String, i32>,
@@ -617,19 +622,19 @@ impl Drop for VideoEngine {
 
 // ---------- 引擎线程 ----------
 
-struct DanmakuFonts {
+pub(crate) struct DanmakuFonts {
     small: TextFormat,
     medium: TextFormat,
     large: TextFormat,
 }
 
 impl DanmakuFonts {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with(DANMAKU_DEFAULT_FONT, 1.0)
     }
 
     /// 按字体族与字号缩放构建(F3);轨道行高与定宽估算随缩放联动。
-    fn with(family: &str, scale: f32) -> Self {
+    pub(crate) fn with(family: &str, scale: f32) -> Self {
         let scale = if scale.is_finite() {
             scale.clamp(0.5, 2.0)
         } else {
@@ -1161,7 +1166,7 @@ const TIMEPOS_EXTRAP_CAP: f64 = 0.25;
 /// 弹幕时基:mpv time-pos 随视频帧步进,直接取值会让滚动锯齿化。
 /// 播放中在两次属性更新之间用墙钟线性外推;`raw_t` 与锚值差在容差内视为
 /// 同值(未更新)则外推,否则重锚。锚定时刻用饱和差,供测试注入虚拟时刻。
-fn interpolated_danmaku_time(
+pub(crate) fn interpolated_danmaku_time(
     anchor: &mut Option<(f64, Instant)>,
     raw_t: f64,
     now: Instant,
@@ -1181,7 +1186,7 @@ fn interpolated_danmaku_time(
 }
 
 /// 画一帧弹幕(DIP 坐标,与 `SwapChain::set_dpi` 对齐;黑色四向描边 + 主色本体)。
-fn draw_danmaku_overlay(
+pub(crate) fn draw_danmaku_overlay(
     session: &windows_canvas::DrawingSession<'_>,
     items: &[OverlayDanmaku],
     cfg: &VideoConfig,

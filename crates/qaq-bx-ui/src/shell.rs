@@ -30,6 +30,8 @@ use qaq_bx_core::search::{SearchClient, SearchVideo};
 use qaq_bx_core::settings::{AppSettings, FileSettingsStore, SETTINGS_FILE};
 use qaq_bx_video::engine::{DanmakuFilter, OverlayDanmaku, VideoConfig, VideoEngine};
 use qaq_bx_video::native::NativePlayer;
+use qaq_bx_video::stage::DanmakuStage;
+use windows::Media::MediaPlaybackStatus;
 use windows_reactor::*;
 
 use crate::auth::{
@@ -49,7 +51,7 @@ use crate::pages::player::{
 };
 use crate::router::{self, NAV_ROUTES, Route};
 use crate::runtime::{block_on, cover_semaphore};
-use crate::smtc::{SmtcCommand, SmtcController};
+use crate::smtc::{NativeSmtc, SmtcCommand, SmtcController};
 use crate::widgets::chrome;
 use crate::widgets::video_card::{self, HomeSlot};
 
@@ -591,6 +593,12 @@ pub struct AppShell {
     /// 解析/控制路径按 native_active 分流)。
     native_player: Option<Arc<NativePlayer>>,
     native_enabled: bool,
+    /// v0.3:native 模式的弹幕透明层(mpv 路径不用——弹幕仍由视频引擎同帧叠画)。
+    native_stage: Option<Arc<DanmakuStage>>,
+    /// 系统媒体引擎是否正在驱动播放:控制分流(暂停/seek/音量/状态心跳)与弹幕
+    /// 投递都以它为准。直播恒走 mpv(FLV,MF 不支持),即使残留 native_player
+    /// 也必须把控制与弹幕送回视频引擎。
+    native_playback: bool,
     /// 当前播放项的元信息(cid/aid/duration;弹幕拉取参数)。
     current_meta: Option<VideoMeta>,
     /// 弹幕预存链的优先段(播放头所在段;先拉它,其余段升序补齐)。
@@ -624,6 +632,8 @@ pub struct AppShell {
     login_timer: Option<ComponentTimer>,
     /// Windows 控制中心媒体控件（SMTC）控制器。
     smtc: Option<SmtcController>,
+    /// v0.3:native 模式下 SMTC 由 MediaPlayer 自持(状态/指令走系统管线)。
+    smtc_native: Option<NativeSmtc>,
     smtc_rx: Option<Arc<Mutex<std::sync::mpsc::Receiver<SmtcCommand>>>>,
     smtc_bvid: Option<String>,
     smtc_playing: Option<bool>,
@@ -1269,8 +1279,10 @@ impl AppShell {
         self.native_enabled
     }
 
-    /// v0.3 spike:确保 NativePlayer 并按选中分轨装载 MPD(系统 DASH 管线)。
-    /// 返回 false = native 未启用,调用方走 mpv 路径。
+    /// v0.3:native 引擎接管装载(系统 DASH 管线;UI 线程只提交请求)。
+    /// 返回 false = native 未启用,调用方走 mpv 路径。MPD→MediaSource 的网络+
+    /// 解析在引擎装载线程,产物由 `NativeSurface` 的挂载节拍注入;失败经
+    /// `status().error` 在 PositionTick 落到 `player_notice`,不在此阻塞。
     fn native_load_choice(
         &mut self,
         choice: &qaq_bx_core::player::StreamChoice,
@@ -1289,8 +1301,12 @@ impl AppShell {
             }
         };
         let mpd = qaq_bx_core::mpd::build_mpd(&choice.video, Some(&choice.audio));
-        // player 未 attach(UI 尚未交回 MPE 内部 player)时 load 进 pending,
-        // attach 后自动重放;autoplay/start 语义随 pending 一并生效。
+        // 诊断锚:系统媒体管线只吃 MF 支持的编码,这里把选中分轨的 codec/mime 留痕。
+        eprintln!(
+            "[qaq-bx-ui] native load qn={} codec={} mime={} w={} h={}",
+            choice.video.id, choice.video.codecs, choice.video.mime_type, choice.video.width,
+            choice.video.height
+        );
         if let Err(e) = player.load(
             &mpd,
             &choice.video.base_url,
@@ -1302,17 +1318,103 @@ impl AppShell {
             self.player_notice = Some(format!("系统媒体引擎装载失败:{e}"));
             return true;
         }
+        // 弹幕改由透明层承接(视频面归 MPE,mpv 引擎保持 idle)。
+        self.ensure_stage();
+        self.native_playback = true;
+        // 音量先记账(未 attach 时 SetVolume 无对象,attach 时由引擎统一施加)。
         let _ = player.set_volume(f64::from(self.volume));
         self.playing = autoplay;
         true
     }
 
-    /// v0.3 spike:native 引擎当前进度(无 engine 时的 start 取值)。
+    /// v0.3:native 引擎当前进度(换画质/换分P 的定点续播起点)。
     fn native_position(&self) -> f64 {
-        self.native_player
-            .as_ref()
+        self.native_sink()
             .map(|player| player.status().position_secs)
             .unwrap_or(0.0)
+    }
+
+    /// v0.3:native 弹幕透明层懒创建(native 未启用返回 None)。创建时按当前
+    /// 设置下发一次样式/规则,之后一切变更走 `danmaku_*` 分流口,杜绝两侧漂移。
+    fn ensure_stage(&mut self) -> Option<Arc<DanmakuStage>> {
+        if !self.native_enabled {
+            return None;
+        }
+        // 诊断用(临时):QAQ_BX_NATIVE_STAGE=0 → 不建透明层,用于隔离
+        // 「多一个 D3D device 是否让 MF 拒绝 MediaSource」。
+        if std::env::var("QAQ_BX_NATIVE_STAGE").as_deref() == Ok("0") {
+            eprintln!("[qaq-bx-ui] native danmaku stage: 诊断模式跳过");
+            return None;
+        }
+        if self.native_stage.is_none() {
+            let stage = DanmakuStage::with_config(video_config_from(&self.settings));
+            eprintln!("[qaq-bx-ui] native danmaku stage: 透明层已创建");
+            self.native_stage = Some(stage.clone());
+        }
+        self.native_stage.clone()
+    }
+
+    // ---- 弹幕投递单源(native_playback → 透明层;否则 → 视频引擎同帧叠画) ----
+
+    /// 全量替换(新视频/换分P 的清层语义)。
+    fn danmaku_replace(&self, items: Vec<OverlayDanmaku>) {
+        if let Some(stage) = self.stage_sink() {
+            stage.set_danmaku(items);
+        } else if let Some(engine) = &self.engine {
+            engine.set_danmaku(items);
+        }
+    }
+
+    /// 增量追加(分段预存链逐段到货)。
+    fn danmaku_append(&self, items: Vec<OverlayDanmaku>) {
+        if let Some(stage) = self.stage_sink() {
+            stage.append_danmaku(items);
+        } else if let Some(engine) = &self.engine {
+            engine.append_danmaku(items);
+        }
+    }
+
+    fn danmaku_config(
+        &self,
+        enabled: bool,
+        opacity: f32,
+        max_lanes: usize,
+        family: &str,
+        scale: f32,
+    ) {
+        if let Some(stage) = self.stage_sink() {
+            stage.set_danmaku_config(enabled, opacity, max_lanes, family, scale);
+        } else if let Some(engine) = &self.engine {
+            engine.set_danmaku_config(enabled, opacity, max_lanes, family, scale);
+        }
+    }
+
+    fn danmaku_filter(&self, filter: DanmakuFilter) {
+        if let Some(stage) = self.stage_sink() {
+            stage.set_danmaku_filter(filter);
+        } else if let Some(engine) = &self.engine {
+            engine.set_danmaku_filter(filter);
+        }
+    }
+
+    /// 透明层投递闸:仅在系统媒体引擎真正驱动播放时返回 Some。
+    fn stage_sink(&self) -> Option<&Arc<DanmakuStage>> {
+        if self.native_playback {
+            self.native_stage.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// 播放控制分流闸(native 驱动时返回引擎;直播/mpv 路径返回 None,调用方
+    /// 走视频引擎)。残留的 native_player 不得劫持直播控制,否则直播的进度/音量
+    /// 会打到已卸载的引擎上。
+    fn native_sink(&self) -> Option<&Arc<NativePlayer>> {
+        if self.native_playback {
+            self.native_player.as_ref()
+        } else {
+            None
+        }
     }
 
     fn current_row_revision(&self) -> u64 {
@@ -1477,7 +1579,10 @@ impl AppShell {
         self.meta_fetch_inflight_seq = None;
         self.playback_avatar_dirty = false;
         self.playback_avatar_timer = None;
-        self.ensure_engine().set_danmaku(Vec::new());
+        // 视频引擎仍是播放页的渲染前提(native 模式下它保持 idle)。
+        self.ensure_engine();
+        // 清弹幕层:投递口按当前模式分流(native → 透明层;mpv → 引擎同帧)。
+        self.danmaku_replace(Vec::new());
         // U1:新视频重置评论输入态。
         self.comment_draft.clear();
         self.composer_notice = None;
@@ -1864,6 +1969,8 @@ impl AppShell {
         self.meta_fetch_inflight_seq = None;
         self.playback_avatar_dirty = false;
         self.playback_avatar_timer = None;
+        // 直播恒走 mpv(FLV,MF 不支持):弹幕必须送回视频引擎,透明层不接管。
+        self.native_playback = false;
         self.ensure_engine().set_danmaku(Vec::new());
         self.comment_draft.clear();
         self.composer_notice = None;
@@ -2400,32 +2507,144 @@ impl AppShell {
         });
     }
 
-    fn sync_smtc(&mut self, context: &ComponentContext<Self>) {
-        if let Some(item) = &self.now_playing {
-            if self.smtc.is_none() {
-                let (tx, rx) = std::sync::mpsc::channel();
-                if let Some(ctrl) = SmtcController::try_init(tx) {
-                    self.smtc = Some(ctrl);
-                    self.smtc_rx = Some(Arc::new(Mutex::new(rx)));
-                    self.listen_smtc(context);
+    /// 播放意愿落地的唯一入口(UI 按钮/快捷键、SMTC 指令、系统媒体键同一条路径):
+    /// native → 系统媒体引擎,mpv → 视频引擎;两条路径共享「末帧重播回零」语义。
+    fn apply_playback_want(&mut self, want_play: bool, context: &ComponentContext<Self>) {
+        // 先克隆句柄:下面要写 self.playing/self.position,不能一路借用 self。
+        if let Some(player) = self.native_sink().cloned() {
+            let status = player.status();
+            if want_play {
+                // 播放结束(锁屏点播放)→ 回零重播。
+                if status.finished {
+                    let _ = player.seek(0.0);
+                    self.position = 0;
                 }
+                let _ = player.play();
+                self.playing = true;
+            } else {
+                let _ = player.pause();
+                self.playing = false;
             }
-            let Some(smtc) = &self.smtc else {
+            self.sync_smtc(context);
+            return;
+        }
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        let status = engine.status();
+        if !status.has_media() {
+            return; // 媒体未加载(解析中/失败):按钮无操作对象。
+        }
+        if want_play {
+            if status.eof {
+                // 末帧重播:回零续播。
+                engine.seek(0.0);
+            }
+            engine.play();
+            self.playing = true;
+        } else {
+            engine.pause();
+            self.playing = false;
+        }
+        self.sync_smtc(context);
+    }
+
+    /// 窗口级 SMTC 桥懒建(按钮输入通道)。native 模式下也建它:系统媒体会话按
+    /// 窗口绑定,媒体键/控制栏按钮的 ButtonPressed 只经这条路进来,而展示状态与
+    /// 元数据交给 MediaPlayer 自持控件写 —— 一个管输入、一个管展示,不互相覆盖。
+    fn ensure_window_smtc(&mut self, context: &ComponentContext<Self>) {
+        if self.smtc.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        match SmtcController::try_init(tx) {
+            Some(ctrl) => {
+                self.smtc = Some(ctrl);
+                self.smtc_rx = Some(Arc::new(Mutex::new(rx)));
+                self.listen_smtc(context);
+            }
+            // 诊断锚:窗口级桥建不起来 = 媒体键/控制栏按钮的输入通道缺失。
+            None => eprintln!("[qaq-bx-ui] smtc window bridge 不可用(按钮输入通道缺失)"),
+        }
+    }
+
+    fn sync_smtc(&mut self, context: &ComponentContext<Self>) {
+        // item 先取快照:后面要改 self 的多个字段,不能一路借用 now_playing。
+        let item = self.now_playing.clone();
+        if let Some(item) = item.as_ref() {
+            // v0.3 native:展示状态/时间轴交给 MediaPlayer 自持 SMTC(系统管线驱动),
+            // 我们只补元数据;输入通道(媒体键/控制栏按钮)始终走窗口级桥。
+            let player = self
+                .native_sink()
+                .and_then(|p| p.current_player());
+            if let Some(player) = player.as_ref() {
+                self.ensure_window_smtc(context);
+                if self
+                    .smtc_native
+                    .as_ref()
+                    .is_none_or(|bound| !bound.is_bound_to(player))
+                {
+                    self.smtc_native = NativeSmtc::from_player(player);
+                    // 面板重建后 player 变更:元数据与状态锚都得重来一次。
+                    self.smtc_bvid = None;
+                    self.smtc_playing = None;
+                    if let Some(bound) = &self.smtc_native {
+                        eprintln!(
+                            "[qaq-bx-ui] smtc native: 控件已绑定(status={:?})",
+                            bound.playback_status()
+                        );
+                    }
+                }
+                if self.smtc_bvid.as_deref() != Some(item.bvid.as_str()) {
+                    if let Some(bound) = &self.smtc_native {
+                        let cover_bytes = item.cover.as_ref().map(|img| img.as_bytes());
+                        bound.update_metadata(&item.title, &item.author, cover_bytes);
+                    }
+                    self.smtc_bvid = Some(item.bvid.clone());
+                }
+                // 只读不写:锁屏/控制栏显示的就是系统侧状态,变化时留诊断锚。
+                let system_playing = self
+                    .smtc_native
+                    .as_ref()
+                    .and_then(|bound| bound.playback_status())
+                    == Some(MediaPlaybackStatus::Playing);
+                if self.smtc_playing != Some(system_playing) {
+                    self.smtc_playing = Some(system_playing);
+                    eprintln!(
+                        "[qaq-bx-ui] smtc native: status={}",
+                        if system_playing { "Playing" } else { "NotPlaying" }
+                    );
+                }
                 return;
-            };
+            }
+            // 系统媒体引擎在驱动但尚未 attach(装载在途/面板重建中):不写状态,
+            // 但仍要把输入通道备好(否则重建期间的媒体键会丢)。
+            if self.native_playback {
+                self.ensure_window_smtc(context);
+                return;
+            }
+            self.ensure_window_smtc(context);
             if self.smtc_bvid.as_deref() != Some(item.bvid.as_str()) {
-                let cover_bytes = item.cover.as_ref().map(|img| img.as_bytes());
-                smtc.update_metadata(&item.title, &item.author, cover_bytes);
+                if let Some(smtc) = &self.smtc {
+                    let cover_bytes = item.cover.as_ref().map(|img| img.as_bytes());
+                    smtc.update_metadata(&item.title, &item.author, cover_bytes);
+                }
                 self.smtc_bvid = Some(item.bvid.clone());
             }
             if self.smtc_playing != Some(self.playing) {
-                smtc.set_playing(self.playing);
+                if let Some(smtc) = &self.smtc {
+                    smtc.set_playing(self.playing);
+                }
                 self.smtc_playing = Some(self.playing);
             }
         } else if self.smtc_bvid.is_some() || self.smtc_playing.is_some() {
             if let Some(smtc) = &self.smtc {
                 smtc.set_stopped();
             }
+            if let Some(bound) = &self.smtc_native {
+                bound.set_stopped();
+            }
+            self.smtc_native = None;
             self.smtc_bvid = None;
             self.smtc_playing = None;
         }
@@ -3493,6 +3712,8 @@ impl Component for AppShell {
             engine,
             native_player: None,
             native_enabled: std::env::var("QAQ_BX_NATIVE").as_deref() == Ok("1"),
+            native_stage: None,
+            native_playback: false,
             current_meta: None,
             danmaku_first_seg: 0,
             playback_dash: None,
@@ -3511,6 +3732,7 @@ impl Component for AppShell {
             timer,
             login_timer: None,
             smtc: None,
+            smtc_native: None,
             smtc_rx: None,
             smtc_bvid: None,
             smtc_playing: None,
@@ -3655,47 +3877,13 @@ impl Component for AppShell {
                 self.sync_smtc(context);
             }
             Message::TogglePlay => {
-                // v0.3 spike:native 引擎优先。
-                if let Some(player) = &self.native_player {
-                    let status = player.status();
-                    if status.finished {
-                        let _ = player.seek(0.0);
-                        let _ = player.play();
-                        self.playing = true;
-                    } else if self.playing {
-                        let _ = player.pause();
-                        self.playing = false;
-                    } else {
-                        let _ = player.play();
-                        self.playing = true;
-                    }
-                    self.sync_smtc(context);
-                    return;
-                }
-                let Some(engine) = &self.engine else {
-                    return;
-                };
-                let status = engine.status();
-                if !status.has_media() {
-                    return; // 媒体未加载(解析中/失败):按钮无操作对象。
-                }
-                if status.eof {
-                    // 末帧重播:回零续播。
-                    engine.seek(0.0);
-                    engine.play();
-                    self.playing = true;
-                } else if self.playing {
-                    engine.pause();
-                    self.playing = false;
-                } else {
-                    engine.play();
-                    self.playing = true;
-                }
+                let want_play = !self.playing;
+                self.apply_playback_want(want_play, context);
                 self.sync_smtc(context);
             }
             Message::Seek(value) => {
                 self.position = value.round().clamp(0.0, f64::from(u32::MAX)) as u32;
-                if let Some(player) = &self.native_player {
+                if let Some(player) = self.native_sink() {
                     let _ = player.seek(value.max(0.0));
                     return;
                 }
@@ -3710,7 +3898,7 @@ impl Component for AppShell {
                 }
                 if vol != self.volume {
                     self.volume = vol;
-                    if let Some(player) = &self.native_player {
+                    if let Some(player) = self.native_sink() {
                         let _ = player.set_volume(f64::from(self.volume));
                     } else if let Some(engine) = &self.engine {
                         engine.set_volume(f64::from(self.volume));
@@ -3729,7 +3917,7 @@ impl Component for AppShell {
                     0
                 };
                 self.volume = target;
-                if let Some(player) = &self.native_player {
+                if let Some(player) = self.native_sink() {
                     let _ = player.set_volume(f64::from(target));
                 } else if let Some(engine) = &self.engine {
                     engine.set_volume(f64::from(target));
@@ -3741,15 +3929,13 @@ impl Component for AppShell {
             }
             Message::ToggleDanmaku => {
                 self.settings.danmaku_enabled = !self.settings.danmaku_enabled;
-                if let Some(engine) = &self.engine {
-                    engine.set_danmaku_config(
-                        self.settings.danmaku_enabled,
-                        self.settings.danmaku_opacity,
-                        self.settings.danmaku_max_lanes,
-                        &self.settings.danmaku_font_family,
-                        self.settings.danmaku_font_scale,
-                    );
-                }
+                self.danmaku_config(
+                    self.settings.danmaku_enabled,
+                    self.settings.danmaku_opacity,
+                    self.settings.danmaku_max_lanes,
+                    &self.settings.danmaku_font_family,
+                    self.settings.danmaku_font_scale,
+                );
                 self.schedule_settings_save(context);
             }
             Message::EnterFullscreen => {
@@ -3834,8 +4020,8 @@ impl Component for AppShell {
                 }
             },
             Message::PositionTick => {
-                // v0.3 spike:native 引擎状态单源(无 has_media/missing_track 探测)。
-                if let Some(player) = &self.native_player {
+                // v0.3:native 引擎状态单源(无 has_media/missing_track 探测)。
+                if let Some(player) = self.native_sink() {
                     let status = player.status();
                     // 心跳诊断锚(F4 风格):播放态每 30s 一行,验证 pos 推进/时长有效。
                     if status.playing
@@ -3847,16 +4033,23 @@ impl Component for AppShell {
                             status.position_secs, status.duration_secs
                         );
                     }
-                    if !status.playing || status.position_secs > 0.0 {
+                    // 装载在途(工作线程建源)保持遮罩,别用旧会话的状态提前解除。
+                    if !status.loading && (!status.playing || status.position_secs > 0.0) {
                         self.video_loading = false;
                     }
                     self.position = status
                         .position_secs
                         .round()
                         .clamp(0.0, f64::from(u32::MAX)) as u32;
-                    self.playing = status.playing;
-                    if status.duration_secs > 0.0 {
+                    self.playing = status.playing && !status.loading;
+                    if status.duration_secs > 0.0 && !status.loading {
                         self.engine_duration = Some(status.duration_secs);
+                    }
+                    // 弹幕透明层时基:节拍喂真实播放位置与播放态(暂停即冻结);
+                    // 层内用墙钟外推到满刷新率,与 mpv 通道的弹幕手感一致。
+                    if let Some(stage) = self.stage_sink() {
+                        stage.set_time(status.position_secs);
+                        stage.set_playing(status.playing);
                     }
                     if self.player_notice.is_none()
                         && let Some(reason) = &status.error
@@ -4049,6 +4242,8 @@ impl Component for AppShell {
                                 if let Some(meta) = &mut self.current_meta {
                                     meta.cid = cid;
                                 }
+                                // 换分P:旧 P 的弹幕先清层(与 mpv 分支同语义)。
+                                self.danmaku_replace(Vec::new());
                                 self.fetch_danmaku(gen_id, 0.0, context);
                                 return;
                             }
@@ -4076,9 +4271,7 @@ impl Component for AppShell {
                         self.player_notice = None;
                         // 弹幕跟随分P cid 重拉(评论区仍按 aid 不动);预存为
                         // 增量追加,换流前先清空旧 P 的弹幕层。
-                        if let Some(engine) = &self.engine {
-                            engine.set_danmaku(Vec::new());
-                        }
+                        self.danmaku_replace(Vec::new());
                         if let Some(meta) = &mut self.current_meta {
                             meta.cid = cid;
                         }
@@ -4385,9 +4578,7 @@ impl Component for AppShell {
                         weight: e.weight,
                     })
                     .collect();
-                if let Some(engine) = &self.engine {
-                    engine.append_danmaku(items);
-                }
+                self.danmaku_append(items);
                 // 预存链:驱动下一段(全部段到货后自然收束)。
                 if let Some(next) = self.next_danmaku_index(index) {
                     self.fetch_danmaku_segment(seq, next, context);
@@ -4439,25 +4630,12 @@ impl Component for AppShell {
                 }
             }
             Message::SmtcAction(Some(cmd)) => {
-                if let Some(engine) = &self.engine {
-                    let status = engine.status();
-                    if status.has_media() {
-                        match cmd {
-                            SmtcCommand::Play => {
-                                if status.eof {
-                                    engine.seek(0.0);
-                                }
-                                engine.play();
-                                self.playing = true;
-                            }
-                            SmtcCommand::Pause => {
-                                engine.pause();
-                                self.playing = false;
-                            }
-                        }
-                        self.sync_smtc(context);
-                    }
-                }
+                // 诊断锚:系统媒体键 / 控制栏按钮确实打到了本进程。
+                eprintln!("[qaq-bx-ui] smtc action: {cmd:?}");
+                // 系统媒体控件/媒体键的播放暂停请求统一走同一入口:
+                // native → MediaPlayer,mpv → 视频引擎(两条输入路径不两套语义)。
+                let want_play = matches!(cmd, SmtcCommand::Play);
+                self.apply_playback_want(want_play, context);
                 self.listen_smtc(context);
             }
             Message::SmtcAction(None) => {}
@@ -4955,7 +5133,9 @@ impl Component for AppShell {
                 }
                 if next.volume != self.settings.volume {
                     self.volume = next.volume;
-                    if let Some(engine) = &self.engine {
+                    if let Some(player) = self.native_sink() {
+                        let _ = player.set_volume(f64::from(next.volume));
+                    } else if let Some(engine) = &self.engine {
                         engine.set_volume(f64::from(next.volume));
                     }
                 }
@@ -4964,15 +5144,15 @@ impl Component for AppShell {
                 {
                     engine.set_hardware_decode(next.hardware_decode);
                 }
-                if (next.danmaku_enabled != self.settings.danmaku_enabled
+                let danmaku_style_changed = next.danmaku_enabled != self.settings.danmaku_enabled
                     || (next.danmaku_opacity - self.settings.danmaku_opacity).abs() > f32::EPSILON
                     || next.danmaku_max_lanes != self.settings.danmaku_max_lanes
                     || next.danmaku_font_family != self.settings.danmaku_font_family
                     || (next.danmaku_font_scale - self.settings.danmaku_font_scale).abs()
-                        > f32::EPSILON)
-                    && let Some(engine) = &self.engine
-                {
-                    engine.set_danmaku_config(
+                        > f32::EPSILON;
+                if danmaku_style_changed {
+                    // 样式下发按当前承接方分流(native 透明层 / mpv 视频引擎)。
+                    self.danmaku_config(
                         next.danmaku_enabled,
                         next.danmaku_opacity,
                         next.danmaku_max_lanes,
@@ -4980,11 +5160,9 @@ impl Component for AppShell {
                         next.danmaku_font_scale,
                     );
                 }
-                if danmaku_filter_from(&next) != danmaku_filter_from(&self.settings)
-                    && let Some(engine) = &self.engine
-                {
-                    // 规则变化 → 引擎线程编译并对已缓存弹幕全量重滤(热更新)。
-                    engine.set_danmaku_filter(danmaku_filter_from(&next));
+                if danmaku_filter_from(&next) != danmaku_filter_from(&self.settings) {
+                    // 规则变化 → 承接线程编译并对已缓存弹幕全量重滤(热更新)。
+                    self.danmaku_filter(danmaku_filter_from(&next));
                 }
                 self.settings = next;
                 self.schedule_settings_save(context);
@@ -5468,6 +5646,8 @@ impl Component for AppShell {
                     loading: self.video_loading,
                     window_width: layout.window_width,
                     engine: engine.clone(),
+                    native: self.native_sink().cloned(),
+                    stage: self.stage_sink().cloned(),
                     on_toggle: context.message(Message::TogglePlay),
                     on_seek: context.callback(|value: f64| Message::Seek(value)),
                     on_volume: context.callback(|value: f64| Message::SetVolume(value)),
@@ -5529,7 +5709,8 @@ impl Component for AppShell {
                         notice: self.player_notice.clone(),
                         loading: self.video_loading,
                         engine: engine.clone(),
-                        native: self.native_player.clone(),
+                        native: self.native_sink().cloned(),
+                        stage: self.stage_sink().cloned(),
                         comments: self.comments_snapshot.clone(),
                         comment_cb: comment_cb.clone(),
                         related: self.related.clone(),

@@ -1,7 +1,32 @@
-# QAQ-Bx v0.3.0 计划:弹幕引擎升级(轨道避让 / 排版缓存 / 密度控制)
+# QAQ-Bx v0.3.0 计划:弹幕引擎升级 + 系统媒体引擎正式化
 
-> 状态:**计划**(未实施)。本文由 2026-11-19 只读调研产出,实施时逐项回填 ✅ 与证据,
-> 完成后本文自然转为 v0.3.0 更新说明(沿用 `Update-0.2.0.md` 体例)。
+> 状态:混合。**M 段(系统媒体引擎正式化)已实施并验收**(逐条带证据);
+> D1–D5(弹幕引擎升级:轨道避让/排版缓存/密度)仍是**计划**,实施时回填 ✅。
+> 两条轨共用 0.3.0(2026-11 决策:媒体引擎正式化并入本文,不再单开版本号)。
+
+## M. 系统媒体引擎正式化(MediaPlayerElement + Windows.Media DASH 管线)✅
+
+分支 `feat/v0.3-native-player`;环境变量 `QAQ_BX_NATIVE=1` 门控,**默认仍走 mpv**
+(直播 FLV 必须 mpv,Media Foundation 不支持)。依赖 fork `qaq-winui-reactor`
+(`MediaPlayerElement` 绑定 + `ImperativeRequest::SetMediaSourceGetPlayer`)。
+
+| 项 | 内容 | 落点 / 证据 |
+|---|---|---|
+| M1 装载移出 UI 线程 | `load()` 只提交请求:MPD→`AdaptiveMediaSource`→`MediaSource` 在专用装载线程(COM MTA,`CoInitializeEx` 配对释放)执行;UI 的 250ms 挂载节拍取产物注入。世代(`LoadLedger` 纯状态机)保证快速连点时旧结果**丢弃**(不覆盖在途状态) | `qaq-bx-video/src/native.rs`;单测 `load_marks_loading_and_rejects_empty_urls`(断言调用者 <50ms 返回)、`stale_build_result_is_discarded_and_loading_kept` |
+| M2 注入权单飞 | 同一份 `MediaSource` 只能绑一个 `MediaPlayer`;两个 `NativeSurface` 实例并发绑定 ⇒ 管线报 `MediaPlayerError(4) SourceNotSupported`。改为 `claim/release/inflight` 全局单飞 + 世代记账 | `native.rs` `LoadLedger::{claim,release,inject}`;单测 `injection_claim_is_single_flight_and_releasable`;E12/E13 断言 stderr 无 `native media failed` |
+| M3 面板重建续播 | 全屏/半屏/路由切换/快速伸缩会销毁旧 `MediaPlayerElement`(其自持 player 作废,事件退订),**旧源不得复用** ⇒ 用留存原料重建新源,断点(播放意愿 `want_play` + 位置)回放;1.5s 节流防伸缩风暴反复起线程 | `native.rs` `note_surface_detached`/`remount_pending`;单测 `rebuild_flag_blocks_stale_source_until_new_generation_lands`;E12 断言 `detached` 后必见 `remount` |
+| M4 弹幕独立透明层 | native 模式 mpv 引擎 idle ⇒ 弹幕改由**自建预乘 alpha composition swapchain** 层承接(`docs/video-channel.md` §2 原设计):独立 D3D device + 层线程,复用 `engine.rs` 同一套 D2D 轨道排版/描边/屏蔽过滤/时基外推原语;resize 只 ResizeBuffers(不需重挂) | `qaq-bx-video/src/stage.rs`、`qaq-bx-ui/src/widgets/danmaku_surface.rs`、`pages/player.rs`/`pages/fullscreen.rs` 同 cell 层叠;锚点 `STAGE-A`(层就位)/`STAGE-B`(首帧绘制),E13 断言 |
+| M5 SMTC 切原生 | 展示状态与时间轴交回 `MediaPlayer.SystemMediaTransportControls`(系统管线自写,我们不再手写 `SetPlaybackStatus`,只补 B 站标题/UP 主/封面);输入通道(媒体键、控制栏按钮)仍走窗口级 interop 桥;控制指令统一到 `apply_playback_want`(UI/快捷键/SMTC 一条语义路径) | `qaq-bx-ui/src/smtc.rs` `NativeSmtc`;`shell.rs` `ensure_window_smtc`/`apply_playback_want`;E13 真机:系统媒体键 → `smtc native: status=Playing→NotPlaying` |
+| M6 登录态 1080P / 换画质真机验证 | 登录态下选到 `qn=80 codec=avc1.640032 w=1920 h=1080` 并真实开画;UIA 驱动画质 ComboBox 换到 `qn=32` ⇒ `build_source ok(seq=2,autoplay=true,start=19.7)`(定点续播)+ 二次 `native media opened` + 零 `media failed`。令牌副本测后已删除(原件未动) | `scripts/ui-edge.ps1` E12/E13 场景;截图 `frames-edge/e14-0-1080p-playing.png`(1080P 画面 + 透明层弹幕同屏) |
+
+**分流不变量**:`native_playback` 单标志控制"控制/弹幕/视图"三路分流;直播路径
+(`start_live_playback`)显式把它打回 false,残留的 `native_player` 不得劫持 mpv 控制。
+
+**已知限制(不在本轮)**:native 模式没有后台播放——`MediaPlayerElement` 卸载即停,
+切页/全屏靠 M3 的断点重建续上(有数百毫秒黑屏);单实例常驻 MPE(挂在窗口根视觉)
+是后续解法。画质切换后的首帧仍会短暂复用旧帧(MPE 自身管线行为)。
+
+---
 
 ## 0. 背景:0.2.x 已落地的弹幕基础(本轮已完成,验收证据在 git 历史)
 

@@ -17,6 +17,7 @@ use crate::layout::ViewportLayout;
 use crate::pages::fullscreen::DoubleClickTracker;
 use crate::theme;
 use crate::widgets::native_surface::{NativeSurface, NativeSurfaceInput};
+use crate::widgets::danmaku_surface::{DanmakuSurface, DanmakuSurfaceInput};
 use crate::widgets::video_surface::{VideoSurface, VideoSurfaceInput};
 
 const PLAYER_SLOT_HEIGHT: f64 = 420.0;
@@ -193,6 +194,9 @@ pub struct PlayerInput {
     pub engine: Arc<VideoEngine>,
     /// v0.3 spike:系统媒体引擎(QAQ_BX_NATIVE=1 时与 engine 互斥生效)。
     pub native: Option<Arc<NativePlayer>>,
+    /// v0.3:弹幕透明层(native 模式下与 `native` 同时就位——mpv 模式的弹幕
+    /// 仍由视频引擎同帧叠画,这一层只在系统媒体引擎路径出现)。
+    pub stage: Option<Arc<qaq_bx_video::stage::DanmakuStage>>,
     pub comments: CommentsSnapshot,
     pub comment_cb: CommentCallbacks,
     /// 相关推荐（真实 archive/related 数据）。
@@ -235,6 +239,11 @@ impl PartialEq for PlayerInput {
             && Arc::ptr_eq(&self.engine, &other.engine)
             && match (&self.native, &other.native) {
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&self.stage, &other.stage) {
+                (Some(a), Some(b)) => a == b,
                 (None, None) => true,
                 _ => false,
             }
@@ -373,11 +382,26 @@ impl Component for PlayerPage {
                 )
                 .into()
         } else if let Some(native) = &input.native {
-            // v0.3 spike:系统媒体引擎渲染面(MediaPlayerElement)。
-            View::component::<NativeSurface>(NativeSurfaceInput {
-                player: native.clone(),
-                tick: input.mount_tick,
-            })
+            // v0.3:系统媒体引擎渲染面(MediaPlayerElement)+ 同 cell 弹幕透明层。
+            // 两层结构固定(不因弹幕开关翻转),避免组件树重建导致合成空窗。
+            let mut layers: Vec<View> = Vec::with_capacity(2);
+            layers.push(
+                View::component::<NativeSurface>(NativeSurfaceInput {
+                    player: native.clone(),
+                    tick: input.mount_tick,
+                })
+                .into(),
+            );
+            if let Some(stage) = &input.stage {
+                layers.push(
+                    View::component::<DanmakuSurface>(DanmakuSurfaceInput {
+                        stage: stage.clone(),
+                        tick: input.mount_tick,
+                    })
+                    .into(),
+                );
+            }
+            Grid::new().children(layers).into()
         } else {
             View::component::<VideoSurface>(VideoSurfaceInput {
                 engine: input.engine.clone(),

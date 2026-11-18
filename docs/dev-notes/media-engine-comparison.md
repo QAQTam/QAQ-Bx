@@ -81,9 +81,40 @@
 
 ### spike 已知限制(正式版待办)
 
-1. `build_source` 在 UI 线程阻塞 join(网络慢时卡 UI)→ 正式版移工作线程。
-2. live(FLV)未接:native 不支持,直播页仍走 mpv(现状保留)。
-3. 弹幕层:native 模式下 mpv 引擎 idle,弹幕 overlay 不出(需独立透明 Canvas 层,见 §3)。
-4. SMTC 未切:MPE/MediaPlayer 自带 SystemTransportControls 可替换 smtc.rs 手写桥。
-5. 登录态 1080P/画质切换真机复测;截图像素检测在 TOPMOST 竞争下不稳定(E12 断言以 stderr 锚点为准)。
+1. `build_source` 在 UI 线程阻塞 join(网络慢时卡 UI)→ 正式版移工作线程。✅M1
+2. live(FLV)未接:native 不支持,直播页仍走 mpv(现状保留)。✅保留不改
+3. 弹幕层:native 模式下 mpv 引擎 idle,弹幕 overlay 不出(需独立透明 Canvas 层,见 §3)。✅M4
+4. SMTC 未切:MPE/MediaPlayer 自带 SystemTransportControls 可替换 smtc.rs 手写桥。✅M5
+5. 登录态 1080P/画质切换真机复测;截图像素检测在 TOPMOST 竞争下不稳定(E12 断言以 stderr 锚点为准)。✅M6
+
+## 7. 正式化实测(2026-11-18,分支 feat/v0.3-native-player)
+
+四项待办全部落地并真机验收,逐条证据见 `docs/Update-0.3.0.md` M 段。这里只记
+**踩过的坑与判据**,避免后续会话重新踩:
+
+1. **同一份 `MediaSource` 不能绑两个 `MediaPlayer`。** 窗口伸缩会让播放页组件树
+   重建(与黑屏那次同源,见 `resize-black-screen.md`),两个 `NativeSurface` 实例
+   各自有自己的"在途"标志却共用同一份产物 ⇒ 第二次 `SetSource` 触发
+   `MediaFailed(MediaPlayerError::SourceNotSupported)`,UI 显示「视频通道异常」。
+   这个错**只在真机 GUI 复现**(selftest 无 UI 不触发),而且**时隐时现**,一开始
+   很容易误判成"移到工作线程把套间搞坏了"。判据要盯 stderr 的
+   `native media opened` 是否出现(出现=源真被管线接受)。
+   ⇒ 修复:注入权全局单飞(`LoadLedger::claim/release`),面板重建一律换**新产物**。
+2. **`MediaPlayerElement.MediaPlayer` 只读**未变;`MediaSource` 一旦被某元素绑走,
+   该元素销毁后**不要指望**新元素复用同一份源(第 1 条的同一条约束)。
+3. **音量/起播时机不能在装载前落**:`attach_player` 之前 `SetVolume` 无对象。
+   引擎侧改为"期望音量记账 + attach 统一施加";`want_play` 记账同理避免
+   「静音旧媒体」把用户播放意愿冲掉(否则面板重建后续播变成暂停)。
+4. **WinUI ComboBox 的下拉项只有 Expand 之后才进 UIA 树**——写自动化点击测试
+   (画质切换)时必须先 `ExpandCollapsePattern.Expand()` 再找 ListItem,否则
+   `FindAll(ListItem)` 返回空,以为"没有画质菜单"。
+5. **单元线程里不要 `CoInitializeEx`**:一个需要 COM 的单测与并发的 D3D/D2D
+   线程同进程跑,测试二进制以 `STATUS_ACCESS_VIOLATION` 崩在退出阶段(与断言无关,
+   且只在 `--test-threads` 并发时复现)。这类"要套间"的路径改由 E12/E13 真机场景覆盖。
+6. **诊断锚(保留,勿删)**:`native load qn=… codec=… w=… h=…`、
+   `native build_source ok(seq=…)`、`native attach:`、`native media opened`、
+   `native media failed: error=… extended=0x…`(`ExtendedErrorCode` 才是 MF 的真错)、
+   `native surface detached/remount`、`smtc native: 控件已绑定/status=`、
+   `STAGE-A/STAGE-B`。E12/E13 的断言全部以这些锚点为准,不用像素。
+
 

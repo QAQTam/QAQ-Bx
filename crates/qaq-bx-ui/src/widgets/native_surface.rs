@@ -1,10 +1,14 @@
-//! 系统媒体播放面板(MediaPlayerElement ↔ NativePlayer 接管桥,v0.3 spike)。
+//! 系统媒体播放面板(MediaPlayerElement ↔ NativePlayer 注入桥,v0.3 正式版)。
 //!
 //! 协议:WinUI3 MPE 的内部 `MediaPlayer` 只读——渲染必须由元素自持的 player
-//! 驱动。本组件在首个 `input_changed`(shell 250ms mount 节拍)经
-//! `request_get_media_player`(UI 线程 imperative)把该 player 交给引擎
-//! `attach_player`;此后引擎的 load/play/pause/seek 全部作用于这个 player,
-//! MPE 自动出画。attach 一次成功即止;失败(面板未实例化)下一拍重试。
+//! 驱动。本组件在 `input_changed`(shell 250ms mount 节拍)按「装载世代」驱动
+//! 注入:引擎工作线程产出的 MediaSource(`player.pending_source()`)经
+//! `request_set_media_source_get_player`(UI 线程 imperative)设进 MPE 并读回
+//! player,交回 `attach_player(raw, seq)` 接管。**首次装载与换画质/换分P 重载
+//! 走同一条路径**(是否需要再注入一次由引擎侧世代账本决定);一次注入请求在途
+//! 时不重复发,失败(面板未实例化)由下一拍按同世代重试。
+//!
+//! 本组件不做任何网络/解析工作:装载耗时全在引擎的装载线程(UI 线程只发 imperative)。
 
 use std::sync::Arc;
 
@@ -27,16 +31,15 @@ impl PartialEq for NativeSurfaceInput {
     }
 }
 
-/// 本组件无页面语义消息(接管由 input_changed 驱动)。
+/// 本组件无页面语义消息(注入由 input_changed 驱动)。
 #[derive(Clone, PartialEq)]
 pub enum Message {}
 
 pub struct NativeSurface {
     player: Arc<NativePlayer>,
     element: ElementRef<MediaPlayerElement>,
-    /// attach 在途/已成功标志(completion 回写;input_changed 据此重试)。
+    /// 注入请求在途(completion / 入队失败回写;input_changed 据此避免重复发)。
     attaching: Arc<std::sync::atomic::AtomicBool>,
-    attached: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Component for NativeSurface {
@@ -48,7 +51,6 @@ impl Component for NativeSurface {
             player: input.player.clone(),
             element: ElementRef::new(),
             attaching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            attached: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -61,26 +63,39 @@ impl Component for NativeSurface {
         match _message {}
     }
 
-    fn view(&self, _input: &Self::Input, _context: &mut ViewContext<Self>) -> View {
+    fn view(&self, _input: &Self::Input, context: &mut ViewContext<Self>) -> View {
+        // 面板卸载:元素自持的 MediaPlayer 随视图树拆走,把断点交给引擎并解绑。
+        // 新面板挂载(view 首次创建)时引擎用断点原位重载(`remount_pending`)。
+        let engine = self.player.clone();
+        context.use_effect("native-lifetime", (), move || {
+            let engine_mount = engine.clone();
+            // 挂载即消费续播断点(有断点才会重新提交装载,不阻塞 UI)。
+            let _ = engine_mount.remount_pending();
+            Some(Box::new(move || {
+                engine.note_surface_detached();
+            }))
+        });
+
         // AutoPlay 由引擎 attach 时关闭,起播时机 shell 统一决定。
         MediaPlayerElement::new().element_ref(&self.element).into()
     }
 }
 
 impl NativeSurface {
+    /// 取引擎待注入的产物并交 MPE;无新产物(未装载 / 该世代已注入 / 别的实例
+    /// 正在注入)则空操作。
     fn try_attach(&mut self) {
         let atomic = std::sync::atomic::Ordering::SeqCst;
-        if self.attached.load(atomic) || self.attaching.swap(true, atomic) {
-            return;
+        if self.attaching.swap(true, atomic) {
+            return; // 本实例上一次注入请求仍在途
         }
-        // 引擎尚未 load(build_source 未产出 MediaSource):等下一拍再试。
-        let Some(source) = self.player.take_pending_source_raw() else {
+        // 领取全局注入权:同一份 MediaSource 只允许绑定一个 player。
+        let Some((seq, source)) = self.player.claim_pending_source() else {
             self.attaching.store(false, atomic);
             return;
         };
-        eprintln!("[qaq-bx-ui] native surface: attach attempt");
+        eprintln!("[qaq-bx-ui] native surface: attach attempt(seq={seq})");
         let engine = self.player.clone();
-        let attached = self.attached.clone();
         let attaching = self.attaching.clone();
         let accepted = self
             .element
@@ -92,19 +107,57 @@ impl NativeSurface {
                 attaching.store(false, atomic);
                 match result {
                     Ok(unknown) => {
-                        if engine.attach_player(unknown).is_ok() {
-                            attached.store(true, atomic);
-                        } else {
-                            eprintln!("[qaq-bx-ui] native engine attach failed");
+                        if let Err(e) = engine.attach_player(unknown, seq) {
+                            eprintln!("[qaq-bx-ui] native engine attach failed: {e}");
                         }
                     }
-                    Err(_) => {} // 面板未就绪:下一拍(mount_tick)再试
+                    // 面板未就绪:放回注入权,下一拍(mount_tick)按同世代重试。
+                    Err(_) => engine.release_injection(seq),
                 }
             });
         if !accepted {
             eprintln!("[qaq-bx-ui] native surface: request not accepted (panel 未实例化)");
-            self.attaching.store(false, atomic); // 入队失败:下一拍重试
+            self.attaching.store(false, atomic);
+            self.player.release_injection(seq); // 入队失败:放回注入权
         }
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 引擎无产物时 try_attach 空操作且不卡在途标志(节拍可继续推进)。
+    #[test]
+    fn try_attach_without_pending_source_is_a_noop() {
+        let mut surface = NativeSurface {
+            player: Arc::new(NativePlayer::new()),
+            element: ElementRef::new(),
+            attaching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        surface.try_attach();
+        surface.try_attach();
+        assert!(
+            !surface
+                .attaching
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    /// input 等价判定只看引擎身份 + 节拍(引用计数变化不该触发重挂)。
+    #[test]
+    fn input_equality_is_engine_identity_and_tick() {
+        let player = Arc::new(NativePlayer::new());
+        let a = NativeSurfaceInput {
+            player: player.clone(),
+            tick: 3,
+        };
+        let b = NativeSurfaceInput {
+            player: player.clone(),
+            tick: 3,
+        };
+        let c = NativeSurfaceInput { player, tick: 4 };
+        assert!(a == b, "同引擎同节拍应等价(不触发重挂)");
+        assert!(a != c, "节拍变化必须触发一次注入尝试");
+    }
+}
