@@ -1340,12 +1340,6 @@ impl AppShell {
         if !self.native_enabled {
             return None;
         }
-        // 诊断用(临时):QAQ_BX_NATIVE_STAGE=0 → 不建透明层,用于隔离
-        // 「多一个 D3D device 是否让 MF 拒绝 MediaSource」。
-        if std::env::var("QAQ_BX_NATIVE_STAGE").as_deref() == Ok("0") {
-            eprintln!("[qaq-bx-ui] native danmaku stage: 诊断模式跳过");
-            return None;
-        }
         if self.native_stage.is_none() {
             let stage = DanmakuStage::with_config(video_config_from(&self.settings));
             eprintln!("[qaq-bx-ui] native danmaku stage: 透明层已创建");
