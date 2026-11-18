@@ -177,14 +177,39 @@ function Find-ProcessMainWindow {
 function Wait-MainWindow {
     param([System.Diagnostics.Process]$Proc)
     $hwnd = [IntPtr]::Zero
-    for ($i = 0; $i -lt 60; $i++) {
+    for ($i = 0; $i -lt 120; $i++) {
         $Proc.Refresh()
         if ($Proc.HasExited) { throw "qaq-bx-ui.exe 提前退出 ($($Proc.ExitCode))" }
         $hwnd = Find-ProcessMainWindow -TargetPid $Proc.Id
+        # EnumWindows 偶发漏窗(冷启动/杀软扫描新 exe 拖慢首帧):.NET 句柄兜底,
+        # 但必须验尺寸 —— .NET 可能拿到 1×1 的 NonClient Sink 占位窗。
+        if ($hwnd -eq [IntPtr]::Zero -and $Proc.MainWindowHandle -ne [IntPtr]::Zero) {
+            $r = New-Object UiEdgeNative+RECT
+            if ([UiEdgeNative]::GetWindowRect($Proc.MainWindowHandle, [ref]$r)) {
+                $w = $r.Right - $r.Left; $h = $r.Bottom - $r.Top
+                if ($w -ge 350 -and $h -ge 350) { $hwnd = $Proc.MainWindowHandle }
+            }
+        }
         if ($hwnd -ne [IntPtr]::Zero) { break }
         Start-Sleep -Milliseconds 250
     }
-    if ($hwnd -eq [IntPtr]::Zero) { throw "等待主窗口超时" }
+    if ($hwnd -eq [IntPtr]::Zero) {
+        # 诊断:列出该 pid 的全部可见窗口与 .NET 句柄,别让超时吞掉现场。
+        Write-Host "[wait] 诊断 pid=$($Proc.Id) net=$($Proc.MainWindowHandle)"
+        $cb = [UiEdgeNative+EnumWindowsProc]{
+            param($hWnd, $lParam)
+            $p = [uint32]0
+            [void][UiEdgeNative]::GetWindowThreadProcessId($hWnd, [ref]$p)
+            if ($p -eq $Proc.Id) {
+                $r2 = New-Object UiEdgeNative+RECT
+                [void][UiEdgeNative]::GetWindowRect($hWnd, [ref]$r2)
+                Write-Host "[wait]   hwnd=$hWnd vis=$([UiEdgeNative]::IsWindowVisible($hWnd)) rect=$($r2.Left),$($r2.Top),$($r2.Right-$r2.Left)x$($r2.Bottom-$r2.Top)"
+            }
+            return $true
+        }
+        [void][UiEdgeNative]::EnumWindows($cb, [IntPtr]::Zero)
+        throw "等待主窗口超时"
+    }
     [void][UiEdgeNative]::ShowWindow($hwnd, [UiEdgeNative]::SW_RESTORE)
     [void][UiEdgeNative]::SetForegroundWindow($hwnd)
     return $hwnd
@@ -948,7 +973,7 @@ try {
     # 整份退默认，场景起点就不确定；另外显式钉成 mpv，避免上一次走查留下的 native。
     [System.IO.File]::WriteAllText(
         $settingsPath,
-        '{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"FullPlayer","danmaku_enabled":true,"autoplay":true,"hardware_decode":true,"volume":60,"player_engine":"Mpv"}'
+        '{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"FullPlayer","danmaku_enabled":true,"autoplay":true,"hardware_decode":true,"volume":60,"webp_hint_shown":true,"player_engine":"Mpv"}'
     )
     $script:settingsSeeded = $true
 
@@ -1071,6 +1096,129 @@ try {
     }
 }
 if ($global:E15Fail) { throw "E15 FAIL: 播放引擎设置项验证失败（详见 $stderrLog）" }
+}
+
+# ---------- 场景 E17：tier1 —— 默认原生 + 后台播放(park) + 当次无缝切换引擎 ----------
+# 不写 player_engine(老配置) ⇒ 默认必须走系统媒体引擎;进设置页(park 垫底)时
+# heartbeat 继续推进 = 后台播放;切回 mpv 应同进度接管(loadfile start= 播放头)。
+if (Should-RunScenario "E17") {
+Write-Host "[E17] tier1：默认原生 + 后台播放 + 当次无缝切换" -ForegroundColor Cyan
+$global:E17Fail = $false
+$stderrLog = Join-Path $OutRoot "e17-stderr.log"
+$settingsPath = Join-Path $dataDir "settings.json"
+$settingsBak = "$settingsPath.e16-bak"
+$script:settingsSeeded = $false
+$proc = $null
+try {
+    if (Test-Path $settingsPath) { Copy-Item -Path $settingsPath -Destination $settingsBak -Force }
+    # 老配置(不含 player_engine):默认引擎必须是原生。
+    # window 字段必须显式给:无 window 字段时窗口会按上次残留尺寸恢复成 490x195
+    # 之类的小窗,被 Wait-MainWindow 的 >=350x350 过滤拒掉(超时假象)。
+    [System.IO.File]::WriteAllText(
+        $settingsPath,
+        '{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"FullPlayer","danmaku_enabled":true,"autoplay":true,"hardware_decode":true,"volume":60,"webp_hint_shown":true,"window":{"x":60,"y":60,"width":1296,"height":808,"maximized":false}}'
+    )
+    $script:settingsSeeded = $true
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.WorkingDirectory = (Split-Path $exe)
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables["QAQ_BX_ROUTE"] = "popular"
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stderrSink = $proc.StandardError
+    $stderrTask = $stderrSink.ReadToEndAsync()
+    $hwnd = Wait-MainWindow $proc
+    [void][UiEdgeNative]::SetWindowPos($hwnd, [IntPtr](-1), 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0010)
+    $rect = New-Object UiEdgeNative+RECT
+    [void][UiEdgeNative]::GetWindowRect($hwnd, [ref]$rect)
+    $winX = $rect.Left; $winY = $rect.Top
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    Start-Sleep -Seconds 6
+
+    # 1) 默认引擎 = 原生:首卡直接走系统媒体引擎
+    Click-Fast -X ($winX + 330) -Y ($winY + 360)
+    Start-Sleep -Seconds 22
+    Capture-WindowFrame -Hwnd $hwnd -Mode screen -FileName "e17-0-native-default.png"
+
+    # 2) 进设置页(park 垫底):后台播放继续
+    if (-not (Select-UiaNav -Root $root -Name "设置")) { throw "E17 FAIL: 未找到「设置」导航项" }
+    Start-Sleep -Seconds 20
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e17-1-parked-settings.png"
+
+    # 3) 当次无缝切换:native -> mpv(同进度接管)
+    if (-not (Select-UiaEngineItem -Root $root -ItemPattern "mpv")) { throw "E17 FAIL: 无法切换到 mpv" }
+    Start-Sleep -Seconds 12
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e17-2-switched-to-mpv.png"
+
+    # 4) 再切回原生(注入在后台完成)
+    if (-not (Select-UiaEngineItem -Root $root -ItemPattern "原生")) { throw "E17 FAIL: 无法切换回原生" }
+    Start-Sleep -Seconds 12
+
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "E17: 进程提前退出 ($($proc.ExitCode))" }
+} finally {
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    if ($script:settingsSeeded) {
+        if (Test-Path $settingsBak) { Copy-Item -Path $settingsBak -Destination $settingsPath -Force }
+        else { Remove-Item -Path $settingsPath -Force -ErrorAction SilentlyContinue }
+        Remove-Item -Path $settingsBak -Force -ErrorAction SilentlyContinue
+    }
+    try {
+        if ($stderrSink) { $stderrSink.Close() }
+        if ($stderrTask.Wait(5000)) {
+            $text = $stderrTask.Result
+            $text | Set-Content -Path $stderrLog -Encoding UTF8
+            Write-Host "[E17] stderr -> $stderrLog" -ForegroundColor DarkCyan
+            # 心跳推进断言:取全部 heartbeat pos,要求最后一个 > 第一个 + 20s(跨越 park 期)。
+            $positions = [regex]::Matches($text, "native heartbeat pos=([0-9.]+)") | ForEach-Object { [double]$_.Groups[1].Value }
+            $iSwitchToMpv = $text.IndexOf("player engine switch: native -> mpv")
+            $iSwitchToNative = $text.IndexOf("player engine switch: mpv -> native")
+            $afterMpv = if ($iSwitchToMpv -ge 0) { $text.Substring($iSwitchToMpv) } else { $null }
+            $afterNative = if ($iSwitchToNative -ge 0) { $text.Substring($iSwitchToNative) } else { $null }
+            $fail = {
+                param($msg)
+                Write-Host "[E17] FAIL: $msg" -ForegroundColor Red
+                $global:E17Fail = $true
+            }
+            # 切 mpv 之前的段 = 起点:native 默认引擎,不得出现 mpv loadfile。
+            $beforeSwitch = if ($iSwitchToMpv -ge 0) { $text.Substring(0, $iSwitchToMpv) } else { $text }
+            # 切回 native 的锚点把 $afterMpv 再切一段:native 重新装载应落在其中。
+            $partsBack = @($afterMpv -split "player engine switch: mpv -> native")
+            $mpvWindow = $partsBack[0]
+            $afterBack = if ($partsBack.Count -gt 1) { $partsBack[1] } else { $null }
+            if ($beforeSwitch -match "loadfile start=") {
+                & $fail "默认引擎不是原生(切 mpv 之前出现 mpv loadfile)"
+            } elseif ($beforeSwitch -notmatch "native load qn=") {
+                & $fail "默认引擎未走系统媒体引擎装载"
+            } elseif ($positions.Count -lt 2 -or ($positions[-1] - $positions[0]) -lt 20) {
+                & $fail "后台播放心跳未推进(park 期间播放停了)"
+            } elseif ($iSwitchToMpv -lt 0) {
+                & $fail "没看到 native -> mpv 的当次切换锚点"
+            } elseif ($afterMpv -notmatch "loadfile start=([1-9][0-9]*\.[0-9])") {
+                & $fail "切回 mpv 没有同进度接管(loadfile start 应带播放头小数)"
+            } elseif ($afterMpv -notmatch "native danmaku stage: 已释放") {
+                & $fail "切回 mpv 后透明层没下线"
+            } elseif ($partsBack.Count -lt 2) {
+                & $fail "没看到 mpv -> native 的当次切换锚点"
+            } elseif ($afterBack -notmatch "native load qn=") {
+                & $fail "切回原生没有重新装载"
+            } elseif ($text -match "native media failed|native engine (init|load) failed|native build_source failed|native engine attach failed") {
+                & $fail "native 通路报错(见 stderr)"
+            } else {
+                Write-Host "[E17] PASS: 默认原生 + 后台播放(park 心跳推进) + 双向当次无缝切换(同进度接管)" -ForegroundColor Green
+            }
+        } else {
+            Write-Host "[E17] FAIL: 没拿到 stderr" -ForegroundColor Red
+            $global:E17Fail = $true
+        }
+    } catch {
+        Write-Host "[E17] FAIL: stderr 判定异常 $($_.Exception.Message)" -ForegroundColor Red
+        $global:E17Fail = $true
+    }
+}
+if ($global:E17Fail) { throw "E17 FAIL: tier1 验证失败(详见 $stderrLog)" }
 }
 
 Write-Host "[done] 极端场景走查完成，截图位于 $FramesDir" -ForegroundColor Green

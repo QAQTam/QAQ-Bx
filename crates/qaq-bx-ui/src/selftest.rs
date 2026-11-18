@@ -158,9 +158,11 @@ fn comments(s: &mut Scenario) -> Result<(), String> {
     {
         let probe = s.probe.borrow();
         assert_eq!(probe.route_tag, "home", "播放页 Back 应回首页");
-        assert!(
-            probe.now_playing_bvid.is_none(),
-            "移除全局播放条后，离开播放页应停止播放并释放当前视频"
+        // S2 tier1:Back 离开播放页不再关播 —— 播放层垫底,后台播放继续。
+        assert_eq!(
+            probe.now_playing_bvid.as_deref(),
+            Some(TEST_BV),
+            "park 语义:离开播放页应保留在播会话(后台播放)"
         );
     }
     Ok(())
@@ -576,8 +578,9 @@ fn fullscreen(s: &mut Scenario) -> Result<(), String> {
         let p = s.probe.borrow();
         assert!(!p.is_fullscreen, "导航离开应自动退出全屏");
         assert_eq!(p.route_tag, "home");
-        assert!(p.now_playing_bvid.is_none(), "离开播放页后应停播释放资源");
-    }
+        // S2 tier1:导航离开不再关播 —— 后台播放继续(park)。
+        assert_eq!(p.now_playing_bvid.as_deref(), Some(TEST_BV));
+        }
 
     Ok(())
 }
@@ -750,10 +753,13 @@ fn prepare_hermetic_data_dir() -> Result<(), String> {
 /// start_playback 走半窗分支(route 合法地留在 Home),路由断言失效。
 fn write_hermetic_settings(home_open_mode: &str) -> Result<(), String> {
     let dir = qaq_bx_core::resolve_data_dir();
+    // S4:显式钉 mpv —— 无头 RecordingAdapter 没有 MPE 面,若种子默认 native,
+    // OpenVideo 场景会真的启动 MF 装载线程(网络+COM),selftest 就不稳定了。
+    // 引擎设置项本身的路径由 `engine` 场景(UpdateSettings + 探针)覆盖。
     std::fs::write(
         dir.join("settings.json"),
         format!(
-            r#"{{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"{home_open_mode}","autoplay":true,"hardware_decode":true,"volume":30}}"#
+            r#"{{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"{home_open_mode}","autoplay":true,"hardware_decode":true,"volume":30,"player_engine":"Mpv"}}"#
         ),
     )
     .map_err(|e| e.to_string())

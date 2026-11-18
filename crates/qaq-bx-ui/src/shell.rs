@@ -21,7 +21,8 @@ use qaq_bx_core::notify::{
     WhisperSession,
 };
 use qaq_bx_core::player::{
-    Dash, PlayerClient, ResolvedMedia, VideoMeta, VideoPage, is_trial_downgrade_reason,
+    Dash, PlayerClient, ResolvedMedia, StreamChoice, VideoMeta, VideoPage,
+    is_trial_downgrade_reason,
     quality_label, quality_menu, select_audio_excluding, select_stream_by_qn,
     select_stream_excluding,
 };
@@ -600,6 +601,12 @@ pub struct AppShell {
     /// `QAQ_BX_NATIVE` 强制覆盖(Some = 覆盖设置项;None = 按设置项)。
     /// E11/E12/E13 自动化靠它把引擎钉死在一条通路上,不受 settings.json 影响。
     engine_env_override: Option<PlayerEngine>,
+    /// S2 tier1:「离开播放页即垫底」——播放层常驻,组件与 MPE 不过渡卸载
+    /// (后台播放);显式关播/开新稿件才真正下线。
+    park_playback: bool,
+    /// S4:本会话内 native 解码失败过的视频 codec 前缀(hevc/av01/…)——
+    /// 系统扩展缺失时同桶不再重试 native,直接走 mpv;不持久化(装了扩展即恢复)。
+    native_fallback_codecs: Vec<String>,
     /// v0.3:native 模式的弹幕透明层(mpv 路径不用——弹幕仍由视频引擎同帧叠画)。
     native_stage: Option<Arc<DanmakuStage>>,
     /// 系统媒体引擎是否正在驱动播放:控制分流(暂停/seek/音量/状态心跳)与弹幕
@@ -610,6 +617,8 @@ pub struct AppShell {
     current_meta: Option<VideoMeta>,
     /// 弹幕预存链的优先段(播放头所在段;先拉它,其余段升序补齐)。
     danmaku_first_seg: u32,
+    /// S3:弹幕投递代次(切引擎即换代;旧链在途分段到货时作废,避免双投)。
+    danmaku_epoch: u64,
     /// 当前播放的全量 DASH 分轨(播放页画质菜单数据源;F2)。
     playback_dash: Option<Dash>,
     /// 播放页画质菜单(降序清晰度代号;空 = 未解析或 dash 缺失)。
@@ -686,27 +695,26 @@ pub(crate) fn search_enter_submits(ev: &KeyEventInfo) -> bool {
     !ev.status.is_released && (ev.key == VirtualKey::ENTER || ev.original_key == VirtualKey::ENTER)
 }
 
-/// M7:播放引擎设置变更后的收口动作(纯判定,单测覆盖)。
+/// S3 tier1:播放引擎设置变更的收口动作(纯判定,单测覆盖)。
+/// 常驻播放层(park)落地后,切换当次生效:正在播的 VOD 定点换引擎续播。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EngineTeardown {
-    /// 新引擎 = native:只记账。当前通路一律不打断(本应用离开播放页即关播),
-    /// 透明层/自持控件等附属资源由下一次装载建立。
+pub(crate) enum EngineSwitchAction {
     RecordOnly,
-    /// 正在播直播:新引擎永不接管这条 FLV(即使设成 native),但 native 侧已经
-    /// 建起来的附属资源要下线。
     LiveKeepMpv,
-    /// 新引擎 = mpv:native 侧附属资源整体下线(透明层 / SMTC 写权 / 分流标志)。
-    TeardownNative,
+    ReloadNative,
+    ReloadMpv,
 }
 
-/// M7:收口动作判定 —— 优先级:直播豁免 > 新引擎方向。
-fn engine_teardown_action(to_native: bool, live: bool) -> EngineTeardown {
+/// S3:切换动作判定 —— 优先级:直播豁免 > 无会话 > 新引擎方向。
+fn engine_switch_plan(to_native: bool, live: bool, has_session: bool) -> EngineSwitchAction {
     if live {
-        EngineTeardown::LiveKeepMpv
+        EngineSwitchAction::LiveKeepMpv
+    } else if !has_session {
+        EngineSwitchAction::RecordOnly
     } else if to_native {
-        EngineTeardown::RecordOnly
+        EngineSwitchAction::ReloadNative
     } else {
-        EngineTeardown::TeardownNative
+        EngineSwitchAction::ReloadMpv
     }
 }
 
@@ -792,12 +800,16 @@ pub enum Message {
     /// 弹幕分段到货(预存链;即到即画,引擎侧归并排序)。
     DanmakuPart {
         seq: u64,
+        /// S3:弹幕投递代次(切引擎即换代;旧链在途分段到货时作废,避免双投)。
+        epoch: u64,
         index: u32,
         elems: Vec<DanmakuElem>,
     },
     /// 弹幕分段拉取失败(静默;预存链跳过该段继续,播放不受影响)。
     DanmakuFailed {
         seq: u64,
+        /// S3:同上,过期链的续链请求一并作废。
+        epoch: u64,
         index: u32,
         reason: String,
     },
@@ -1346,6 +1358,15 @@ impl AppShell {
         if !self.native_enabled() {
             return false;
         }
+        // S4:本会话回退记忆 —— 该 codec 桶 native 解码失败过(系统扩展缺失等),
+        // 直接走 mpv,不给用户第二次黑屏/报错。
+        let codec_bucket = choice.video.codecs.split('.').next().unwrap_or_default().to_string();
+        if !codec_bucket.is_empty() && self.native_fallback_codecs.contains(&codec_bucket) {
+            eprintln!(
+                "[qaq-bx-ui] native load skip: codec {codec_bucket} 本会话已回退 mpv"
+            );
+            return false;
+        }
         let player = match &self.native_player {
             Some(player) => player.clone(),
             None => {
@@ -1465,32 +1486,157 @@ impl AppShell {
         }
     }
 
-    /// M7:播放引擎设置变更的收口。**生效时机 = 下一次装载**:本应用「离开播放页即
-    /// 关播」(`reconcile_playback_visibility` → `stop_playback`),改引擎时用户必然在
-    /// 设置页,当前流早已关播;为了不动不动就重开/打断任何在播通路,这里绝不重载,
-    /// 只把 native 侧的附属资源收干净(见 `EngineTeardown`):
-    /// ① 弹幕透明层(常驻层线程 + 独立 D3D device)释放,不在 mpv 通路上白占;
-    /// ② SMTC 写权交回窗口级桥,player 自持控件收尾(否则锁屏/控制栏留残卡);
-    /// ③ `native_playback` 归零 —— 控制/弹幕/视图三路分流整体回到 mpv。
-    /// 直播(FLV,MF 不支持)即使设成 native 也永不接管。
+    /// S3:播放引擎设置变更的收口(常驻播放层落地后当次生效)。
+    /// mpv→native:mpv 静音停解码(引擎对象保留作回退),系统媒体引擎按当前
+    /// 进度定点续播;native→mpv:MPE 源卸下,libmpv 同进度接管,透明层/SMTC
+    /// 写权随之交回。直播(FLV,MF 不支持)即使设成 native 也永不接管。
+    /// 没有可切换会话(未开播/解析在途)只记账,下一次装载按新引擎走。
     fn switch_player_engine(&mut self, context: &ComponentContext<Self>) {
         let to_native = self.native_enabled();
         let target = self.effective_player_engine().tag();
-        match engine_teardown_action(to_native, self.current_is_live()) {
-            EngineTeardown::RecordOnly => {
+        let has_session =
+            self.now_playing.is_some() && self.current_qn != 0 && self.playback_dash.is_some();
+        match engine_switch_plan(to_native, self.current_is_live(), has_session) {
+            EngineSwitchAction::RecordOnly => {
+                if !to_native {
+                    self.teardown_native_side(context);
+                }
                 eprintln!("[qaq-bx-ui] player engine -> {target}(记账完成,下一次装载生效)");
             }
-            EngineTeardown::LiveKeepMpv => {
+            EngineSwitchAction::LiveKeepMpv => {
                 self.teardown_native_side(context);
                 eprintln!("[qaq-bx-ui] player engine -> {target}(直播恒 mpv,不接管当前流)");
             }
-            EngineTeardown::TeardownNative => {
-                self.teardown_native_side(context);
-                eprintln!("[qaq-bx-ui] player engine -> {target}(native 侧已下线,下一次装载生效)");
+            EngineSwitchAction::ReloadNative => {
+                let Some(choice) = self.current_choice() else {
+                    eprintln!("[qaq-bx-ui] player engine: {target}(当前档位无可选分轨)");
+                    return;
+                };
+                let engine = self.ensure_engine();
+                let start = engine.status().time_pos.max(f64::from(self.position));
+                let want_play = self.playing;
+                eprintln!(
+                    "[qaq-bx-ui] player engine switch: mpv -> {target} resume={start:.1} play={want_play}"
+                );
+                engine.stop();
+                self.reset_smtc_writer(true);
+                self.video_loading = true;
+                if self.native_load_choice(&choice, want_play, start) {
+                    self.current_video_url = choice.video.base_url;
+                    self.current_audio_url = choice.audio.base_url;
+                    self.player_notice = None;
+                    self.reseed_danmaku(start, context);
+                    self.sync_smtc(context);
+                }
+            }
+            EngineSwitchAction::ReloadMpv => {
+                self.switch_to_mpv_now(context);
             }
         }
     }
 
+    /// S4:native 通路解码失败 → 自动回退 mpv(同分轨同进度接管)。
+    /// 会话级按 codec 桶记忆;用户设置项不动(装上系统扩展后下次启动即恢复 native)。
+    fn fallback_native_to_mpv(&mut self, reason: &str, context: &ComponentContext<Self>) {
+        let bucket = self
+            .playback_dash
+            .as_ref()
+            .and_then(|dash| {
+                dash.video
+                    .iter()
+                    .find(|v| v.base_url == self.current_video_url)
+            })
+            .map(|v| v.codecs.split('.').next().unwrap_or_default().to_string())
+            .unwrap_or_default();
+        if !bucket.is_empty() && !self.native_fallback_codecs.contains(&bucket) {
+            self.native_fallback_codecs.push(bucket.clone());
+            eprintln!(
+                "[qaq-bx-ui] native fallback: codec {bucket} 解码失败,记入本会话回退名单"
+            );
+        }
+        self.switch_to_mpv_now(context);
+        self.player_notice = Some(format!(
+            "系统媒体引擎解码失败，已自动切换 mpv 兼容通道({reason})"
+        ));
+    }
+
+    /// S3/S4 共享:native → mpv 立即接管(同分轨同进度;常驻播放层里换 surface 分支)。
+    fn switch_to_mpv_now(&mut self, context: &ComponentContext<Self>) {
+        let target = self.effective_player_engine().tag();
+        let Some(choice) = self.current_choice() else {
+            eprintln!("[qaq-bx-ui] player engine: {target}(当前档位无可选分轨)");
+            return;
+        };
+        let start = self.native_position().max(f64::from(self.position));
+        let want_play = self.playing;
+        eprintln!(
+            "[qaq-bx-ui] player engine switch: native -> {target} resume={start:.1} play={want_play}"
+        );
+        if let Some(player) = self.native_player.clone() {
+            let _ = player.pause();
+        }
+        self.reset_smtc_writer(false);
+        self.native_playback = false;
+        self.release_stage();
+        let engine = self.ensure_engine();
+        engine.set_volume(f64::from(self.volume));
+        engine.load_with_options(
+            &choice.video.base_url,
+            Some(&choice.audio.base_url),
+            start,
+            want_play,
+        );
+        self.current_video_url = choice.video.base_url;
+        self.current_audio_url = choice.audio.base_url;
+        self.media_probe_at = Some(Instant::now());
+        self.failed_video_prefixes.clear();
+        self.video_fallback_done = false;
+        self.audio_fallback_done = false;
+        self.player_notice = None;
+        self.video_loading = true;
+        self.playing = want_play;
+        self.reseed_danmaku(start, context);
+        self.sync_smtc(context);
+    }
+
+    /// S3:当前档位在 DASH 里的分轨对照(切引擎定点续播用)。
+    /// 先按直链精确复用实际在播的那一对轨道(F4 回退过的编码桶不被切回去),
+    /// 找不到再退回「当前档位 + 编码偏好」重选(同画质菜单口径)。
+    fn current_choice(&self) -> Option<StreamChoice> {
+        let dash = self.playback_dash.as_ref()?;
+        let video = dash
+            .video
+            .iter()
+            .find(|v| v.base_url == self.current_video_url);
+        let audio = dash
+            .audio
+            .iter()
+            .find(|a| a.base_url == self.current_audio_url);
+        if let (Some(video), Some(audio)) = (video, audio) {
+            return Some(StreamChoice {
+                video: video.clone(),
+                audio: audio.clone(),
+            });
+        }
+        select_stream_by_qn(dash, self.current_qn, self.settings.codec.priority())
+    }
+
+    /// S3:引擎翻转后重新落位弹幕 —— 先换代作废旧链在途分段(避免双投/续链),
+    /// 再清目标承接方、补一次当前样式/规则,最后从播放头所在分段起重走预存链。
+    fn reseed_danmaku(&mut self, start_secs: f64, context: &ComponentContext<Self>) {
+        self.danmaku_epoch = self.danmaku_epoch.wrapping_add(1);
+        self.danmaku_replace(Vec::new());
+        let st = self.settings.clone();
+        self.danmaku_config(
+            st.danmaku_enabled,
+            st.danmaku_opacity,
+            st.danmaku_max_lanes,
+            &st.danmaku_font_family,
+            st.danmaku_font_scale,
+        );
+        self.danmaku_filter(danmaku_filter_from(&st));
+        self.fetch_danmaku(self.playback_gen, start_secs, context);
+    }
     /// M7:把 native 通路的附属资源整体下线(切回 mpv / 直播在播时共用)。
     fn teardown_native_side(&mut self, context: &ComponentContext<Self>) {
         if self.native_playback
@@ -2389,11 +2535,17 @@ impl AppShell {
         }
         let first = danmaku_segment_at(start_secs);
         self.danmaku_first_seg = first;
-        self.fetch_danmaku_segment(seq, first, context);
+        self.fetch_danmaku_segment(seq, self.danmaku_epoch, first, context);
     }
 
     /// 拉取单个弹幕分段(预存链的一环;结果经 DanmakuPart/DanmakuFailed 驱动下一段)。
-    fn fetch_danmaku_segment(&mut self, seq: u64, index: u32, context: &ComponentContext<Self>) {
+    fn fetch_danmaku_segment(
+        &mut self,
+        seq: u64,
+        epoch: u64,
+        index: u32,
+        context: &ComponentContext<Self>,
+    ) {
         let Some(meta) = self.current_meta.clone() else {
             return;
         };
@@ -2402,9 +2554,15 @@ impl AppShell {
         context.spawn_background(move |_| {
             let client = DanmakuClient::with_nav(auth.http(), auth.credential_provider(), nav);
             match block_on(client.segment(meta.cid, meta.aid, index)) {
-                Ok(elems) => Message::DanmakuPart { seq, index, elems },
+                Ok(elems) => Message::DanmakuPart {
+                    seq,
+                    epoch,
+                    index,
+                    elems,
+                },
                 Err(error) => Message::DanmakuFailed {
                     seq,
+                    epoch,
                     index,
                     reason: error.to_string(),
                 },
@@ -2842,6 +3000,60 @@ impl AppShell {
         self.sync_smtc(context);
     }
 
+    /// S2 常驻播放层:播放页视图构造单源(park 模式下路由离开也要渲染同一层,
+    /// 组件与 MPE 才不会过渡卸载)。
+    fn player_page_content(
+        &self,
+        author_avatar: &Option<EncodedImage>,
+        my_avatar: &Option<EncodedImage>,
+        comment_cb: &CommentCallbacks,
+        on_open: &Callback<String>,
+        layout: ViewportLayout,
+        context: &mut ViewContext<Self>,
+    ) -> Option<View> {
+            Some(            match (self.now_playing.as_ref(), self.engine.as_ref()) {
+                (Some(item), Some(engine)) => {
+                    View::component::<pages::player::PlayerPage>(pages::player::PlayerInput {
+                        item: item.clone(),
+                        author_avatar: author_avatar.clone(),
+                        my_avatar: my_avatar.clone(),
+                        desc: self.now_playing_desc.clone(),
+                        playing: self.playing,
+                        position: self.position,
+                        volume: self.volume,
+                        danmaku_enabled: self.settings.danmaku_enabled,
+                        quality_menu: self.quality_menu_view(),
+                        current_qn: self.current_qn,
+                        pages_menu: self.pages_menu_view(),
+                        current_cid: self.current_cid,
+                        layout,
+                        mount_tick: self.mount_tick,
+                        duration_secs: self.display_duration(item),
+                        notice: self.player_notice.clone(),
+                        loading: self.video_loading,
+                        engine: engine.clone(),
+                        native: self.native_sink().cloned(),
+                        stage: self.stage_sink().cloned(),
+                        comments: self.comments_snapshot.clone(),
+                        comment_cb: comment_cb.clone(),
+                        related: self.related.clone(),
+                        on_open_video: on_open.clone(),
+                        on_related_retry: context.message(Message::RelatedRetry),
+                        on_toggle: context.message(Message::TogglePlay),
+                        on_seek: context.callback(|value: f64| Message::Seek(value)),
+                        on_volume: context.callback(|value: f64| Message::SetVolume(value)),
+                        on_toggle_mute: context.message(Message::ToggleMute),
+                        on_toggle_danmaku: context.message(Message::ToggleDanmaku),
+                        on_select_quality: context.callback(Message::SelectQuality),
+                        on_select_page: context.callback(Message::SelectPage),
+                        on_enter_fullscreen: context.message(Message::EnterFullscreen),
+                        demo_override: self.demo.as_ref().and_then(|d| d.player_override),
+                    })
+                }
+                _ => self.home_view(context),
+            })
+    }
+
     fn reconcile_playback_visibility(&mut self, context: &ComponentContext<Self>) {
         if self.is_fullscreen
             && (self.now_playing.is_none() || self.engine.is_none() || !self.is_player_visible())
@@ -2849,7 +3061,12 @@ impl AppShell {
             self.exit_fullscreen(context);
         }
         if self.now_playing.is_some() && !self.is_player_visible() {
-            self.stop_playback(context);
+            if self.park_playback {
+                // S2 tier1:离开播放页不再关播——播放层垫底继续解码/出声,
+                // 回播放页(Back/重开同一稿件)原样续上;资源随显式关播统一下线。
+            } else {
+                self.stop_playback(context);
+            }
         }
         self.sync_key_route_ctx();
     }
@@ -3348,8 +3565,11 @@ fn mount_pulse_active(
     home_half_pane: bool,
     is_fullscreen: bool,
     engine_attached: bool,
+    park: bool,
 ) -> bool {
-    (route == Route::Player || home_half_pane || is_fullscreen) && !engine_attached
+    // S2 tier1:park(播放层垫底)也算可见——后台装载/注入必须被 250ms 节拍
+    // 持续驱动,否则在设置页切引擎后的定点续播要等到回播放页才注入。
+    (park || route == Route::Player || home_half_pane || is_fullscreen) && !engine_attached
 }
 
 /// F4 首播音画缺失探测:媒体已就绪(时长>0)但解码轨道缺失持续 ≥3s → 报缺哪条轨。
@@ -3829,10 +4049,13 @@ impl Component for AppShell {
             engine_env_override: PlayerEngine::env_override(
                 std::env::var("QAQ_BX_NATIVE").ok().as_deref(),
             ),
+            park_playback: true,
+            native_fallback_codecs: Vec::new(),
             native_stage: None,
             native_playback: false,
             current_meta: None,
             danmaku_first_seg: 0,
+            danmaku_epoch: 0,
             playback_dash: None,
             quality_qns: Vec::new(),
             current_qn: 0,
@@ -4170,11 +4393,9 @@ impl Component for AppShell {
                         stage.set_time(status.position_secs);
                         stage.set_playing(status.playing);
                     }
-                    if self.player_notice.is_none()
-                        && let Some(reason) = &status.error
-                    {
-                        self.player_notice = Some(reason.clone());
-                        self.video_loading = false;
+                    if let Some(reason) = &status.error {
+                        // S4:native 通路失败不再只弹通知 —— 自动回退 mpv 同进度接管。
+                        self.fallback_native_to_mpv(reason, context);
                     }
                     // 挂载节拍:engine.attached 恒 false(mpv idle),持续驱动
                     // NativeSurface 重试注入(500ms 节流一次足够)。
@@ -4183,6 +4404,7 @@ impl Component for AppShell {
                         self.home_half_pane,
                         self.is_fullscreen,
                         false,
+                        self.park_playback && self.now_playing.is_some(),
                     ) {
                         self.mount_tick = self.mount_tick.wrapping_add(1);
                     }
@@ -4242,6 +4464,7 @@ impl Component for AppShell {
                         self.home_half_pane,
                         self.is_fullscreen,
                         engine.attached(),
+                        self.park_playback && self.now_playing.is_some(),
                     ) {
                         self.mount_tick = self.mount_tick.wrapping_add(1);
                     }
@@ -4679,8 +4902,14 @@ impl Component for AppShell {
                 self.refresh_comments_snapshot();
                 self.spawn_playback_avatars(avatar_urls.iter().map(String::as_str), seq, context);
             }
-            Message::DanmakuPart { seq, index, elems } => {
-                if seq != self.playback_gen {
+            Message::DanmakuPart {
+                seq,
+                epoch,
+                index,
+                elems,
+            } => {
+                // 播放代次或弹幕投递代次(切引擎)过期 → 整段作废,不续链。
+                if seq != self.playback_gen || epoch != self.danmaku_epoch {
                     return;
                 }
                 // 转引擎镜像类型(避免 qaq-bx-video 依赖 qaq-bx-core),增量追加;
@@ -4700,15 +4929,21 @@ impl Component for AppShell {
                 self.danmaku_append(items);
                 // 预存链:驱动下一段(全部段到货后自然收束)。
                 if let Some(next) = self.next_danmaku_index(index) {
-                    self.fetch_danmaku_segment(seq, next, context);
+                    self.fetch_danmaku_segment(seq, epoch, next, context);
                 }
             }
-            Message::DanmakuFailed { seq, index, reason } => {
+            Message::DanmakuFailed {
+                seq,
+                epoch,
+                index,
+                reason,
+            } => {
                 // 弹幕拉取失败不影响播放;静默跳过该段,预存链继续补齐后续段。
-                if seq == self.playback_gen {
+                // 切引擎后的旧链分段直接作废(与新链的投递口不匹配)。
+                if seq == self.playback_gen && epoch == self.danmaku_epoch {
                     eprintln!("[qaq-bx-ui] 弹幕分段 {index} 拉取失败(不影响播放): {reason}");
                     if let Some(next) = self.next_danmaku_index(index) {
-                        self.fetch_danmaku_segment(seq, next, context);
+                        self.fetch_danmaku_segment(seq, epoch, next, context);
                     }
                 }
             }
@@ -5813,46 +6048,16 @@ impl Component for AppShell {
             .and_then(|url| self.avatar_cache.get(&url));
 
         let content: View = if self.route == Route::Player {
-            match (self.now_playing.as_ref(), self.engine.as_ref()) {
-                (Some(item), Some(engine)) => {
-                    View::component::<pages::player::PlayerPage>(pages::player::PlayerInput {
-                        item: item.clone(),
-                        author_avatar: author_avatar.clone(),
-                        my_avatar: my_avatar.clone(),
-                        desc: self.now_playing_desc.clone(),
-                        playing: self.playing,
-                        position: self.position,
-                        volume: self.volume,
-                        danmaku_enabled: self.settings.danmaku_enabled,
-                        quality_menu: self.quality_menu_view(),
-                        current_qn: self.current_qn,
-                        pages_menu: self.pages_menu_view(),
-                        current_cid: self.current_cid,
-                        layout,
-                        mount_tick: self.mount_tick,
-                        duration_secs: self.display_duration(item),
-                        notice: self.player_notice.clone(),
-                        loading: self.video_loading,
-                        engine: engine.clone(),
-                        native: self.native_sink().cloned(),
-                        stage: self.stage_sink().cloned(),
-                        comments: self.comments_snapshot.clone(),
-                        comment_cb: comment_cb.clone(),
-                        related: self.related.clone(),
-                        on_open_video: on_open.clone(),
-                        on_related_retry: context.message(Message::RelatedRetry),
-                        on_toggle: context.message(Message::TogglePlay),
-                        on_seek: context.callback(|value: f64| Message::Seek(value)),
-                        on_volume: context.callback(|value: f64| Message::SetVolume(value)),
-                        on_toggle_mute: context.message(Message::ToggleMute),
-                        on_toggle_danmaku: context.message(Message::ToggleDanmaku),
-                        on_select_quality: context.callback(Message::SelectQuality),
-                        on_select_page: context.callback(Message::SelectPage),
-                        on_enter_fullscreen: context.message(Message::EnterFullscreen),
-                        demo_override: self.demo.as_ref().and_then(|d| d.player_override),
-                    })
-                }
-                _ => self.home_view(context),
+            match self.player_page_content(
+                &author_avatar,
+                &my_avatar,
+                &comment_cb,
+                &on_open,
+                layout,
+                context,
+            ) {
+                Some(view) => view,
+                None => self.home_view(context),
             }
         } else if self.route == Route::Login {
             let (account_view, account_cb) = match &self.auth {
@@ -5963,6 +6168,30 @@ impl Component for AppShell {
             self.route.tag().to_string()
         };
 
+        // S2 常驻播放层(park):键稳定 ⇒ 组件与 MPE 不过渡卸载(后台播放)。
+        // 垫在活动页之下:画面被遮挡但解码/计时/音频继续,回播放页即原样续上。
+        let park_layer = (self.park_playback
+            && self.now_playing.is_some()
+            && self.engine.is_some()
+            && !self.is_player_visible())
+        .then(|| {
+            let park_key = format!(
+                "player:{}",
+                self.now_playing
+                    .as_ref()
+                    .map_or(String::new(), |item| item.bvid.clone())
+            );
+            let parked = self
+                .player_page_content(&author_avatar, &my_avatar, &comment_cb, &on_open, layout, context)
+                .unwrap_or_else(|| self.home_view(context));
+            keyed(
+                park_key,
+                Border::new()
+                    .background(ThemeBrush::SolidBackground)
+                    .content(parked),
+            )
+        });
+
         let menu_items: Vec<KeyedView> = NAV_ROUTES
             .iter()
             .map(|&route| {
@@ -6070,6 +6299,9 @@ impl Component for AppShell {
                 } else {
                     vec![keyed(key, content)]
                 };
+                if let Some(park) = park_layer.clone() {
+                    layers.insert(0, park);
+                }
                 if self.gamepad_active {
                     let focus_title = self.focused_home_video().map(|v| v.title.as_str());
                     layers.push(keyed(
@@ -6161,6 +6393,9 @@ impl Component for AppShell {
                 } else {
                     vec![keyed(key, content)]
                 };
+                if let Some(park) = park_layer.clone() {
+                    layers.insert(0, park);
+                }
                 if self.gamepad_active {
                     let focus_title = self.focused_home_video().map(|v| v.title.as_str());
                     layers.push(keyed(
@@ -6248,19 +6483,20 @@ mod tests {
         assert_eq!(chain, vec![1]);
     }
 
-    /// M7:引擎设置变更的收口判定 —— 直播豁免优先;切 native 只记账;切 mpv 下线
-    /// native 附属资源(透明层 / SMTC 写权 / 分流标志)。
+    /// S3:引擎切换判定 —— 直播豁免 > 无会话只记账 > 双向定点重载。
     #[test]
-    fn engine_teardown_action_pins_live_and_flips_side_resources() {
-        use EngineTeardown::*;
+    fn engine_switch_plan_pins_live_and_reloads_both_directions() {
+        use EngineSwitchAction::*;
         // 直播:即使设成 native 也不接管,只做 native 侧下线。
-        assert_eq!(engine_teardown_action(true, true), LiveKeepMpv);
-        assert_eq!(engine_teardown_action(false, true), LiveKeepMpv);
-        // 非直播:两个方向分别是「记账」与「整体下线」。
-        assert_eq!(engine_teardown_action(true, false), RecordOnly);
-        assert_eq!(engine_teardown_action(false, false), TeardownNative);
+        assert_eq!(engine_switch_plan(true, true, true), LiveKeepMpv);
+        assert_eq!(engine_switch_plan(false, true, true), LiveKeepMpv);
+        // 无会话(未开播/解析在途):只记账,下一次装载生效。
+        assert_eq!(engine_switch_plan(true, false, false), RecordOnly);
+        assert_eq!(engine_switch_plan(false, false, false), RecordOnly);
+        // 正在播的 VOD:两个方向都走定点重载(常驻播放层,当次生效)。
+        assert_eq!(engine_switch_plan(true, false, true), ReloadNative);
+        assert_eq!(engine_switch_plan(false, false, true), ReloadMpv);
     }
-
     /// M7:直播判定只认 `live:` 前缀(真实稿件 bvid 恒以 BV 开头,不得误判)。
     #[test]
     fn live_prefix_matches_live_room_items_only() {
@@ -6321,20 +6557,23 @@ mod tests {
     #[test]
     fn mount_pulse_covers_half_pane_fullscreen_and_stops_when_attached() {
         // 全播放页未挂载 → 脉冲。
-        assert!(mount_pulse_active(Route::Player, false, false, false));
+        assert!(mount_pulse_active(Route::Player, false, false, false, false));
         // 半屏抽屉(route 停在 Home)未挂载 → 必须脉冲(修复冷启动/关闭播放条后首个视频黑屏)。
-        assert!(mount_pulse_active(Route::Home, true, false, false));
+        assert!(mount_pulse_active(Route::Home, true, false, false, false));
         // 全屏态未挂载 → 必须脉冲(切全屏重挂新 SwapChainPanel)。
-        assert!(mount_pulse_active(Route::Player, false, true, false));
-        assert!(mount_pulse_active(Route::Home, true, true, false));
+        assert!(mount_pulse_active(Route::Player, false, true, false, false));
+        assert!(mount_pulse_active(Route::Home, true, true, false, false));
         // 已挂载成功 → 任何路由都停脉冲。
-        assert!(!mount_pulse_active(Route::Player, false, false, true));
-        assert!(!mount_pulse_active(Route::Home, true, false, true));
-        assert!(!mount_pulse_active(Route::Player, false, true, true));
+        assert!(!mount_pulse_active(Route::Player, false, false, true, false));
+        assert!(!mount_pulse_active(Route::Home, true, false, true, false));
+        assert!(!mount_pulse_active(Route::Player, false, true, true, false));
         // 首页无半屏抽屉、无播放画面 → 不脉冲(省电:无 surface 需要挂载)。
-        assert!(!mount_pulse_active(Route::Home, false, false, false));
+        assert!(!mount_pulse_active(Route::Home, false, false, false, false));
         // 其它空态页(收藏/历史等)同理不脉冲。
-        assert!(!mount_pulse_active(Route::Favorites, false, false, false));
+        assert!(!mount_pulse_active(Route::Favorites, false, false, false, false));
+        // S2 tier1:park(播放层垫底)等同可见 —— 后台装载/注入靠这条脉冲驱动。
+        assert!(mount_pulse_active(Route::Settings, false, false, false, true));
+        assert!(!mount_pulse_active(Route::Settings, false, false, true, true));
     }
 
     /// 全局搜索框 Enter 提交门控:按下(主/小键盘)提交并拦截;释放与其他键放行。

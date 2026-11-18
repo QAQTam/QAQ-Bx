@@ -144,34 +144,34 @@ impl CodecPref {
     }
 }
 
-/// 播放引擎(默认 mpv:兼容性优先;原生 Windows Media 走系统媒体管线)。
+/// 播放引擎(tier1 默认 **原生 Windows Media**;mpv 降级为兼容性回退通道)。
 ///
 /// `QAQ_BX_NATIVE` 只作**强制覆盖**(自动化 / 开发调试),不参与持久化:
 /// `"1"` → 强制原生,`"0"` → 强制 mpv,其余取值按本设置项。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlayerEngine {
-    /// libmpv 自绘(D3D11 同帧叠弹幕;直播唯一通道)。
+    /// 系统媒体引擎(MediaFoundation MediaPlayerElement + 弹幕透明层;弹幕满帧率)。
     #[default]
-    Mpv,
-    /// 系统媒体引擎(MediaFoundation MediaPlayerElement + 弹幕透明层)。
     Native,
+    /// libmpv 自绘(D3D11 同帧叠弹幕;直播唯一通道 + native 解码失败时的回退)。
+    Mpv,
 }
 
 impl PlayerEngine {
     /// UI 列表固定顺序(与 `index()` / `from_index()` 一一对应)。
-    pub const ALL: [Self; 2] = [Self::Mpv, Self::Native];
+    pub const ALL: [Self; 2] = [Self::Native, Self::Mpv];
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Mpv => "1. mpv（兼容性优先）",
-            Self::Native => "2. 原生 Windows Media",
+            Self::Native => "1. 原生 Windows Media（默认）",
+            Self::Mpv => "2. mpv（兼容性优先）",
         }
     }
 
     pub const fn index(self) -> usize {
         match self {
-            Self::Mpv => 0,
-            Self::Native => 1,
+            Self::Native => 0,
+            Self::Mpv => 1,
         }
     }
 
@@ -530,17 +530,17 @@ fn danmaku_filter_defaults_for_legacy_configs_and_weight_clamped() {
     assert_eq!(weird.danmaku_filter_rules, "前方高能");
 }
 
-/// M7:播放引擎设置项 —— 旧配置缺字段必须回落 mpv(兼容优先),不得因反序列化
-/// 失败而整份配置回退默认;非法取值同样按缺省处理(normalized 不改枚举)。
+/// S4:播放引擎设置项 —— 旧配置缺字段按 tier1 默认回落 **native**(弹幕满帧率
+/// 通道);反序列化失败不得整份配置回退默认;normalized 不改枚举。
 #[test]
-fn player_engine_defaults_to_mpv_for_legacy_configs() {
+fn player_engine_defaults_to_native_for_legacy_configs() {
     let legacy: AppSettings = serde_json::from_str("{}").unwrap();
-    assert_eq!(legacy.player_engine, PlayerEngine::Mpv);
+    assert_eq!(legacy.player_engine, PlayerEngine::Native);
 
-    // 只写了一半的老配置:缺 player_engine → mpv,其余字段照常读出。
+    // 只写了一半的老配置:缺 player_engine → native,其余字段照常读出。
     let partial: AppSettings =
         serde_json::from_str(r#"{"volume": 42, "autoplay": false}"#).unwrap();
-    assert_eq!(partial.player_engine, PlayerEngine::Mpv);
+    assert_eq!(partial.player_engine, PlayerEngine::Native);
     assert_eq!(partial.volume, 42);
     assert!(!partial.autoplay);
 
@@ -553,8 +553,8 @@ fn player_engine_defaults_to_mpv_for_legacy_configs() {
 /// M7:引擎列表顺序 / 标签 / 下标必须一一对应(设置页 ComboBox 下发按 index)。
 #[test]
 fn player_engine_index_and_label_order_is_stable() {
-    assert_eq!(PlayerEngine::ALL[0], PlayerEngine::Mpv);
-    assert_eq!(PlayerEngine::ALL[1], PlayerEngine::Native);
+    assert_eq!(PlayerEngine::ALL[0], PlayerEngine::Native);
+    assert_eq!(PlayerEngine::ALL[1], PlayerEngine::Mpv);
     for engine in PlayerEngine::ALL {
         assert_eq!(PlayerEngine::from_index(engine.index()), Some(engine));
         assert!(engine.label().starts_with(&format!("{}.", engine.index() + 1)));
