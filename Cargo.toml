@@ -13,7 +13,7 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "native-tls", "gzip", "brotli"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "native-tls", "gzip", "brotli", "stream"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 rsa = "0.9"
 sha2 = "0.10"
@@ -42,6 +42,10 @@ windows = { path = "D:/Projects/qaq-winui-reactor/crates/libs/windows", features
     "xinput",
 ] }
 hex = "0.4"
+# stream_proxy 零拷贝热路径(#1):bytes 为 reqwest 同树传递依赖,无新增包;
+# reqwest "stream" 仅启用已解析的 futures-util/tokio-util。
+bytes = "1"
+futures-util = "0.3"
 qrcode = "0.14"
 url = "2"
 anyhow = "1"

@@ -11,6 +11,8 @@ windows-sys.workspace = true
 windows.workspace = true
 windows-time = { path = "D:/Projects/qaq-winui-reactor/crates/libs/time" }
 regex.workspace = true
+# 弹幕零拷贝(#2):overlay 文本以 (Bytes,off,len) 引用分段原始缓冲。
+bytes.workspace = true
 # D2D overlay:弹幕绘制进视频同帧(canvas fork 的 GpuDevice 互操作 + SwapChain)。
 windows-canvas = { path = "D:/Projects/qaq-winui-reactor/crates/libs/canvas" }
 windows-text = { path = "D:/Projects/qaq-winui-reactor/crates/libs/text" }

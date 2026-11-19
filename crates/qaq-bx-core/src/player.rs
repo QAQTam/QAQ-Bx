@@ -152,34 +152,141 @@ pub struct SegmentBase {
     pub index_range: String,
 }
 
-/// 宽松字符串:JSON 里范围串可能是数字形态。
+/// 宽松字符串:JSON 里范围串可能是数字形态。手写 Visitor 直读,无 `Value` 中转;
+/// 字符串/数字取文本形态,null/布尔取空串,容器形态消费后置空(非法范围串
+/// 不参与 MPD 字节范围)。
+struct LooseString;
+
+impl<'de> serde::de::Visitor<'de> for LooseString {
+    type Value = String;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a string or a number")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _v: bool) -> std::result::Result<String, E> {
+        Ok(String::new())
+    }
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<String, E> {
+        Ok(v.to_string())
+    }
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<String, E> {
+        Ok(v.to_string())
+    }
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<String, E> {
+        Ok(v.to_string())
+    }
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<String, E> {
+        Ok(v.to_owned())
+    }
+    fn visit_string<E: serde::de::Error>(self, v: String) -> std::result::Result<String, E> {
+        Ok(v)
+    }
+    fn visit_none<E: serde::de::Error>(self) -> std::result::Result<String, E> {
+        Ok(String::new())
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<String, E> {
+        Ok(String::new())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<String, A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(String::new())
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> std::result::Result<String, A::Error> {
+        while map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+            map.next_value::<serde::de::IgnoredAny>()?;
+        }
+        Ok(String::new())
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for LooseString {
+    type Value = String;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        d: D,
+    ) -> std::result::Result<String, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
 fn loose_str<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::Deserialize as _;
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(match value {
-        serde_json::Value::String(s) => s,
-        serde_json::Value::Number(n) => n.to_string(),
-        other => other.to_string(),
-    })
+    deserializer.deserialize_any(LooseString)
 }
 
-/// SegmentBase 宽容反序列化:B 站同键位可能下发 null/字符串/对象多形态
-/// (snake `segment_base` 实测非对象),非法形态一律视为缺失。
+/// SegmentBase 宽容反序列化:B 站同键位可能下发 null/字符串/数字/数组/对象多形态
+/// (snake `segment_base` 实测非对象),非法形态一律视为缺失。手写 Visitor 逐键
+/// 直读(重复内键 last-wins,与旧 `Value` 路径语义一致),无 `Value` 中转。
 fn seg_base_loose<'de, D>(deserializer: D) -> std::result::Result<Option<SegmentBase>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::Deserialize as _;
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(match value {
-        serde_json::Value::Null => None,
-        other => SegmentBase::deserialize(other).ok().filter(|s| {
-            !s.initialization.is_empty() || !s.index_range.is_empty()
-        }),
-    })
+    struct SegBaseVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for SegBaseVisitor {
+        type Value = Option<SegmentBase>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("null or a SegmentBase object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut sb = SegmentBase::default();
+            while let Some(key) = map.next_key::<String>()? {
+                // 与 SegmentBase derive 的 rename+alias 集对齐。
+                if key.eq_ignore_ascii_case("initialization") {
+                    sb.initialization = map.next_value_seed(LooseString)?;
+                } else if key == "indexRange" || key == "IndexRange" || key == "index_range" {
+                    sb.index_range = map.next_value_seed(LooseString)?;
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+            Ok((!sb.initialization.is_empty() || !sb.index_range.is_empty()).then_some(sb))
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, _v: bool) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_i64<E: serde::de::Error>(self, _v: i64) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_u64<E: serde::de::Error>(self, _v: u64) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_f64<E: serde::de::Error>(self, _v: f64) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_str<E: serde::de::Error>(self, _v: &str) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_string<E: serde::de::Error>(self, _v: String) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(SegBaseVisitor)
 }
 
 /// 视频流（m4s；`base_url` 为主，`backup_url` 为备）。
@@ -217,6 +324,10 @@ pub struct VideoStream {
         deserialize_with = "seg_base_loose"
     )]
     pub segment_base: Option<SegmentBase>,
+    /// snake_case `segment_base` 键形(实测与 PascalCase 同条目双发;解析进独立
+    /// 强类型字段而非 `extra` 二次解析,取值时 PascalCase 优先)。
+    #[serde(default, rename = "segment_base", deserialize_with = "seg_base_loose")]
+    pub segment_base_snake: Option<SegmentBase>,
     /// 捕获未知键名(B 站 dash 同键双形取证/前向兼容;不参与渲染路径)。
     #[serde(default, flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -247,28 +358,26 @@ pub struct AudioStream {
         deserialize_with = "seg_base_loose"
     )]
     pub segment_base: Option<SegmentBase>,
+    /// snake_case `segment_base` 键形(同 `VideoStream::segment_base_snake`)。
+    #[serde(default, rename = "segment_base", deserialize_with = "seg_base_loose")]
+    pub segment_base_snake: Option<SegmentBase>,
     /// 捕获未知键名(B 站 dash 同键双形取证/前向兼容;不参与渲染路径)。
     #[serde(default, flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn resolved_segment_base_from(
-    primary: Option<&SegmentBase>,
-    extra: &serde_json::Map<String, serde_json::Value>,
+    primary: Option<SegmentBase>,
+    snake: Option<SegmentBase>,
 ) -> Option<SegmentBase> {
-    primary.cloned().or_else(|| {
-        extra
-            .get("segment_base")
-            .filter(|v| !v.is_null())
-            .and_then(|v| serde_json::from_value::<SegmentBase>(v.clone()).ok())
-            .filter(|s| !s.initialization.is_empty() || !s.index_range.is_empty())
-    })
+    // seg_base_loose 已过滤全空形态,这里只做 PascalCase 优先。
+    primary.or(snake)
 }
 
 impl VideoStream {
-    /// 合并大小写变体后的可用 `SegmentBase`（优先结构化字段，回退 `extra["segment_base"]`）。
+    /// 合并大小写变体后的可用 `SegmentBase`（优先 PascalCase 字段，回退 snake 字段）。
     pub fn resolved_segment_base(&self) -> Option<SegmentBase> {
-        resolved_segment_base_from(self.segment_base.as_ref(), &self.extra)
+        resolved_segment_base_from(self.segment_base.clone(), self.segment_base_snake.clone())
     }
 
     /// 按 CDN 优先级（默认官方 UPOS 优先、mcdn/PCDN 兜底）收集去重后的候选播放 URL。
@@ -278,9 +387,9 @@ impl VideoStream {
 }
 
 impl AudioStream {
-    /// 合并大小写变体后的可用 `SegmentBase`（优先结构化字段，回退 `extra["segment_base"]`）。
+    /// 合并大小写变体后的可用 `SegmentBase`（优先 PascalCase 字段，回退 snake 字段）。
     pub fn resolved_segment_base(&self) -> Option<SegmentBase> {
-        resolved_segment_base_from(self.segment_base.as_ref(), &self.extra)
+        resolved_segment_base_from(self.segment_base.clone(), self.segment_base_snake.clone())
     }
 
     /// 按 CDN 优先级（默认官方 UPOS 优先、mcdn/PCDN 兜底）收集去重后的候选播放 URL。
@@ -625,6 +734,7 @@ mod tests {
             mime_type: "video/mp4".into(),
             start_with_sap: 1,
             segment_base: None,
+            segment_base_snake: None,
             extra: Default::default(),
         }
     }
@@ -639,6 +749,7 @@ mod tests {
             mime_type: "audio/mp4".into(),
             start_with_sap: 1,
             segment_base: None,
+            segment_base_snake: None,
             extra: Default::default(),
         }
     }
@@ -1026,5 +1137,77 @@ mod tests {
                 "https://xy9.mcdn.bilivideo.cn:8082/a.m4s?os=mcdn",
             ]
         );
+    }
+
+    /// Visitor 直读零 `Value` 中转回归:数字形态范围串转文本;null/标量/容器
+    /// 形态一律视为缺失;非法内键不得炸掉外层解析;重复内键 last-wins。
+    #[test]
+    fn seg_base_visitor_handles_all_wire_shapes() {
+        let parse_seg = |seg: serde_json::Value| -> Option<SegmentBase> {
+            serde_json::from_value::<VideoStream>(serde_json::json!({
+                "id": 80,
+                "codecs": "avc1",
+                "base_url": "https://cdn/x.m4s",
+                "SegmentBase": seg,
+            }))
+            .expect("任何 SegmentBase 形态都不应使整条流解析失败")
+            .resolved_segment_base()
+        };
+        // 数字形态范围串(loose_str  Visitor)。
+        assert_eq!(
+            parse_seg(serde_json::json!({ "initialization": 0, "indexRange": 1222.5 })),
+            Some(SegmentBase {
+                initialization: "0".into(),
+                index_range: "1222.5".into(),
+            })
+        );
+        // 非对象形态一律缺失。
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!(""),
+            serde_json::json!("0-976"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!({ "initialization": { "nested": 1 } }),
+            serde_json::json!({ "index_range": ["a"] }),
+            serde_json::json!({ "timescale": 1000 }),
+        ] {
+            assert_eq!(parse_seg(bad), None, "非法/全空形态应视为缺失");
+        }
+        // 重复内键 last-wins(与旧 Value 路径语义一致)。
+        assert_eq!(
+            parse_seg(
+                serde_json::from_str::<serde_json::Value>(
+                    r#"{"initialization":"0-1","initialization":"2-3"}"#
+                )
+                .unwrap()
+            ),
+            Some(SegmentBase {
+                initialization: "2-3".into(),
+                index_range: String::new(),
+            })
+        );
+    }
+
+    /// snake 键形解析进独立强类型字段(不再落入 `extra` 二次解析)。
+    #[test]
+    fn snake_segment_base_lands_in_typed_field_not_extra() {
+        let s: VideoStream = serde_json::from_value(serde_json::json!({
+            "id": 32,
+            "codecs": "avc1",
+            "base_url": "https://cdn/s.m4s",
+            "segment_base": { "initialization": "0-300", "index_range": "301-700" },
+        }))
+        .unwrap();
+        assert_eq!(
+            s.segment_base_snake,
+            Some(SegmentBase {
+                initialization: "0-300".into(),
+                index_range: "301-700".into(),
+            })
+        );
+        assert!(!s.extra.contains_key("segment_base"));
+        assert_eq!(s.resolved_segment_base(), s.segment_base_snake);
     }
 }

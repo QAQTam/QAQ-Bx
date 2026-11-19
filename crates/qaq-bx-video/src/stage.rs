@@ -501,8 +501,8 @@ mod tests {
             mode: 1,
             fontsize: 25,
             color: 0xFFFFFF,
-            content: content.to_string(),
-            mid_hash: String::new(),
+            content: content.into(),
+            mid_hash: None,
             weight: 0,
         }
     }

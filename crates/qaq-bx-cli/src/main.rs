@@ -414,12 +414,17 @@ async fn cmd_dm(bvid: Option<String>) -> anyhow::Result<()> {
     );
 
     let dm = DanmakuClient::new(http, auth.credentials());
-    let elems = dm
+    let segs = dm
         .all(meta.cid, meta.aid, u64::try_from(meta.duration).unwrap_or(0))
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("解析得到 {} 条弹幕", elems.len());
-    for elem in elems.iter().take(10) {
+    let total: usize = segs.iter().map(|s| s.len()).sum();
+    println!("解析得到 {total} 条弹幕");
+    for (seg, elem) in segs
+        .iter()
+        .flat_map(|s| s.elems().iter().map(move |e| (s, e)))
+        .take(10)
+    {
         println!(
             "  [{:02}:{:02}] mode={} fs={} #{:06X} {}",
             elem.progress_ms / 60_000,
@@ -427,13 +432,13 @@ async fn cmd_dm(bvid: Option<String>) -> anyhow::Result<()> {
             elem.mode,
             elem.fontsize,
             elem.color & 0xFF_FF_FF,
-            elem.content
+            seg.content(elem)
         );
     }
-    if let Some(first) = elems.first() {
+    if let Some((seg, first)) = segs.iter().find_map(|s| s.elems().first().map(|e| (s, e))) {
         std::fs::write(
             ".qaqh/research/samples/dm-seg1.bin",
-            format!("{}\n", first.content),
+            format!("{}\n", seg.content(first)),
         )?;
     }
     println!("首条内容已存档 → .qaqh/research/samples/dm-seg1.bin");

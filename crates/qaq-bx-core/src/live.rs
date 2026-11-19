@@ -45,9 +45,9 @@ impl LiveClient {
     pub async fn rooms(&self, page: u32) -> Result<Vec<LiveRoom>> {
         let page = page.max(1);
         let url = format!("{ROOM_LIST_URL}?area_id=0&order_type=online&page={page}&page_size=20");
-        let raw: Vec<serde_json::Value> =
+        let raw: Vec<LooseRoom> =
             crate::httpx::get_json_with_ticket(&self.http, &self.creds, None, &url).await?;
-        Ok(parse_live_rooms(&raw))
+        Ok(parse_live_rooms(raw))
     }
 
     /// 房间 FLV/HLS 播放地址（取 `durl[0].url`；房间未开播返回 `InvalidData`）。
@@ -87,7 +87,7 @@ impl LiveClient {
 
 /// 宽松房间行(数字字段实测存在字符串形态;全字段缺省安全)。
 #[derive(Deserialize)]
-struct LooseRoom {
+pub(crate) struct LooseRoom {
     #[serde(default, deserialize_with = "crate::loose::u64_any_or_zero")]
     roomid: u64,
     #[serde(default)]
@@ -106,21 +106,19 @@ struct LooseRoom {
     area_v2_parent_name: String,
 }
 
-/// 宽松解析房间列表（单测与实网共用;`roomid/online` 双形态数字;封面
-/// `user_cover` 优先,空则 `cover`;roomid 无效的行丢弃）。
-pub(crate) fn parse_live_rooms(raw: &[serde_json::Value]) -> Vec<LiveRoom> {
-    raw.iter()
-        .filter_map(|v| {
-            let room: LooseRoom = serde_json::from_value(v.clone()).ok()?;
-            if room.roomid == 0 {
-                return None;
-            }
+/// 宽松解析房间列表（单测与实网共用;`roomid/online` 双形态数字由 `LooseRoom`
+/// derive 直读,无 `Value` 中转;封面 `user_cover` 优先,空则 `cover`;roomid
+/// 无效的行丢弃）。
+pub(crate) fn parse_live_rooms(raw: Vec<LooseRoom>) -> Vec<LiveRoom> {
+    raw.into_iter()
+        .filter(|room| room.roomid != 0)
+        .map(|room| {
             let cover = if room.user_cover.trim().is_empty() {
                 room.cover
             } else {
                 room.user_cover
             };
-            Some(LiveRoom {
+            LiveRoom {
                 roomid: room.roomid,
                 title: room.title,
                 uname: room.uname,
@@ -128,7 +126,7 @@ pub(crate) fn parse_live_rooms(raw: &[serde_json::Value]) -> Vec<LiveRoom> {
                 cover,
                 area_name: room.area_v2_name,
                 parent_name: room.area_v2_parent_name,
-            })
+            }
         })
         .collect()
 }
@@ -138,8 +136,8 @@ mod tests {
     use super::*;
 
     fn parse_rooms(json: &str) -> Vec<LiveRoom> {
-        let raw: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
-        parse_live_rooms(&raw)
+        let raw: Vec<LooseRoom> = serde_json::from_str(json).unwrap();
+        parse_live_rooms(raw)
     }
 
     /// 实测响应样本(2026-11-18)宽松解析:字段缺省/字符串数字不 panic。

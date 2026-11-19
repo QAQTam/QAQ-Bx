@@ -17,6 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
+
 use windows::Win32::d3d11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
 use windows::core::Interface;
 use windows_canvas::{ColorF, GpuDevice, Rect, SwapChain};
@@ -326,6 +328,9 @@ pub enum EngineCmd {
 }
 
 /// 弹幕 overlay 条目(qaq-bx-core DanmakuElem 的引擎侧镜像,避免跨 crate 依赖)。
+///
+/// 零分配契约(#2):文本以 [`ContentRef`] 引用分段原始缓冲,只有进入过滤/绘制
+/// 的条目才解码;`mid_hash` 为 CRC32 直解的 `u32`(v0.7 屏蔽同源)。
 #[derive(Debug, Clone)]
 pub struct OverlayDanmaku {
     /// 出现时刻(毫秒)。
@@ -335,11 +340,54 @@ pub struct OverlayDanmaku {
     pub fontsize: i32,
     /// 0xRRGGBB。
     pub color: u32,
-    pub content: String,
-    /// 发送者 mid CRC32 hash(网页版用户屏蔽同源;空 = 未下发)。
-    pub mid_hash: String,
+    pub content: ContentRef,
+    /// 发送者 mid CRC32 hash(网页版用户屏蔽同源;None = 未下发/非法)。
+    pub mid_hash: Option<u32>,
     /// 云屏蔽权重(0 = 未下发;越低越疑似垃圾)。
     pub weight: u32,
+}
+
+/// 弹幕文本引用:分段原始 protobuf 缓冲的 `(off,len)` 切片(`Bytes` 引用计数,
+/// clone 无拷贝);`text()` 上屏/过滤命中时才 lossy 解码为 UTF-16 供 D2D。
+#[derive(Debug, Clone)]
+pub struct ContentRef {
+    data: Bytes,
+    off: u32,
+    len: u32,
+}
+
+impl ContentRef {
+    pub fn new(data: Bytes, off: u32, len: u32) -> Self {
+        Self { data, off, len }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        let start = (self.off as usize).min(self.data.len());
+        let end = start
+            .saturating_add(self.len as usize)
+            .min(self.data.len());
+        &self.data[start..end]
+    }
+
+    pub fn text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(self.bytes())
+    }
+}
+
+impl From<&str> for ContentRef {
+    fn from(s: &str) -> Self {
+        let data = Bytes::copy_from_slice(s.as_bytes());
+        let len = data.len() as u32;
+        Self { data, off: 0, len }
+    }
+}
+
+impl From<String> for ContentRef {
+    fn from(s: String) -> Self {
+        let data = Bytes::from(s.into_bytes());
+        let len = data.len() as u32;
+        Self { data, off: 0, len }
+    }
 }
 
 /// 弹幕过滤规则(网页版弹幕屏蔽面板对齐)。UI 侧原样下发,引擎线程编译执行。
@@ -372,7 +420,7 @@ pub(crate) struct CompiledDanmakuFilter {
     cfg: DanmakuFilter,
     keywords: Vec<String>,
     regexes: Vec<regex::Regex>,
-    users: Vec<String>,
+    users: Vec<u32>,
 }
 
 impl CompiledDanmakuFilter {
@@ -387,9 +435,9 @@ impl CompiledDanmakuFilter {
                     regexes.push(re);
                 }
             } else if let Some(hash) = rule.strip_prefix("u:") {
-                let hash = hash.trim().to_string();
-                if !hash.is_empty() {
-                    users.push(hash);
+                // #2:midHash 规则编译期直解 u32(与元素侧同型),非法静默丢弃。
+                if let Ok(v) = u32::from_str_radix(hash.trim(), 16) {
+                    users.push(v);
                 }
             } else {
                 let kw = rule.to_lowercase();
@@ -437,21 +485,21 @@ impl CompiledDanmakuFilter {
             return false;
         }
         if !self.users.is_empty()
-            && self
-                .users
-                .iter()
-                .any(|u| e.mid_hash.eq_ignore_ascii_case(u))
+            && e.mid_hash.is_some_and(|h| self.users.contains(&h))
         {
             return false;
         }
         if !self.keywords.is_empty() {
-            let lower = e.content.to_lowercase();
+            let lower = e.content.text().to_lowercase();
             if self.keywords.iter().any(|kw| lower.contains(kw.as_str())) {
                 return false;
             }
         }
-        if self.regexes.iter().any(|re| re.is_match(&e.content)) {
-            return false;
+        if !self.regexes.is_empty() {
+            let text = e.content.text();
+            if self.regexes.iter().any(|re| re.is_match(text.as_ref())) {
+                return false;
+            }
         }
         true
     }
@@ -474,7 +522,7 @@ impl CompiledDanmakuFilter {
                 continue;
             }
             if self.cfg.block_repeat {
-                let key = e.content.to_lowercase();
+                let key = e.content.text().to_lowercase();
                 let dup = dedup
                     .get(&key)
                     .is_some_and(|&last| (e.progress_ms - last).abs() < REPEAT_WINDOW_MS);
@@ -1334,6 +1382,8 @@ pub(crate) fn draw_danmaku_overlay(
             break; // 排序后早退
         }
         let elapsed = t - progress;
+        // #2:解码收拢到上屏点——每帧仅对时间窗内条目做一次 lossy。
+        let content = elem.content.text();
         let (x, y) = match elem.mode {
             1 | 2 | 3 => {
                 if elapsed > ROLL_SECONDS {
@@ -1348,7 +1398,7 @@ pub(crate) fn draw_danmaku_overlay(
                 if elapsed > PIN_SECONDS {
                     continue;
                 }
-                let est_w = elem.content.chars().count() as f32 * char_width;
+                let est_w = content.chars().count() as f32 * char_width;
                 let x = (width_f - est_w).max(8.0) / 2.0;
                 let y = match elem.mode {
                     4 => (height_f - lane_pitch - 14.0).max(0.0),
@@ -1376,7 +1426,7 @@ pub(crate) fn draw_danmaku_overlay(
         };
         for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
             session.draw_text(
-                &elem.content,
+                &content,
                 format,
                 &Rect {
                     left: x + dx,
@@ -1399,7 +1449,7 @@ pub(crate) fn draw_danmaku_overlay(
             (r, g, b)
         };
         if let Ok(brush) = session.create_solid_brush(ColorF::new(r, g, b, alpha)) {
-            session.draw_text(&elem.content, format, &rect, &brush);
+            session.draw_text(&content, format, &rect, &brush);
         }
     }
 }
@@ -1608,7 +1658,7 @@ mod tests {
                 fontsize: 22,
                 color: 0xFFFFFF,
                 content: "滚动".into(),
-                mid_hash: String::new(),
+                mid_hash: None,
                 weight: 0,
             },
             OverlayDanmaku {
@@ -1617,7 +1667,7 @@ mod tests {
                 fontsize: 22,
                 color: 0xFFFFFF,
                 content: "底端".into(),
-                mid_hash: String::new(),
+                mid_hash: None,
                 weight: 0,
             },
             OverlayDanmaku {
@@ -1626,7 +1676,7 @@ mod tests {
                 fontsize: 22,
                 color: 0xFFFFFF,
                 content: "顶端".into(),
-                mid_hash: String::new(),
+                mid_hash: None,
                 weight: 0,
             },
         ];
@@ -1654,7 +1704,7 @@ mod tests {
                 fontsize: 25,
                 color: 0xFFFFFF,
                 content: "大字号滚动".into(),
-                mid_hash: String::new(),
+                mid_hash: None,
                 weight: 0,
             },
             OverlayDanmaku {
@@ -1663,7 +1713,7 @@ mod tests {
                 fontsize: 25,
                 color: 0xFFFFFF,
                 content: "底部".into(),
-                mid_hash: String::new(),
+                mid_hash: None,
                 weight: 0,
             },
             OverlayDanmaku {
@@ -1672,7 +1722,7 @@ mod tests {
                 fontsize: 25,
                 color: 0xFFFFFF,
                 content: "顶部".into(),
-                mid_hash: String::new(),
+                mid_hash: None,
                 weight: 0,
             },
         ];
@@ -1768,7 +1818,7 @@ mod tests {
             fontsize: 22,
             color,
             content: content.into(),
-            mid_hash: String::new(),
+            mid_hash: None,
             weight: 0,
         };
         // 关键词:忽略大小写子串。
@@ -1802,7 +1852,7 @@ mod tests {
         });
         let mut e = mk("正常内容", 1, 0xFFFFFF);
         assert!(f.passes(&e));
-        e.mid_hash = "abcd1234".into();
+        e.mid_hash = Some(0xabcd_1234);
         assert!(!f.passes(&e));
         // 类型屏蔽:滚动放行,顶部/底部屏蔽。
         let f = CompiledDanmakuFilter::compile(&DanmakuFilter {
@@ -1842,7 +1892,7 @@ mod tests {
             fontsize: 22,
             color: 0xFFFFFF,
             content: content.into(),
-            mid_hash: String::new(),
+            mid_hash: None,
             weight: 0,
         };
         let f = CompiledDanmakuFilter::compile(&DanmakuFilter {

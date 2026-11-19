@@ -138,6 +138,7 @@ mod tests {
                 initialization: "0-976".into(),
                 index_range: "977-1721".into(),
             }),
+            segment_base_snake: None,
             extra: Default::default(),
         }
     }
@@ -155,6 +156,7 @@ mod tests {
                 initialization: "0-512".into(),
                 index_range: "513-1024".into(),
             }),
+            segment_base_snake: None,
             extra: Default::default(),
         }
     }

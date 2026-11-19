@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use qaq_bx_core::account::{AccountStat, NavClient, RelationKind, RelationPage, RelationUser};
-use qaq_bx_core::danmaku::{DanmakuClient, DanmakuElem, SEGMENT_MS};
+use qaq_bx_core::danmaku::{DanmakuClient, DanmakuSegment, SEGMENT_MS};
 use qaq_bx_core::feed::{
     ArchiveCard, FeedCard, FeedClient, FeedKind, FeedSession, fetch_rcmd_batch,
 };
@@ -30,7 +30,7 @@ use qaq_bx_core::reply::{ReplyClient, ReplyCursor, ReplyItem, ReplyPage, ReplySo
 use qaq_bx_core::search::{SearchClient, SearchVideo};
 use qaq_bx_core::settings::{AppSettings, FileSettingsStore, PlayerEngine, SETTINGS_FILE};
 use qaq_bx_core::stream_proxy::StreamProxy;
-use qaq_bx_video::engine::{DanmakuFilter, OverlayDanmaku, VideoConfig, VideoEngine};
+use qaq_bx_video::engine::{ContentRef, DanmakuFilter, OverlayDanmaku, VideoConfig, VideoEngine};
 use qaq_bx_video::native::NativePlayer;
 use qaq_bx_video::stage::DanmakuStage;
 use windows::Media::MediaPlaybackStatus;
@@ -944,7 +944,7 @@ pub enum Message {
         /// S3:弹幕投递代次(切引擎即换代;旧链在途分段到货时作废,避免双投)。
         epoch: u64,
         index: u32,
-        elems: Vec<DanmakuElem>,
+        segment: DanmakuSegment,
     },
     /// 弹幕分段拉取失败(静默;预存链跳过该段继续,播放不受影响)。
     DanmakuFailed {
@@ -2915,11 +2915,11 @@ impl AppShell {
         context.spawn_background(move |_| {
             let client = DanmakuClient::with_nav(auth.http(), auth.credential_provider(), nav);
             match block_on(client.segment(meta.cid, meta.aid, index)) {
-                Ok(elems) => Message::DanmakuPart {
+                Ok(segment) => Message::DanmakuPart {
                     seq,
                     epoch,
                     index,
-                    elems,
+                    segment,
                 },
                 Err(error) => Message::DanmakuFailed {
                     seq,
@@ -5525,22 +5525,25 @@ impl Component for AppShell {
                 seq,
                 epoch,
                 index,
-                elems,
+                segment,
             } => {
                 // 播放代次或弹幕投递代次(切引擎)过期 → 整段作废,不续链。
                 if seq != self.playback_gen || epoch != self.danmaku_epoch {
                     return;
                 }
                 // 转引擎镜像类型(避免 qaq-bx-video 依赖 qaq-bx-core),增量追加;
-                // 引擎线程归并回 progress 升序后在视频帧上叠画(暂停即冻结)。
-                let items = elems
-                    .into_iter()
+                // 文本零拷贝:#2 条目仅携带分段缓冲的 (off,len),被筛掉的弹幕
+                // 全程不物化 String。引擎线程归并回 progress 升序后叠画。
+                let data = segment.data().clone();
+                let items = segment
+                    .elems()
+                    .iter()
                     .map(|e| OverlayDanmaku {
                         progress_ms: e.progress_ms,
                         mode: e.mode,
                         fontsize: e.fontsize,
                         color: e.color,
-                        content: e.content,
+                        content: ContentRef::new(data.clone(), e.content_off, e.content_len),
                         mid_hash: e.mid_hash,
                         weight: e.weight,
                     })

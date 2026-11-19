@@ -922,9 +922,8 @@ impl NativePlayer {
             InMemoryRandomAccessStream::new().map_err(|e| format!("内存流创建失败:{e}"))?;
         let writer =
             DataWriter::CreateDataWriter(&stream).map_err(|e| format!("DataWriter 创建失败:{e}"))?;
-        let bytes: Vec<u8> = mpd.bytes().collect();
         writer
-            .WriteBytes(&bytes)
+            .WriteBytes(mpd.as_bytes())
             .map_err(|e| format!("MPD 写入失败:{e}"))?;
         writer
             .StoreAsync()

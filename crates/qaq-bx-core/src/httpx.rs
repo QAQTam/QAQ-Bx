@@ -90,15 +90,16 @@ pub(crate) async fn get_json_with_referer<T: DeserializeOwned>(
     }
 }
 
-/// 同 [`get_bytes`]，额外注入可用 `bili_ticket`。
+/// 同 [`get_bytes`]，额外注入可用 `bili_ticket`。返回 `Bytes`(引用计数缓冲,
+/// 下游零拷贝切片;#2 弹幕分段直传解析)。
 pub(crate) async fn get_bytes_with_ticket(
     http: &reqwest::Client,
     creds: &Arc<dyn CredentialProvider>,
     ticket: Option<&TicketManager>,
     url: &str,
-) -> Result<Vec<u8>> {
+) -> Result<bytes::Bytes> {
     let resp = send_get(http, creds, ticket, url, "https://www.bilibili.com/").await?;
-    Ok(resp.bytes().await?.to_vec())
+    Ok(resp.bytes().await?)
 }
 
 /// 带登录态的表单 POST + `Envelope<T>` 解包（写接口统一入口：

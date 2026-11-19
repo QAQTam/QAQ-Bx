@@ -127,6 +127,30 @@ composition 液态玻璃:效果采样 XAML 背景内容做 blur(saturation(backd
 |---|---|---|---|---|
 | C-1 评论区 composer 竖堆 | 播放页评论区头像独占一行居中、输入框独占一行拉满、「发布」钮掉到第三行左侧,本应单行三列 `[头像 \| 输入框 \| 发布]` | v0.2.0「U1 评论发布接线」(提交 `18c755e`)为支持条件性行内提示把 composer 子元素改成动态 `Vec<View>`,容器从 `Grid [Auto, Star(1), Auto]` 顺手换成垂直 `StackPanel`,却保留子元素的 `Grid.Column` 附加属性——该属性映射 WinUI `Grid.Column`(fork `native/generated.rs` → `Grid::ColumnProperty`),**只有 Grid 布局会读**,StackPanel 静默忽略 → 三子元素各排一行;notice 的 `.grid_column(1)` 同失效 | `crates/qaq-bx-ui/src/pages/player.rs`:抽出 `comment_composer` 纯函数,容器恢复 `Grid` 三列 `[Auto, Star(1), Auto]` + 两行 `[Auto, Auto]`(`Vec<View>` 本就实现 `IntoViews`,Grid 可直接收动态子元素,换容器本不必要);notice 补 `.grid_row(1)` 落第 2 行输入框列,无 notice 时第 2 行 Auto 收零高 | 新增单测 `composer_is_three_column_grid_with_notice_on_second_row`(根节点必须 Grid、禁 StackPanel、TextBox/Button 段落各钉 Grid.Column 1/2、notice 钉 Grid.Row=1+Column=1、登录/未登录双态文案与置灰);`qaq-bx-ui` 94 passed 0 failed;`just selftest comments` PASS(真实评论首页 + 排序双桶 + Back,0 panic) |
 
+## Z. 后端零拷贝三件套(refs #1/#2/#3,2026-11-19)✅
+
+依据 `docs/dev-notes/zero-copy-audit.md`,领单实施 GitHub issue #1(P0)/#2(P1)/
+#3(P2)。播放热路径 CPU、瞬时峰值与首帧延迟收益;P2 总内存不变(本就由 mpv/解码
+池主导)。
+
+| 项 | 内容 | 落点 / 证据 |
+|---|---|---|
+| Z1 #1 stream_proxy `Bytes` 贯通 + 边收边转发 | 缓存/watch/`FetchOutcome` 全链路 `bytes::Bytes`(去 `to_vec` 二次拷贝;单片终态 0 拷贝直转);分块 leader 改 spawn 任务,`bytes_stream` 逐片到达即广播连续前缀快照,播放器不必等整块下完;候选中途截断从已发布缺口续拉(已发字节绝对位置不变,failover 语义保留);请求头解析保持复用 | `qaq-bx-core/src/stream_proxy.rs`;新增测试 `reader_receives_bytes_before_chunk_completes`(首 8 KiB 到达 <200ms,整块需 ~300ms 滴流)、`midstream_truncation_resumes_from_gap_on_backup`(备线自 16384 缺口续拉);既有 Range/failover/416/有界缓存测试全绿。⚠ perf-probe 真机首帧/内存曲线未在本会话实测(需登录实播),留待回放对照后补数 |
+| Z2 #2 弹幕解析零分配 | `get_bytes_with_ticket` 返回 `Bytes`;`DanmakuSegment{data:Bytes, elems}` 元素仅存 `(content_off,content_len)`,`mid_hash` 转 `Option<u32>`(8 位 hex 直解);video 侧 `OverlayDanmaku.content: ContentRef`(Bytes+offset/len),解码收拢到过滤命中/上屏绘制点,被密度筛掉的弹幕全程零分配;`u:` 屏蔽规则编译期直解 u32(core/video 仍零跨 crate 类型耦合,经 shell 映射) | `qaq-bx-core/src/{danmaku.rs,httpx.rs}`、`qaq-bx-video/src/{engine.rs,stage.rs}`、`qaq-bx-ui/src/shell.rs`;新增单测:非法 UTF-8 延迟解码/越界 content 丢弃/空 content 保留/mid_hash 非 hex 回退/大小写 hex 解析;filter 语义测试迁移 u32 比对 |
+| Z3 #3 JSON 二次解析清理 | `loose_str`/`seg_base_loose` 手写 Visitor 直读(零 `Value` 中转,重复内键 last-wins 与旧语义一致);dash `segment_base` snake 键形改独立强类型字段(不再 `extra`+`from_value(v.clone())` 二次解析);live 房间列表 `Vec<LooseRoom>` derive 直读;native MPD 写入 `mpd.as_bytes()` 去 `bytes().collect()` 拷贝 | `qaq-bx-core/src/{player.rs,live.rs}`、`qaq-bx-video/src/native.rs`;新增 `seg_base_visitor_handles_all_wire_shapes`、`snake_segment_base_lands_in_typed_field_not_extra`;既有 Pascal/camel/snake/null/双键契约测试保持全绿 |
+
+行为差异(有意收紧):#3 中 `initialization`/`indexRange` 为 null/容器形态时由旧
+「to_string 保留垃圾串」改为置空缺失,避免向 MPD 写非法字节范围;#1 中「无
+Content-Range 的短 206」由整块接受改为收敛该块尾(等价旧上层短块判定)。
+
+### Z 项验收实测(2026-11-19)
+
+- `cargo test --workspace` 全绿:**222 passed, 0 failed, 7 ignored**(较 v0.4.0
+  基线净增 8 项:core +6 新单测/回归、stream_proxy +2 时序测试;2 项旧 dash 契约
+  测试迁移到新签名)。
+- 新增依赖:`bytes = "1"`(reqwest 同树传递依赖)、reqwest `stream` feature
+  (仅启用已解析的 futures-util/tokio-util,依赖树零新增)。
+
 ## 版本
 
 - workspace 版本 0.2.0 → **0.4.0**(`Cargo.toml [workspace.package]`,成员
