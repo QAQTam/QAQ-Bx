@@ -14,8 +14,13 @@ use qaq_bx_core::danmaku::{DanmakuClient, DanmakuSegment, SEGMENT_MS};
 use qaq_bx_core::feed::{
     ArchiveCard, FeedCard, FeedClient, FeedKind, FeedSession, fetch_rcmd_batch,
 };
+use qaq_bx_core::fav::FavClient;
+use qaq_bx_core::history::HistoryClient;
 use qaq_bx_core::live::LiveClient;
 use crate::pages::live::{LiveCard, LivePageState};
+use crate::pages::user_lists::{
+    FavFolderChip, FavPageState, UserListState, UserVideoCard,
+};
 use qaq_bx_core::notify::{
     AtNotice, FeedCursor, LikeNotice, ReplyNotice, SystemNotice, UnreadSummary, WhisperMessage,
     WhisperSession,
@@ -580,6 +585,15 @@ pub struct ShellProbe {
     pub home_videos: usize,
     /// #7:首页首个真实卡 bvid(peek 场景注入悬停用)。
     pub home_first_bvid: Option<String>,
+    /// U5:历史页已加载条数(selftest 断言)。
+    pub user_history_count: usize,
+    /// U5:稍后再看页已加载条数(selftest 断言)。
+    pub user_watch_later_count: usize,
+    /// U5:收藏页已选夹与资源条数(selftest 断言)。
+    pub user_fav_cards: usize,
+    pub user_fav_folders: usize,
+    /// U5:当前登录态(selftest user-lists 场景分流用)。
+    pub lists_logged_in: bool,
 }
 
 pub struct AppShell {
@@ -719,6 +733,20 @@ pub struct AppShell {
     live_client: Arc<LiveClient>,
     /// 直播封面在飞集合(url 键)。
     live_cover_inflight: std::collections::HashSet<String>,
+    /// 历史页单源状态(U5;登录态 history API)。
+    user_history: UserListState,
+    /// 稍后再看页单源状态(U5;登录态 toview API)。
+    watch_later: UserListState,
+    /// 收藏页单源状态(U5;v3 夹列表 → 资源列表两级)。
+    favorites: FavPageState,
+    /// 历史/稍后再看客户端(U5;登录态必需,与共享凭据同源)。
+    history_client: Arc<HistoryClient>,
+    /// 收藏夹客户端(U5)。
+    fav_client: Arc<FavClient>,
+    /// 用户列表封面在飞集合(三页共用,url 键)。
+    user_cover_inflight: std::collections::HashSet<String>,
+    /// 用户列表卡索引(bvid → 展示模型;open_video 数据源链一环)。
+    user_index: HashMap<String, VideoItem>,
     /// 热门卡索引（bvid → 展示模型；open_video 数据源链一环）。
     popular_index: HashMap<String, VideoItem>,
     /// 播放页右栏相关推荐状态（真实 archive/related API，跟随播放代次）。
@@ -989,6 +1017,34 @@ pub enum Message {
     LiveReady { gen_id: u64, result: Result<String, String> },
     /// U4:直播页加载更多。
     LiveMore,
+    /// U5:历史页就绪(page 失配即丢弃)。
+    HistoryLoaded {
+        page: u32,
+        res: Result<Vec<UserVideoCard>, String>,
+    },
+    /// U5:历史页加载更多。
+    HistoryMore,
+    /// U5:稍后再看页就绪(count + 卡;page 失配即丢弃)。
+    WatchLaterLoaded {
+        page: u32,
+        res: Result<(u64, Vec<UserVideoCard>), String>,
+    },
+    /// U5:稍后再看页加载更多。
+    WatchLaterMore,
+    /// U5:收藏夹列表就绪。
+    FavFoldersLoaded { res: Result<Vec<FavFolderChip>, String> },
+    /// U5:选中收藏夹(复位资源列表并拉首页)。
+    FavSelectFolder(u64),
+    /// U5:收藏夹资源页就绪(folder+page 失配即丢弃;载 (夹总数, 卡, has_more))。
+    FavResourcesLoaded {
+        folder: u64,
+        page: u32,
+        res: Result<(u64, Vec<UserVideoCard>, bool), String>,
+    },
+    /// U5:收藏页加载更多。
+    FavMore,
+    /// U5:用户列表封面就绪(url 键回填)。
+    UserCoverReady { url: String, image: Option<EncodedImage> },
     /// 弹幕分段到货(预存链;即到即画,引擎侧归并排序)。
     DanmakuPart {
         seq: u64,
@@ -1243,6 +1299,33 @@ fn search_video_item(video: &SearchVideo) -> VideoItem {
     }
 }
 
+/// U5:用户列表卡 → open_video 展示模型(封面沿用已解码位图;aid/cid 由
+/// video_meta 解析管线回填,卡片不预置)。
+fn user_card_item(card: &UserVideoCard) -> VideoItem {
+    VideoItem {
+        bvid: card.bvid.clone(),
+        aid: 0,
+        cid: 0,
+        title: card.title.clone(),
+        author: card.up_name.clone(),
+        author_mid: 0,
+        author_face_url: None,
+        duration_secs: card.duration_secs,
+        play_count: card.play_count,
+        danmaku_count: 0,
+        like_count: None,
+        coin_count: None,
+        favorite_count: None,
+        share_count: None,
+        cover: card.cover.clone(),
+        pic_url: if card.cover_url.is_empty() {
+            None
+        } else {
+            Some(card.cover_url.clone())
+        },
+    }
+}
+
 /// 归档卡（popular/related 真实接口）→ 展示模型(封面占位,由 ImageCache/CoverReady 异步填充)。
 fn archive_video_item(card: &ArchiveCard) -> VideoItem {
     VideoItem {
@@ -1358,6 +1441,11 @@ impl AppShell {
         out.current_qn = self.current_qn;
         out.live_rooms = self.live.cards.len();
         out.live_first_roomid = self.live.cards.first().map_or(0, |c| c.room.roomid);
+        out.user_history_count = self.user_history.cards.len();
+        out.user_watch_later_count = self.watch_later.cards.len();
+        out.user_fav_cards = self.favorites.resources.cards.len();
+        out.user_fav_folders = self.favorites.folders.len();
+        out.lists_logged_in = self.lists_logged_in();
         out.player_engine = self.effective_player_engine().tag().to_string();
         out.native_playback = self.native_playback;
         out.portrait_mode = self.settings.portrait_mode;
@@ -1523,6 +1611,7 @@ impl AppShell {
             .or_else(|| self.search_index.get(bvid).cloned())
             .or_else(|| self.popular_index.get(bvid).cloned())
             .or_else(|| self.related_index.get(bvid).cloned())
+            .or_else(|| self.user_index.get(bvid).cloned())
         {
             Some(item) => item,
             None => minimal_video_item(bvid, ""),
@@ -2805,6 +2894,311 @@ impl AppShell {
         });
     }
 
+    // ---- U5:登录态列表页(历史/稍后再看/收藏) ----
+    //
+    // 门控纪律:未登录不发请求(与 U1 评论发布同款);登录态切换由
+    // `reset_account_data` 清态,翻页页号随之复位。
+
+    fn lists_logged_in(&self) -> bool {
+        matches!(self.auth, AuthState::LoggedIn(_))
+    }
+
+    /// U5:历史页首屏/加载更多。
+    fn ensure_history(&mut self, context: &ComponentContext<Self>) {
+        if !self.lists_logged_in() || self.user_history.loaded_once || self.user_history.loading {
+            return;
+        }
+        self.fetch_history(context);
+    }
+
+    fn fetch_history(&mut self, context: &ComponentContext<Self>) {
+        if !self.lists_logged_in() || self.user_history.loading {
+            return;
+        }
+        self.user_history.loading = true;
+        self.user_history.error = None;
+        let client = self.history_client.clone();
+        let cache = self.image_cache.clone();
+        let page = self.user_history.next_page.max(1);
+        context.spawn_background(move |_| {
+            let res = block_on(client.history(page))
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| {
+                            pages::user_lists::card_from_watch(
+                                item,
+                                &crate::theme::fmt_time(item.viewed_at),
+                                cache.get(&item.cover),
+                            )
+                        })
+                        .collect()
+                })
+                .map_err(|err| err.to_string());
+            Message::HistoryLoaded { page, res }
+        });
+    }
+
+    fn absorb_history(
+        &mut self,
+        page: u32,
+        res: Result<Vec<UserVideoCard>, String>,
+        context: &ComponentContext<Self>,
+    ) {
+        if page != self.user_history.next_page {
+            return;
+        }
+        self.user_history.loading = false;
+        let cards = match res {
+            Ok(cards) => cards,
+            Err(err) => {
+                self.user_history.error = Some(err);
+                return;
+            }
+        };
+        self.user_history.next_page += 1;
+        self.user_history.reached_end = cards.is_empty();
+        for card in cards {
+            if card.cover.is_none() && !card.cover_url.is_empty() {
+                self.spawn_user_cover(card.cover_url.clone(), context);
+            }
+            self.user_index
+                .insert(card.bvid.clone(), user_card_item(&card));
+            self.user_history.cards.push(card);
+        }
+        self.user_history.loaded_once = true;
+    }
+
+    /// U5:稍后再看页首屏/加载更多(服务端 count 作页头总数)。
+    fn ensure_watch_later(&mut self, context: &ComponentContext<Self>) {
+        if !self.lists_logged_in() || self.watch_later.loaded_once || self.watch_later.loading {
+            return;
+        }
+        self.fetch_watch_later(context);
+    }
+
+    fn fetch_watch_later(&mut self, context: &ComponentContext<Self>) {
+        if !self.lists_logged_in() || self.watch_later.loading {
+            return;
+        }
+        self.watch_later.loading = true;
+        self.watch_later.error = None;
+        let client = self.history_client.clone();
+        let cache = self.image_cache.clone();
+        let page = self.watch_later.next_page.max(1);
+        context.spawn_background(move |_| {
+            let res = block_on(async {
+                let page = client.toview(page).await;
+                page.map(|data| {
+                    let cards = data
+                        .items
+                        .iter()
+                        .map(|item| {
+                            pages::user_lists::card_from_watch(
+                                item,
+                                &item
+                                    .added_at
+                                    .map(crate::theme::fmt_time)
+                                    .unwrap_or_default(),
+                                cache.get(&item.cover),
+                            )
+                        })
+                        .collect();
+                    (data.total, cards)
+                })
+            });
+            let res = res.map_err(|err| err.to_string());
+            Message::WatchLaterLoaded { page, res }
+        });
+    }
+
+    fn absorb_watch_later(
+        &mut self,
+        page: u32,
+        res: Result<(u64, Vec<UserVideoCard>), String>,
+        context: &ComponentContext<Self>,
+    ) {
+        if page != self.watch_later.next_page {
+            return;
+        }
+        self.watch_later.loading = false;
+        let (total, cards) = match res {
+            Ok(pair) => pair,
+            Err(err) => {
+                self.watch_later.error = Some(err);
+                return;
+            }
+        };
+        self.watch_later.next_page += 1;
+        self.watch_later.reached_end = cards.is_empty();
+        self.watch_later.total = Some(total);
+        for card in cards {
+            if card.cover.is_none() && !card.cover_url.is_empty() {
+                self.spawn_user_cover(card.cover_url.clone(), context);
+            }
+            self.user_index
+                .insert(card.bvid.clone(), user_card_item(&card));
+            self.watch_later.cards.push(card);
+        }
+        self.watch_later.loaded_once = true;
+    }
+
+    /// U5:收藏页首屏(夹列表;成功后默认选首夹并拉资源首页)。
+    fn ensure_favorites(&mut self, context: &ComponentContext<Self>) {
+        if !self.lists_logged_in() || self.favorites.folders_loading || self.favorites.folders_loaded
+        {
+            return;
+        }
+        self.fetch_fav_folders(context);
+    }
+
+    fn fetch_fav_folders(&mut self, context: &ComponentContext<Self>) {
+        if !self.lists_logged_in() || self.favorites.folders_loading {
+            return;
+        }
+        self.favorites.folders_loading = true;
+        self.favorites.folders_error = None;
+        let client = self.fav_client.clone();
+        // mid 从登录态资料直取(lists_logged_in 已保证 LoggedIn 分支)。
+        let mid = match &self.auth {
+            AuthState::LoggedIn(user) => user.mid,
+            _ => 0,
+        };
+        if mid == 0 {
+            self.favorites.folders_loading = false;
+            self.favorites.folders_error = Some("未获取到用户 mid,请稍后重试".into());
+            return;
+        }
+        context.spawn_background(move |_| {
+            let res = block_on(client.created_folders(mid))
+                .map(|folders| {
+                    folders
+                        .into_iter()
+                        .map(|f| FavFolderChip {
+                            id: f.id,
+                            title: f.title,
+                            media_count: f.media_count,
+                        })
+                        .collect()
+                })
+                .map_err(|err| err.to_string());
+            Message::FavFoldersLoaded { res }
+        });
+    }
+
+    fn absorb_fav_folders(
+        &mut self,
+        res: Result<Vec<FavFolderChip>, String>,
+        context: &ComponentContext<Self>,
+    ) {
+        self.favorites.folders_loading = false;
+        let folders = match res {
+            Ok(folders) => folders,
+            Err(err) => {
+                self.favorites.folders_error = Some(err);
+                return;
+            }
+        };
+        let first = folders.first().map(|f| f.id).unwrap_or(0);
+        self.favorites.folders = folders;
+        self.favorites.folders_loaded = true;
+        if first != 0 && self.favorites.selected == 0 {
+            self.select_fav_folder(first, context);
+        }
+    }
+
+    fn select_fav_folder(&mut self, folder: u64, context: &ComponentContext<Self>) {
+        if folder == 0 {
+            return;
+        }
+        self.favorites.selected = folder;
+        self.favorites.resources = UserListState::default();
+        self.fetch_fav_resources(context);
+    }
+
+    fn fetch_fav_resources(&mut self, context: &ComponentContext<Self>) {
+        let folder = self.favorites.selected;
+        if !self.lists_logged_in() || folder == 0 || self.favorites.resources.loading {
+            return;
+        }
+        self.favorites.resources.loading = true;
+        self.favorites.resources.error = None;
+        let client = self.fav_client.clone();
+        let cache = self.image_cache.clone();
+        let page = self.favorites.resources.next_page.max(1);
+        context.spawn_background(move |_| {
+            let res = block_on(client.resources(folder, page))
+                .map(|data| {
+                    let cards = data
+                        .items
+                        .iter()
+                        .map(|media| {
+                            pages::user_lists::card_from_fav(
+                                media,
+                                &crate::theme::fmt_time(media.fav_at),
+                                cache.get(&media.cover),
+                            )
+                        })
+                        .collect();
+                    (data.folder_media_count, cards, data.has_more)
+                })
+                .map_err(|err| err.to_string());
+            Message::FavResourcesLoaded { folder, page, res }
+        });
+    }
+
+    fn absorb_fav_resources(
+        &mut self,
+        folder: u64,
+        page: u32,
+        res: Result<(u64, Vec<UserVideoCard>, bool), String>,
+        context: &ComponentContext<Self>,
+    ) {
+        if folder != self.favorites.selected || page != self.favorites.resources.next_page {
+            return;
+        }
+        self.favorites.resources.loading = false;
+        let (total, cards, has_more) = match res {
+            Ok(triple) => triple,
+            Err(err) => {
+                self.favorites.resources.error = Some(err);
+                return;
+            }
+        };
+        self.favorites.resources.next_page += 1;
+        self.favorites.resources.reached_end = !has_more || cards.is_empty();
+        self.favorites.resources.total = Some(total);
+        for card in cards {
+            if card.cover.is_none() && !card.cover_url.is_empty() {
+                self.spawn_user_cover(card.cover_url.clone(), context);
+            }
+            self.user_index
+                .insert(card.bvid.clone(), user_card_item(&card));
+            self.favorites.resources.cards.push(card);
+        }
+        self.favorites.resources.loaded_once = true;
+    }
+
+    /// U5:用户列表封面补拉(url 键 LRU;与视频封面同一信号量节流)。
+    fn spawn_user_cover(&mut self, url: String, context: &ComponentContext<Self>) {
+        if !self.user_cover_inflight.insert(url.clone()) {
+            return;
+        }
+        let auth = self.auth_service.clone();
+        let cache = self.image_cache.clone();
+        context.spawn_background(move |_| {
+            let image = block_on(async {
+                let _permit = cover_semaphore().acquire().await.ok()?;
+                auth.fetch_image_async(&url).await
+            });
+            if image.is_some() {
+                cache.put(url.clone(), image.clone().unwrap());
+            }
+            Message::UserCoverReady { url, image }
+        });
+    }
+
+
     /// U4:直播间 → Player 页(mpv 直播 FLV/HLS;评论区/画质/分P/弹幕不适用)。
     fn start_live_playback(
         &mut self,
@@ -3903,6 +4297,12 @@ impl AppShell {
         self.notify_gen = self.notify_gen.wrapping_add(1);
         self.account_stat = None;
         self.unread_summary = UnreadSummary::default();
+        // U5:登录态切换(登录/登出/换号)一律清列表态,翻页页号随之复位。
+        self.user_history = UserListState::default();
+        self.watch_later = UserListState::default();
+        self.favorites = FavPageState::default();
+        self.user_index.clear();
+        self.user_cover_inflight.clear();
         self.followings = ListSliceState::default();
         self.followings_next_pn = 1;
         self.followers = ListSliceState::default();
@@ -4558,6 +4958,14 @@ impl Component for AppShell {
             auth_service.http(),
             auth_service.credential_provider(),
         ));
+        let history_client = Arc::new(HistoryClient::new(
+            auth_service.http(),
+            auth_service.credential_provider(),
+        ));
+        let fav_client = Arc::new(FavClient::new(
+            auth_service.http(),
+            auth_service.credential_provider(),
+        ));
 
         // 启动即探测登录态（含自动 Cookie 续期 + `bili_ticket` 预热；后台单飞不重跑）。
         context.spawn_background({
@@ -4826,6 +5234,13 @@ impl Component for AppShell {
             },
             live_client,
             live_cover_inflight: std::collections::HashSet::new(),
+            user_history: UserListState::default(),
+            watch_later: UserListState::default(),
+            favorites: FavPageState::default(),
+            history_client,
+            fav_client,
+            user_cover_inflight: std::collections::HashSet::new(),
+            user_index: HashMap::new(),
             popular: pages::popular::PopularFeedState {
                 // pn 从 1 起（实测 pn=0 非法）；直启热门路由时首页已在飞。
                 next_pn: 1,
@@ -4956,6 +5371,15 @@ impl Component for AppShell {
                     }
                     if route == Route::Live {
                         self.ensure_live(context);
+                    }
+                    if route == Route::History {
+                        self.ensure_history(context);
+                    }
+                    if route == Route::WatchLater {
+                        self.ensure_watch_later(context);
+                    }
+                    if route == Route::Favorites {
+                        self.ensure_favorites(context);
                     }
                 }
             }
@@ -5573,6 +5997,52 @@ impl Component for AppShell {
             Message::LiveMore => {
                 self.fetch_live_rooms(context);
             }
+            Message::HistoryLoaded { page, res } => {
+                self.absorb_history(page, res, context);
+            }
+            Message::HistoryMore => {
+                self.fetch_history(context);
+            }
+            Message::WatchLaterLoaded { page, res } => {
+                self.absorb_watch_later(page, res, context);
+            }
+            Message::WatchLaterMore => {
+                self.fetch_watch_later(context);
+            }
+            Message::FavFoldersLoaded { res } => {
+                self.absorb_fav_folders(res, context);
+            }
+            Message::FavSelectFolder(folder) => {
+                self.select_fav_folder(folder, context);
+            }
+            Message::FavResourcesLoaded { folder, page, res } => {
+                self.absorb_fav_resources(folder, page, res, context);
+            }
+            Message::FavMore => {
+                self.fetch_fav_resources(context);
+            }
+            Message::UserCoverReady { url, image } => {
+                self.user_cover_inflight.remove(&url);
+                if let Some(img) = image {
+                    for card in &mut self.user_history.cards {
+                        if card.cover_url == url && card.cover.is_none() {
+                            card.cover = Some(img.clone());
+                        }
+                    }
+                    for card in &mut self.watch_later.cards {
+                        if card.cover_url == url && card.cover.is_none() {
+                            card.cover = Some(img.clone());
+                        }
+                    }
+                    for card in &mut self.favorites.resources.cards {
+                        if card.cover_url == url && card.cover.is_none() {
+                            card.cover = Some(img.clone());
+                        }
+                    }
+                    // user_index 以 bvid 键入,不按 url 回填;open_video 时经
+                    // pic_url → image_cache.get 命中位图(已 put 进缓存)。
+                }
+            }
             Message::CommentDraftChanged(text) => {
                 self.comment_draft = text;
                 if self.composer_notice.is_some() {
@@ -6061,6 +6531,15 @@ impl Component for AppShell {
                     }
                     if target == Route::Live {
                         self.ensure_live(context);
+                    }
+                    if target == Route::History {
+                        self.ensure_history(context);
+                    }
+                    if target == Route::WatchLater {
+                        self.ensure_watch_later(context);
+                    }
+                    if target == Route::Favorites {
+                        self.ensure_favorites(context);
                     }
                 }
             }
@@ -7233,6 +7712,8 @@ impl Component for AppShell {
                 .into();
         }
         let on_open = context.callback(Message::OpenVideo);
+        // U5:登录门控页「去登录」按钮(菜单导航路径,含 ensure_account_loaded)。
+        let go_login = context.message(Message::NavigateCompact(Route::Login));
         let is_vip = matches!(&self.auth, AuthState::LoggedIn(user) if user.vip.is_vip());
         let my_avatar = match &self.auth {
             AuthState::LoggedIn(user) => user.avatar.clone(),
@@ -7308,6 +7789,11 @@ impl Component for AppShell {
                         on_close_whisper_detail: context.message(Message::CloseWhisperDetail),
                         on_refresh_thread: context.callback(Message::RefreshWhisperThread),
                         on_open_video: context.callback(Message::OpenVideoTarget),
+                        on_open_history: context.message(Message::NavigateCompact(Route::History)),
+                        on_open_watch_later: context
+                            .message(Message::NavigateCompact(Route::WatchLater)),
+                        on_open_favorites: context
+                            .message(Message::NavigateCompact(Route::Favorites)),
                     }),
                 ),
                 _ => (None, None),
@@ -7362,6 +7848,57 @@ impl Component for AppShell {
                 &on_open,
                 &context.message(Message::PopularMore),
             )
+        } else if self.route == Route::History {
+            // U5:登录门控(未登录不发请求,与 U1 评论发布同款纪律)。
+            if !self.lists_logged_in() {
+                pages::user_lists::login_gate_page(
+                    "历史",
+                    "登录后查看观看历史",
+                    layout,
+                    &go_login,
+                )
+            } else {
+                pages::user_lists::history_page(
+                    &self.user_history,
+                    layout,
+                    &on_open,
+                    &context.message(Message::HistoryMore),
+                )
+            }
+        } else if self.route == Route::WatchLater {
+            if !self.lists_logged_in() {
+                pages::user_lists::login_gate_page(
+                    "稍后再看",
+                    "登录后查看稍后再看列表",
+                    layout,
+                    &go_login,
+                )
+            } else {
+                pages::user_lists::watch_later_page(
+                    &self.watch_later,
+                    layout,
+                    &on_open,
+                    &context.message(Message::WatchLaterMore),
+                )
+            }
+        } else if self.route == Route::Favorites {
+            if !self.lists_logged_in() {
+                pages::user_lists::login_gate_page(
+                    "收藏",
+                    "登录后查看收藏夹",
+                    layout,
+                    &go_login,
+                )
+            } else {
+                let on_select_folder = context.callback(|folder: u64| Message::FavSelectFolder(folder));
+                pages::user_lists::favorites_page(
+                    &self.favorites,
+                    layout,
+                    &on_select_folder,
+                    &on_open,
+                    &context.message(Message::FavMore),
+                )
+            }
         } else {
             router::route(self.route, layout, on_open.clone())
         };

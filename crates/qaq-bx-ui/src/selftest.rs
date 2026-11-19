@@ -940,6 +940,43 @@ fn peek(s: &mut Scenario) -> Result<(), String> {
     Ok(())
 }
 
+/// 场景 17:登录态列表页(历史/稍后再看/收藏;U5 接线)。
+/// 有登录凭据:等待三个页面的真实数据落定(计数 > 0)。
+/// 无凭据(冷环境):三页应为门控空态,导航可达且不 panic。
+fn user_lists(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    if !s.probe.borrow().lists_logged_in {
+        for tag in ["history", "watch-later", "favorites"] {
+            s.send(Message::NavTagSelected(Some(tag.into())))?;
+            s.sync()?;
+            assert_eq!(s.probe.borrow().route_tag, tag, "未登录也应可导航到 {tag}");
+        }
+        s.send(Message::NavTagSelected(Some("home".into())))?;
+        s.sync()?;
+        return Ok(());
+    }
+    s.send(Message::NavTagSelected(Some("history".into())))?;
+    s.wait_for(Duration::from_secs(30), |p| {
+        p.route_tag == "history" && p.user_history_count > 0
+    })
+    .map_err(|err| format!("历史数据未就绪:{err}"))?;
+    s.send(Message::NavTagSelected(Some("watch-later".into())))?;
+    s.wait_for(Duration::from_secs(30), |p| {
+        p.route_tag == "watch-later" && p.user_watch_later_count > 0
+    })
+    .map_err(|err| format!("稍后再看数据未就绪:{err}"))?;
+    s.send(Message::NavTagSelected(Some("favorites".into())))?;
+    s.wait_for(Duration::from_secs(30), |p| {
+        p.route_tag == "favorites" && p.user_fav_folders > 0
+    })
+    .map_err(|err| format!("收藏夹未就绪:{err}"))?;
+    // 资源列表:夹内可能无视频,只要求落定不 panic(给一拍缓冲)。
+    s.sync()?;
+    s.send(Message::NavTagSelected(Some("home".into())))?;
+    s.sync()?;
+    Ok(())
+}
+
 const SCENARIOS: &[(&str, &str, fn(&mut Scenario) -> Result<(), String>)] = &[
     ("boot", "FullPlayer", boot),
     ("nav", "FullPlayer", nav),
@@ -957,6 +994,7 @@ const SCENARIOS: &[(&str, &str, fn(&mut Scenario) -> Result<(), String>)] = &[
     ("engine", "FullPlayer", engine),
     ("loading-state", "FullPlayer", loading_state),
     ("peek", "FullPlayer", peek),
+    ("user-lists", "FullPlayer", user_lists),
 ];
 
 /// 解析 `--selftest [scenario]`;非 selftest 调用返回 `None` 走正常启动。

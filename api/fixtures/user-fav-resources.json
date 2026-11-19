@@ -1,0 +1,160 @@
+{
+  "url": "https://api.bilibili.com/x/v3/fav/resource/list?media_id=105925889&pn=1&ps=20&keyword=&order=mtime&type=0&tid=0&platform=web&web_location=1550101",
+  "captured_at": "2026-11-19T19:00:41.676Z",
+  "json": {
+    "code": 0,
+    "message": "OK",
+    "ttl": 1,
+    "data": {
+      "info": {
+        "id": 105925889,
+        "fid": 1059258,
+        "mid": 85841389,
+        "attr": 21,
+        "title": "TEMP",
+        "cover": "http://i2.hdslb.com/bfs/archive/cbf1eda712addc5475ff98863f1ab71eabd33cee.jpg",
+        "upper": {
+          "mid": 85841389,
+          "name": "QAQTam",
+          "face": "https://i1.hdslb.com/bfs/face/b644b95d3d15fcd01886a8c63e0c62f4cfc70e52.jpg",
+          "followed": false,
+          "vip_type": 1,
+          "vip_statue": 1
+        },
+        "cover_type": 2,
+        "cnt_info": {
+          "collect": 0,
+          "play": 1,
+          "thumb_up": 0,
+          "share": 0
+        },
+        "type": 11,
+        "intro": "",
+        "ctime": 1486173603,
+        "mtime": 1626596950,
+        "state": 0,
+        "fav_state": 0,
+        "like_state": 0,
+        "media_count": 153,
+        "is_top": false,
+        "is_kid_playlist": false,
+        "kid_playlist_desc": ""
+      },
+      "medias": [
+        {
+          "id": 117621907326313,
+          "type": 2,
+          "title": "手机不小心掉床缝听了一小时…",
+          "cover": "http://i2.hdslb.com/bfs/archive/cbf1eda712addc5475ff98863f1ab71eabd33cee.jpg",
+          "intro": "-",
+          "page": 1,
+          "duration": 14,
+          "upper": {
+            "mid": 17543422,
+            "name": "小猪音音呀",
+            "face": "https://i1.hdslb.com/bfs/face/cf30325ab45b7d5d6259803ff9e3b473e8b55d5b.jpg",
+            "jump_link": ""
+          },
+          "attr": 0,
+          "cnt_info": {
+            "collect": 134645,
+            "play": 2961590,
+            "danmaku": 17981,
+            "vt": 0,
+            "play_switch": 0,
+            "reply": 0,
+            "view_text_1": "296.1万"
+          },
+          "link": "bilibili://video/117621907326313",
+          "ctime": 1794768029,
+          "pubtime": 1794768028,
+          "fav_time": 1794965231,
+          "bv_id": "BV1oFsW6oEs5",
+          "bvid": "BV1oFsW6oEs5",
+          "season": null,
+          "ogv": null,
+          "ugc": {
+            "first_cid": 43626530199
+          },
+          "media_list_link": "bilibili://music/playlist/playpage/191767189?page_type=3&oid=117621907326313&otype=2"
+        },
+        {
+          "id": 117581407065539,
+          "type": 2,
+          "title": "精选电台 | 那些曾在b站爆火的神级歌曲 如今又唤起多少失落的魂灵",
+          "cover": "http://i1.hdslb.com/bfs/archive/85bd7995192cc8c592b82ff82f87c0115389d4c6.jpg",
+          "intro": "-",
+          "page": 1,
+          "duration": 2011,
+          "upper": {
+            "mid": 545355496,
+            "name": "PlanckLength",
+            "face": "https://i1.hdslb.com/bfs/face/325ddefb1318cf312346a9d92a4cb3e6624e37e7.jpg",
+            "jump_link": ""
+          },
+          "attr": 0,
+          "cnt_info": {
+            "collect": 8576,
+            "play": 47270,
+            "danmaku": 42,
+            "vt": 0,
+            "play_switch": 0,
+            "reply": 0,
+            "view_text_1": "4.7万"
+          },
+          "link": "bilibili://video/117581407065539",
+          "ctime": 1794150192,
+          "pubtime": 1794211200,
+          "fav_time": 1794826105,
+          "bv_id": "BV1J1WH6sEQZ",
+          "bvid": "BV1J1WH6sEQZ",
+          "season": null,
+          "ogv": null,
+          "ugc": {
+            "first_cid": 43442504272
+          },
+          "media_list_link": "bilibili://music/playlist/playpage/191767189?page_type=3&oid=117581407065539&otype=2"
+        },
+        {
+          "id": 117353807352847,
+          "type": 2,
+          "title": "中秋节来长春参加漫展了～",
+          "cover": "http://i2.hdslb.com/bfs/archive/690a3d987f8f563555f6a8cd5ba711410ea491b5.jpg",
+          "intro": "-",
+          "page": 1,
+          "duration": 148,
+          "upper": {
+            "mid": 12400166,
+            "name": "锐殿-",
+            "face": "https://i2.hdslb.com/bfs/face/7eaa549c7a7cd3f55a68a9c4acbc45813b55a965.jpg",
+            "jump_link": ""
+          },
+          "attr": 0,
+          "cnt_info": {
+            "collect": 1773,
+            "play": 196151,
+            "danmaku": 51,
+            "vt": 0,
+            "play_switch": 0,
+            "reply": 0,
+            "view_text_1": "19.6万"
+          },
+          "link": "bilibili://video/117353807352847",
+          "ctime": 1790677292,
+          "pubtime": 1790737200,
+          "fav_time": 1794760233,
+          "bv_id": "BV1amaH6aE2m",
+          "bvid": "BV1amaH6aE2m",
+          "season": null,
+          "ogv": null,
+          "ugc": {
+            "first_cid": 42307749356
+          },
+          "media_list_link": "bilibili://music/playlist/playpage/191767189?page_type=3&oid=117353807352847&otype=2"
+        }
+      ],
+      "has_more": true,
+      "ttl": 1795114840
+    }
+  }
+}

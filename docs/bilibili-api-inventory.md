@@ -107,6 +107,13 @@
 
 | 端点 | 用途 | 签名/鉴权 |
 |---|---|---|
+| `GET /x/v2/history?pn&ps` | **历史记录列表**（`data` 裸数组 ArchiveCard 超集 + `progress/view_at/kid/business`；`history/cursor` 实测 404 不存在，2026-11-20） | Cookie ✅ 已实现（core/history.rs，契约 `api/openapi/bilibili-user-v1.yaml`） |
+| `GET /x/v2/history/toview?pn&ps` | **稍后再看列表**（`data{count,list[]}`，条目带 `add_at`；`toview/web` 同构） | Cookie ✅ 已实现（core/history.rs） |
+| `GET /x/v3/fav/folder/created/list-all?up_mid` | **我创建的收藏夹**（一次全量，`id`=media_id） | Cookie ✅ 已实现（core/fav.rs） |
+| `GET /x/v3/fav/resource/list?media_id&pn&ps&order=mtime&type=0&platform=web` | **收藏夹内容**（`data{info,medias[],has_more}`；type=2 视频行外全过滤） | Cookie ✅ 已实现（core/fav.rs） |
+| `GET /x/v2/history/cursor` | 现行 PC 历史页传闻端点 | **实测 404（HTML 错误页）**，api.bilibili.com 上不存在——勿再尝试 |
+| `GET /x/web-interface/history/search?business&pn&ps&keyword` | 历史内搜索（异构行 `data.page{pn,total}`） | Cookie（备用，未实现） |
+| `GET /x/v3/fav/folder/collected/list?up_mid&pn&ps` | 收藏的收藏夹 | Cookie（备用，未实现） |
 | `GET /x/player/wbi/v2?aid&cid&dm_img_*` | 播放器配置（弹幕开关/推荐卡/字幕开关） | WBI |
 | `GET /x/v2/subtitle/web/view?oid&pid` | 字幕列表（CC） | WBI |
 | `GET /x/player/online/total?aid&cid&bvid` | 实时在线人数 | 无 |

@@ -218,3 +218,22 @@ Content-Range 的短 206」由整块接受改为收敛该块尾(等价旧上层�
 - `cargo test --workspace`:**236 passed, 0 failed, 7 ignored**(新增 peek 8 项、settings 1 项、core watch_later 表单 1 项);`just selftest all` **16/16 PASS**(新场景 `peek`:真实首页流 → 悬停 1s 弹出 → 移入 PeekCard 不收起 → 宽限收起 → 掠过 10 卡全程不弹 → 点「播放」进播放页,全走真实定时器)。
 - 自动化点击(E23,`scripts/ui-edge.ps1 -Scenario E23`):真实 `mouse_event(MOVE|ABSOLUTE)` 悬停(SetCursorPos 不产生 WM_MOUSEMOVE,不触发 PointerEntered——踩坑修正)+ UIA 断言 `peek-card` 0.5s 不出现/1.4s 出现 → Invoke「播放」→ `player-quality-selector` 出现且预览收起 → 快速掠过 10 卡中心无弹出无 panic。**修复内容溢出(PEEK_HEIGHT 420→440,按钮行曾越出边框)与封面取旧副本(改读槽位 Rc 现值)后的复验因测试环境桌面会话中断未跑完,留真机确认。**
 - 真机验收格:4c8G 弹出期滚动无掉帧未录;300ms 简介预取命中真实 `view` API(selftest `peek` 场景走真实网络,PASS)。
+
+## V. 登录态四页接线（U5:历史/稍后再看/收藏/个人中心快捷入口,2026-11-20 深夜)✅
+
+> 上游 U5 决策「登录后另开任务」的本轮执行。凭据面:本地 `data/credentials.json`(app 登录流落盘,有效期至 2027-05)。
+
+| 项 | 内容 | 落点 / 证据 |
+|---|---|---|
+| V-1 契约 | 新组契约 `api/openapi/bilibili-user-v1.yaml`(x-contract-version 1):`x/v2/history`(data 裸数组,行多态按 bvid 过滤)、`x/v2/history/toview`(count+list)、`x/v3/fav/folder/created/list-all`、`x/v3/fav/resource/list`(has_more 翻页);fixtures ×4(真机截断)+`make-user-fixtures.mjs`;实测记录:`history/cursor` 404 不存在(勿再试)、历史行 `page` 是分P对象非数字 | `api/openapi/bilibili-user-v1.yaml`、`api/fixtures/user-*.json`、`.qaqh/research/capture-user-apis.mjs` |
+| V-2 core | `HistoryClient::history/toview` + `FavClient::created_folders/resources`(宽松行解析:`opt_i64_any/opt_bool_any` 新助手);行过滤纪律:bvid 空(live/pgc/失效/音频)静默丢弃,progress=-1=看完 | `core/history.rs`、`core/fav.rs`;fixture 锚测试 6 项;实网冒烟 `history_smoke`/`fav_smoke`(ignored,登录态真网)**2/2 PASS** |
+| V-3 UI | `pages/user_lists.rs`(752 行):统一 `UserVideoCard` 网格(时长徽标/进度条/「看到 xx:xx」/「已看完」角标)、`login_gate_page` 门控页、`UserListState::subtitle` 口径;历史=观看时间+进度,稍后=加入时间+总数,收藏=夹 chip 横排→资源网格(首夹自动选中) | `pages/user_lists.rs` 11 单测;shell `user_index` 进 open_video 数据源链(点卡带标题/封面进播放页) |
+| V-4 shell | 三路由 stub 全退役;ensure/fetch/absorb ×3(page 失配丢弃)+封面补拉(与直播卡同信号量);`reset_account_data` 登录态切换清列表态;个人中心 profile 下新增 历史/稍后再看/收藏 快捷入口 | `shell.rs` Message::{HistoryLoaded,WatchLaterLoaded,FavFoldersLoaded,FavSelectFolder,FavResourcesLoaded,FavMore,UserCoverReady} |
+| V-5 selftest | 新场景 `user-lists`:登录态等三页真实数据落定;无凭据环境验证门控空态可达不 panic | `selftest.rs`;**17/17 PASS**(新增 user-lists) |
+
+### V 项验收实测(2026-11-20)
+
+- `cargo test --workspace`:**255 passed, 0 failed**(core 93+fix 6+login 7+ui 113+video 36;ignored 8 内含 2 新实网冒烟)。
+- `just selftest all`:**17/17 PASS**。
+- 实网冒烟:`cargo test -p qaq-bx-core -- --ignored history_smoke fav_smoke` **2/2 PASS**(登录态真实网络,只读)。
+- 遗留:历史续播(progress → 播放器 start_secs 贯通)、稍后再看/历史删除写路径、历史内搜索(history/search 已抓样)、收藏的夹(collected/list 已抓样)、多 P 定点(cid 已在行数据中,待播放器入口参数)——均记录为后续。

@@ -8,14 +8,19 @@
 ```
 api/
 ├── openapi/
-│   └── bilibili-feed-v1.yaml   # feed 组契约（rcmd/ogv/popular/precious/ranking/related）
+│   ├── bilibili-feed-v1.yaml    # feed 组契约（rcmd/ogv/popular/precious/ranking/related）
+│   └── bilibili-user-v1.yaml    # 用户数据组契约（历史/稍后再看/收藏夹，登录态）
 └── fixtures/
-    ├── feed-rcmd.json          # 首页推荐（goto=av/ad/live 多态卡）
-    ├── feed-ogv.json           # 剧集卡（season_type=1 样本）
-    ├── feed-popular.json       # 综合热门
-    ├── feed-ranking.json       # 排行榜
-    ├── feed-precious.json      # 入站必刷
-    └── feed-related.json       # 播放页相关视频（data 为 ArchiveCard 裸数组）
+    ├── feed-rcmd.json           # 首页推荐（goto=av/ad/live 多态卡）
+    ├── feed-ogv.json            # 剧集卡（season_type=1 样本）
+    ├── feed-popular.json        # 综合热门
+    ├── feed-ranking.json        # 排行榜
+    ├── feed-precious.json       # 入站必刷
+    ├── feed-related.json        # 播放页相关视频（data 为 ArchiveCard 裸数组）
+    ├── user-history.json        # 历史记录（data 裸数组 ArchiveCard 超集行）
+    ├── user-toview.json         # 稍后再看（data{count,list}）
+    ├── user-fav-folders.json    # 收藏夹列表（created/list-all）
+    └── user-fav-resources.json  # 收藏夹内容（resource/list，medias+has_more）
 ```
 
 全量真机样本（未截断）：`.qaqh/research/samples/feed/`（含每次捕获的完整 URL 与时间戳）。

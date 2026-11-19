@@ -8,3 +8,4 @@ pub mod popular;
 pub mod search;
 pub mod settings;
 pub mod stub;
+pub mod user_lists;

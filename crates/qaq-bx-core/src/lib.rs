@@ -9,7 +9,9 @@ pub mod cdn;
 pub mod credentials;
 pub mod danmaku;
 pub mod error;
+pub mod fav;
 pub mod feed;
+pub mod history;
 pub mod httpx;
 pub mod live;
 pub mod loose;
@@ -38,7 +40,9 @@ pub mod prelude {
         FileCredentialStore,
     };
     pub use crate::error::{BiliError, Result};
+    pub use crate::fav::{FavClient, FavFolder, FavMedia, FavResourcePage};
     pub use crate::feed::{ArchiveCard, FeedCard, FeedClient, OgvCard, RcmdQuery};
+    pub use crate::history::{HistoryClient, HistoryItem, ToViewPage};
     pub use crate::notify::{
         AtNotice, FeedCursor, FeedPage, LikeNotice, NoticeLink, NotifyClient, ReplyNotice,
         SessionPage, SystemNotice, SystemPage, UnreadSummary, WhisperMessage, WhisperSession,

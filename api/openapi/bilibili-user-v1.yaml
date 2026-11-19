@@ -1,0 +1,309 @@
+openapi: 3.1.0
+info:
+  title: bilibili 用户数据消费契约（QAQ-Bx：历史/稍后再看/收藏）
+  version: 1.0.0
+  x-contract-version: 1
+  x-observed-at: "2026-11-20"
+  description: |
+    **QAQ-Bx 对 B 站登录态列表接口的消费契约锚 —— 不是 B 站官方文档。**
+
+    来源纪律（项目红线）：全部字段来自本地登录凭据真机捕获
+    （`.qaqh/research/capture-user-apis.mjs`，样本 `.qaqh/research/samples/user/`），
+    零第三方 API 文档。
+
+    ## 版本与向下兼容（见 api/README.md）
+    - `x-contract-version: 1` = 当前消费契约代。服务器**新增字段**视为兼容
+      （Rust 侧忽略未知字段 + 本文件 `additionalProperties: true`）。
+    - 服务器**删除/改名本文件 `required` 字段** = 破坏性变更：
+      `api/fixtures/` 行为锚测试红灯 → 评估迁移并升 `x-contract-version: 2`。
+    - 所有 ID/计数一律 64 位（实测 aid 已达 1.17e14，u32 溢出）。
+
+    ## 实测定案（2026-11-20，登录态）
+    - **历史**：`GET /x/v2/history?pn&ps`（无签名，Cookie 必需）→ `data` 为
+      **裸数组**（ArchiveCard 超集行 + `progress/view_at/kid/business/bvid/page`）。
+      - 行多态：archive 行含 `bvid/cid/owner`；`business=pgc/live` 等行可能缺
+        `bvid/cid` —— **客户端按 `bvid` 非空过滤**后消费。
+      - 现行 PC 页面所称 `x/v2/history/cursor` 实测 **404（HTML 错误页）**，
+        api.bilibili.com 上不存在 —— 不采用；pn/ps 翻页可用。
+      - `x/web-interface/history/search?business&pn&ps&keyword`（历史内搜索）
+        为异构行（`data.page{pn,total}` + 独立字段集），记录备用，本轮不消费。
+    - **稍后再看**：`GET /x/v2/history/toview?pn&ps` → `data{count,list[]}`；
+      `x/v2/history/toview/web?ps` 同构（无 pn）。条目为 ArchiveCard 超集 +
+      `add_at`；失效条目 `bvid` 为空 → 客户端过滤。写路径 `toview/add` 已在
+      `qaq-bx-core::player`（PeekCard 接线）。
+    - **收藏**：v3 族（无签名，Cookie）：
+      - 夹列表 `GET /x/v3/fav/folder/created/list-all?up_mid=<mid>` →
+        `data{count,list[],season}`；收藏的夹 `collected/list?up_mid&pn&ps` 同构。
+      - 资源列表 `GET /x/v3/fav/resource/list?media_id&pn&ps&keyword&order&type=0&tid=0&platform=web`
+        → `data{info,medias[],has_more}`；`info` 为夹详情（含 media_count），
+        `has_more` 为翻页锚。`medias[].type=2` 为视频，其余（音频/课程/合集）
+        `bvid` 空 → 客户端过滤。
+
+servers:
+  - url: https://api.bilibili.com
+
+tags:
+  - name: user-lists
+    description: 登录态列表（历史/稍后再看/收藏）
+
+paths:
+  /x/v2/history:
+    get:
+      tags: [user-lists]
+      operationId: historyList
+      summary: 历史记录（pn/ps 翻页，data 裸数组）
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - { name: pn, in: query, schema: { type: integer, minimum: 1, default: 1 }, example: 1 }
+        - { name: ps, in: query, schema: { type: integer, minimum: 1, maximum: 30 }, description: "实测 20/30 通过；更大未验证" }
+      responses:
+        "200":
+          description: 历史行裸数组（含 archive/pgc/live 多态行，客户端按 bvid 过滤）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    required: [data]
+                    properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/HistoryRow" } }
+              examples:
+                sample: { externalValue: "../fixtures/user-history.json" }
+
+  /x/v2/history/toview:
+    get:
+      tags: [user-lists]
+      operationId: toViewList
+      summary: 稍后再看列表（pn/ps 翻页 + count 总数）
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - { name: pn, in: query, schema: { type: integer, minimum: 1, default: 1 }, example: 1 }
+        - { name: ps, in: query, schema: { type: integer, minimum: 1, maximum: 30 }, example: 30 }
+      responses:
+        "200":
+          description: 稍后再看页（count=总数；失效条目 bvid 空，客户端过滤）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    required: [data]
+                    properties:
+                      data: { $ref: "#/components/schemas/ToViewData" }
+              examples:
+                sample: { externalValue: "../fixtures/user-toview.json" }
+
+  /x/v3/fav/folder/created/list-all:
+    get:
+      tags: [user-lists]
+      operationId: favFolderCreatedAll
+      summary: 我创建的收藏夹（一次全量）
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - { name: up_mid, in: query, required: true, schema: { type: integer, format: int64 }, example: 85841389 }
+      responses:
+        "200":
+          description: 收藏夹全量列表（默认夹 + 自建夹）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    required: [data]
+                    properties:
+                      data: { $ref: "#/components/schemas/FavFolderListAll" }
+              examples:
+                sample: { externalValue: "../fixtures/user-fav-folders.json" }
+
+  /x/v3/fav/resource/list:
+    get:
+      tags: [user-lists]
+      operationId: favResourceList
+      summary: 收藏夹内容（pn/ps + has_more 翻页）
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - { name: media_id, in: query, required: true, schema: { type: integer, format: int64 }, description: 收藏夹 id（created/list-all 的 list[].id） }
+        - { name: pn, in: query, schema: { type: integer, minimum: 1, default: 1 }, example: 1 }
+        - { name: ps, in: query, schema: { type: integer, minimum: 1, maximum: 20 }, description: "实测 20 通过" }
+        - { name: keyword, in: query, schema: { type: string }, description: 夹内搜索（空串可用） }
+        - { name: order, in: query, schema: { type: string, enum: [mtime, view, pubtime] }, description: "排序：mtime=收藏时间（默认）" }
+        - { name: type, in: query, schema: { type: integer, enum: [0, 2] }, description: "0=全部 2=视频" }
+        - { name: tid, in: query, schema: { type: integer }, description: 分区过滤（0=全部） }
+        - { name: platform, in: query, schema: { type: string }, description: 页面传 web }
+        - { name: web_location, in: query, schema: { type: string }, description: 页面埋点参数，可省 }
+      responses:
+        "200":
+          description: 收藏资源页（medias[] 多态：type=2 视频其余类型客户端过滤）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    required: [data]
+                    properties:
+                      data: { $ref: "#/components/schemas/FavResourceData" }
+              examples:
+                sample: { externalValue: "../fixtures/user-fav-resources.json" }
+
+components:
+  securitySchemes:
+    cookieAuth: { type: apiKey, in: cookie, name: SESSDATA }
+
+  schemas:
+    Envelope:
+      type: object
+      required: [code]
+      properties:
+        code: { type: integer, description: 0=成功 }
+        message: { type: string }
+        ttl: { type: integer }
+      additionalProperties: true
+
+    Owner:
+      type: object
+      required: [mid, name]
+      properties:
+        mid: { type: integer, format: int64 }
+        name: { type: string }
+        face: { type: string }
+      additionalProperties: true
+
+    CardStat:
+      type: object
+      properties:
+        view: { type: integer, format: int64 }
+        danmaku: { type: integer, format: int64 }
+        reply: { type: integer, format: int64 }
+        favorite: { type: integer, format: int64 }
+        coin: { type: integer, format: int64 }
+        share: { type: integer, format: int64 }
+        like: { type: integer, format: int64 }
+      additionalProperties: true
+
+    # 历史行 = ArchiveCard 超集 + 观看态。required 只锚「archive 行（客户端过滤
+    # 后）必然存在且被消费」的字段；pgc/live 行缺 bvid/cid/owner 时由客户端过滤。
+    HistoryRow:
+      type: object
+      required: [aid, title, pic, duration, progress, view_at]
+      properties:
+        aid: { type: integer, format: int64 }
+        bvid: { type: string, description: archive 行必有；pgc/live 行可能为空/缺省 }
+        cid: { type: integer, format: int64, description: 观看分P 的 cid }
+        title: { type: string }
+        pic: { type: string }
+        duration: { type: integer, description: 秒 }
+        progress: { type: integer, description: "已看秒数；-1=看完" }
+        view_at: { type: integer, description: 最后观看时间戳（秒） }
+        page:
+          type: object
+          description: **分P 详情对象**（非数字！实测 {cid,page,part,dimension,…}），观看分P 的页号/cid 在其内
+          properties:
+            cid: { type: integer, format: int64 }
+            page: { type: integer }
+            part: { type: string }
+          additionalProperties: true
+        videos: { type: integer, description: 总P 数 }
+        business: { type: string, description: "archive/pgc/live/…；本轮只消费 archive" }
+        kid: { type: string, description: 行主键 aid:xxx / ep:xxx / live:xxx }
+        owner: { $ref: "#/components/schemas/Owner" }
+        stat: { $ref: "#/components/schemas/CardStat" }
+        tname: { type: string }
+        pubdate: { type: integer }
+        show_title: { type: string, description: pgc 行标题形态 }
+      additionalProperties: true
+
+    ToViewItem:
+      allOf:
+        - $ref: "#/components/schemas/HistoryRow"
+        - type: object
+          properties:
+            add_at: { type: integer, description: 加入稍后再看时间戳（秒） }
+          additionalProperties: true
+
+    ToViewData:
+      type: object
+      required: [count, list]
+      properties:
+        count: { type: integer, description: 稍后再看总数 }
+        list: { type: array, items: { $ref: "#/components/schemas/ToViewItem" } }
+      additionalProperties: true
+
+    FavFolder:
+      type: object
+      required: [id, title, media_count]
+      properties:
+        id: { type: integer, format: int64, description: media_id（资源列表入参） }
+        fid: { type: integer, format: int64, description: 老版夹 id（≠ media_id，勿混用） }
+        mid: { type: integer, format: int64, description: 创建者 }
+        title: { type: string }
+        media_count: { type: integer }
+        attr: { type: integer, description: 位标志（隐私等，本轮不消费语义） }
+        fav_state: { type: integer }
+        is_kid_playlist: { type: boolean }
+      additionalProperties: true
+
+    FavFolderListAll:
+      type: object
+      required: [count, list]
+      properties:
+        count: { type: integer }
+        list: { type: array, items: { $ref: "#/components/schemas/FavFolder" } }
+        season: { type: array, description: 收藏的合集（本轮不消费） }
+      additionalProperties: true
+
+    FavCntInfo:
+      type: object
+      properties:
+        collect: { type: integer, format: int64 }
+        play: { type: integer, format: int64 }
+        danmaku: { type: integer, format: int64 }
+        reply: { type: integer, format: int64 }
+      additionalProperties: true
+
+    FavMedia:
+      type: object
+      required: [id, type, title]
+      properties:
+        id: { type: integer, format: int64 }
+        type: { type: integer, description: 2=视频（音频/课程等其余类型 bvid 空由客户端过滤） }
+        title: { type: string }
+        cover: { type: string }
+        intro: { type: string }
+        duration: { type: integer, description: 秒 }
+        page: { type: integer }
+        upper: { $ref: "#/components/schemas/Owner" }
+        cnt_info: { $ref: "#/components/schemas/FavCntInfo" }
+        bvid: { type: string, description: 视频行必有；失效/其他类型为空串 }
+        bv_id: { type: string, description: bvid 的冗余形态 }
+        fav_time: { type: integer, description: 收藏时间戳（秒） }
+        pubtime: { type: integer }
+        ctime: { type: integer }
+        attr: { type: integer }
+        link: { type: string }
+      additionalProperties: true
+
+    FavFolderInfo:
+      type: object
+      required: [id, title, media_count]
+      properties:
+        id: { type: integer, format: int64 }
+        title: { type: string }
+        cover: { type: string }
+        media_count: { type: integer }
+        upper: { $ref: "#/components/schemas/Owner" }
+        intro: { type: string }
+        cnt_info: { $ref: "#/components/schemas/FavCntInfo" }
+      additionalProperties: true
+
+    FavResourceData:
+      type: object
+      required: [info, medias, has_more]
+      properties:
+        info: { $ref: "#/components/schemas/FavFolderInfo" }
+        medias: { type: array, items: { $ref: "#/components/schemas/FavMedia" } }
+        has_more: { type: boolean, description: 翻页锚；false=末页 }
+      additionalProperties: true

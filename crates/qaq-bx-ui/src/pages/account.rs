@@ -121,6 +121,10 @@ pub struct AccountCallbacks {
     pub on_close_whisper_detail: Callback<()>,
     pub on_refresh_thread: Callback<(u64, i32)>,
     pub on_open_video: Callback<OpenTarget>,
+    /// U5:快捷入口(登录态列表页接线后的页内直达)。
+    pub on_open_history: Callback<()>,
+    pub on_open_watch_later: Callback<()>,
+    pub on_open_favorites: Callback<()>,
 }
 
 pub fn account_page(data: AccountViewData<'_>, cb: AccountCallbacks) -> View {
@@ -418,6 +422,27 @@ fn profile_section(data: &AccountViewData<'_>, cb: &AccountCallbacks) -> View {
     };
 
     let mut stack_children: Vec<View> = vec![page_title_row.into(), profile_card.into()];
+    // U5:登录态列表页快捷入口(与 space 主页的收藏/历史/稍后再看同语义)。
+    stack_children.push(
+        StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(8.0)
+            .children((
+                Button::new()
+                    .style(ButtonStyle::Subtle)
+                    .content("历史")
+                    .on_click(cb.on_open_history.clone()),
+                Button::new()
+                    .style(ButtonStyle::Subtle)
+                    .content("稍后再看")
+                    .on_click(cb.on_open_watch_later.clone()),
+                Button::new()
+                    .style(ButtonStyle::Subtle)
+                    .content("收藏")
+                    .on_click(cb.on_open_favorites.clone()),
+            ))
+            .into(),
+    );
     if let Some(reason) = data.auth_notice {
         stack_children.push(
             InfoBar::new()

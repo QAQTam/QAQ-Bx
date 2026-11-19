@@ -1,0 +1,48 @@
+{
+  "url": "https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid=85841389",
+  "captured_at": "2026-11-19T19:00:41.483Z",
+  "json": {
+    "code": 0,
+    "message": "OK",
+    "ttl": 1,
+    "data": {
+      "count": 6,
+      "list": [
+        {
+          "id": 105925889,
+          "fid": 1059258,
+          "mid": 85841389,
+          "attr": 21,
+          "title": "TEMP",
+          "fav_state": 0,
+          "media_count": 153,
+          "is_kid_playlist": false,
+          "kid_playlist_desc": ""
+        },
+        {
+          "id": 1753107089,
+          "fid": 17531070,
+          "mid": 85841389,
+          "attr": 23,
+          "title": "游戏类",
+          "fav_state": 0,
+          "media_count": 2,
+          "is_kid_playlist": false,
+          "kid_playlist_desc": ""
+        },
+        {
+          "id": 1658007089,
+          "fid": 16580070,
+          "mid": 85841389,
+          "attr": 23,
+          "title": "健康类",
+          "fav_state": 0,
+          "media_count": 2,
+          "is_kid_playlist": false,
+          "kid_playlist_desc": ""
+        }
+      ],
+      "season": null
+    }
+  }
+}

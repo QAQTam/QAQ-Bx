@@ -60,6 +60,61 @@ pub fn opt_u64_any<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Optio
     }
 }
 
+/// 宽松可选有符号整数：`null` 或非法占位回退 `None`（历史行 `progress: -1`
+/// 等「看完」哨兵值需要保留负数，与 [`opt_u64_any`] 的差异在允许负值）。
+pub fn opt_i64_any<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<i64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        Null,
+        Num(f64),
+        Text(String),
+    }
+    match Option::<V>::deserialize(d)? {
+        None | Some(V::Null) => Ok(None),
+        Some(V::Num(f)) if f.is_finite() => Ok(Some(f.round() as i64)),
+        Some(V::Num(_)) => Ok(None),
+        Some(V::Text(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            match trimmed.parse::<f64>() {
+                Ok(f) if f.is_finite() => Ok(Some(f.round() as i64)),
+                _ => Ok(None),
+            }
+        }
+    }
+}
+
+/// 宽松可选布尔：`null`/缺省回退 `None`；`"true"/"1"` 等字符串形态可读。
+pub fn opt_bool_any<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<bool>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        Null,
+        Bool(bool),
+        Num(f64),
+        Text(String),
+    }
+    match Option::<V>::deserialize(d)? {
+        None | Some(V::Null) => Ok(None),
+        Some(V::Bool(b)) => Ok(Some(b)),
+        Some(V::Num(f)) => Ok(Some(f != 0.0)),
+        Some(V::Text(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return Ok(None);
+            }
+            match t.to_ascii_lowercase().as_str() {
+                "true" | "1" => Ok(Some(true)),
+                "false" | "0" => Ok(Some(false)),
+                _ => Ok(None),
+            }
+        }
+    }
+}
+
 /// 宽松浮点：`null` 兜底为 `0.0`。
 pub fn f64_any_or_zero<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<f64, D::Error> {
     #[derive(Deserialize)]

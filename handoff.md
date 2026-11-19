@@ -1,5 +1,7 @@
 # Handoff — 0.2.0 体验补完与未接线功能全面接线
 
+> **2026-11-20 深夜追加(U5 登录态四页):**历史/稍后再看/收藏三路由已接线真数据(契约 `api/openapi/bilibili-user-v1.yaml` + `core/history.rs`/`core/fav.rs` + `pages/user_lists.rs`,个人中心加三快捷入口),workspace 255 绿、selftest 17/17、实网冒烟 2/2;本轮完整记录见 [docs/Update-0.4.0.md](Update-0.4.0.md) §V。遗留:历史续播 start_secs、列表删除写路径、history/search、collected/list(端点均已抓样)。
+>
 > 记录时间:2026-11-18(夜)。
 > **新队友第一入口:[docs/dev-notes/long-run.md](dev-notes/long-run.md)**(任务目标/审计/核验表格/代码地图/坑/实测数据,自足可续)。
 > 基线:`0.2.0`,`just dev` 自增末尾修订号,本轮已出 `package/debug/QAQ-Bx-Dev_0.2.0.5_x64.appx`(自签)。
