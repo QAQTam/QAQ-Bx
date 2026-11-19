@@ -29,6 +29,20 @@ composition 液态玻璃:效果采样 XAML 背景内容做 blur(saturation(backd
 - 自动化点击(390×760 / 845×1000 / 420×680 真机):点击底栏「更多」Tab → 浮层完整浮在玻璃胶囊上方,6 项全部可见可点,无玻璃遮挡;再点击 Tab 收起正常。
 - `cargo test --workspace` 全绿;selftest boot / stress(4.8s)/ mobile / e8 PASS。
 
+## F. 合并后回归三连修(2026-11-19,v0.3×v0.4 首次同二进制)✅
+
+> main 合入 feat/v0.3-native-player + feat/v0.4.0 后,两线功能首次同进程运行,
+> 真机走查暴露三处回归/缺口,当日修复:
+
+| 项 | 现象 | 根因 | 修复 | 验证 |
+|---|---|---|---|---|
+| F-1 玻璃 backdrop 残留 | 切到搜索/我的,玻璃仍透出推荐/热门底部的旧卡片颜色,不实时刷新 | content_host 跨行铺底(row1+row2)后,搜索/我的等页面根容器透明,胶囊带区域无不透明重绘 → composition backdrop 停在旧帧 | mobile `content_host` 补 `SolidBackground` 不透明底色,玻璃后面每帧都有当前页面像素可采(滚动内容仍浮在其上,透色语义不变) | 真机点击 推荐→搜索→我的 截图对照:玻璃区域均匀暗底无残影 |
+| F-2 竖屏音量控制丢失 | 竖屏播放页只剩静音/取消静音,无音量滑条 | 单列 transport 从未放音量滑条( longstanding 缺口);半窗预览滑条又有 440 DIP 阈值整体隐藏 | 单列 transport 插入 48 DIP 紧凑滑条(带 M9 滚轮调节);`half_pane_shows_volume_slider` 改为 `half_pane_volume_slider_width`(44/68 自适应,任何宽度都出滑条) | 竖屏播放页截图:滑条+静音钮并排;单测改钉新语义 |
+| F-3 切视频播放时长残留 | 快速切视频后,新页面显示旧视频的进度/时长,新视频不从 0 播 | 解析在途(start_playback→loadfile 之间,网络可达数秒)PositionTick 仍把**旧媒体**引擎快照灌进 UI 且提前解除 loading 遮罩 | 新增 `media_load_pending` 装载闸门:start_playback 置位,引擎 Load 清零快照(mpv `!has_media` / native `status.loading`)后放行;解析失败/引擎错误解除;置位期间旧位置/时长/播放态/弹幕时基全冻结 | 切换视频实测新片 `0:00:00 / 23:55` 从零起播,无旧片(1:04:35)残留 |
+
+- 回归证据:`cargo test --workspace` 全绿(187);selftest boot/mobile/e8/stress PASS;
+  自动化走查截图 `target/ui-demo/frames-fix3/`(未入库)。
+
 ### 验收实测(2026-11-19,96 DPI 真机)
 
 - `cargo test --workspace` 全绿(core 61 / ui 78 / video 25 / core-cli 7 / 6)。

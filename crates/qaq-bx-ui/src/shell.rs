@@ -696,6 +696,11 @@ pub struct AppShell {
     volume_before_mute: u32,
     /// 引擎回报的媒体总长(秒;None = 尚未加载,用卡片数据兜底)。
     engine_duration: Option<f64>,
+    /// 新视频装载闸门:start_playback 置位,直到引擎真正收到新会话
+    /// (Load 会清零引擎快照)或装载失败。置位期间 PositionTick 不得把
+    /// **旧媒体**的 position/duration/播放态灌进 UI——否则快速切视频时
+    /// 新页面会显示旧视频的时长与进度(播放时长残留 bug)。
+    media_load_pending: bool,
     /// 媒体失败/引擎错误提示(播放页显示一次)。
     player_notice: Option<String>,
     /// 视频加载态:解析/缓冲中为 true(驱动 ProgressRing 环形指示);
@@ -1962,6 +1967,9 @@ impl AppShell {
         self.playing = self.settings.autoplay;
         self.position = 0;
         self.engine_duration = None;
+        // 新视频装载闸门:解析在途期间引擎仍持有旧媒体快照,PositionTick
+        // 不得把旧时长/进度灌进 UI(见字段注释)。
+        self.media_load_pending = true;
         self.player_notice = None;
         self.video_loading = true;
         self.comments_session.reset(item.aid, item.author_mid);
@@ -4222,6 +4230,7 @@ impl Component for AppShell {
             volume_before_mute: if volume == 0 { 80 } else { volume },
             settings,
             engine_duration: None,
+            media_load_pending: false,
             player_notice: None,
             video_loading,
             engine,
@@ -4558,22 +4567,31 @@ impl Component for AppShell {
                         );
                     }
                     // 装载在途(工作线程建源)保持遮罩,别用旧会话的状态提前解除。
-                    if !status.loading && (!status.playing || status.position_secs > 0.0) {
-                        self.video_loading = false;
-                    }
-                    self.position = status
-                        .position_secs
-                        .round()
-                        .clamp(0.0, f64::from(u32::MAX)) as u32;
-                    self.playing = status.playing && !status.loading;
-                    if status.duration_secs > 0.0 && !status.loading {
-                        self.engine_duration = Some(status.duration_secs);
-                    }
-                    // 弹幕透明层时基:节拍喂真实播放位置与播放态(暂停即冻结);
-                    // 层内用墙钟外推到满刷新率,与 mpv 通道的弹幕手感一致。
-                    if let Some(stage) = self.stage_sink() {
-                        stage.set_time(status.position_secs);
-                        stage.set_playing(status.playing);
+                    // 新视频装载闸门:解析在途期间引擎仍是旧会话快照,位置/时长/
+                    // 播放态一律冻结在 start_playback 的重置值;status.loading
+                    // 翻 true = 装载请求已受理,交回常规遮罩逻辑。
+                    if self.media_load_pending {
+                        if status.loading {
+                            self.media_load_pending = false;
+                        }
+                    } else {
+                        if !status.loading && (!status.playing || status.position_secs > 0.0) {
+                            self.video_loading = false;
+                        }
+                        self.position = status
+                            .position_secs
+                            .round()
+                            .clamp(0.0, f64::from(u32::MAX)) as u32;
+                        self.playing = status.playing && !status.loading;
+                        if status.duration_secs > 0.0 && !status.loading {
+                            self.engine_duration = Some(status.duration_secs);
+                        }
+                        // 弹幕透明层时基:节拍喂真实播放位置与播放态(暂停即冻结);
+                        // 层内用墙钟外推到满刷新率,与 mpv 通道的弹幕手感一致。
+                        if let Some(stage) = self.stage_sink() {
+                            stage.set_time(status.position_secs);
+                            stage.set_playing(status.playing);
+                        }
                     }
                     if let Some(reason) = &status.error {
                         // S4:native 通路失败不再只弹通知 —— 自动回退 mpv 同进度接管。
@@ -4604,7 +4622,14 @@ impl Component for AppShell {
                 let engine = self.engine.clone();
                 if let Some(engine) = engine {
                     let status = engine.status();
-                    if status.has_media() {
+                    // 新视频装载闸门:引擎 Load 会把快照清零(PlaybackStatus::default),
+                    // 看到旧快照消失(!has_media)即视为新会话开始。置位期间旧媒体的
+                    // 位置/时长/播放态不得灌进 UI,loading 遮罩保持。
+                    if self.media_load_pending {
+                        if !status.has_media() {
+                            self.media_load_pending = false;
+                        }
+                    } else if status.has_media() {
                         self.video_loading = false;
                         self.position =
                             status.time_pos.round().clamp(0.0, f64::from(u32::MAX)) as u32;
@@ -4614,13 +4639,16 @@ impl Component for AppShell {
                         }
                     }
                     // F4 首播音画缺失探测:媒体就绪后计时,持续缺轨 3s 自动回退。
-                    if status.has_media() && self.media_probe_at.is_none() {
+                    if !self.media_load_pending
+                        && status.has_media()
+                        && self.media_probe_at.is_none()
+                    {
                         self.media_probe_at = Some(Instant::now());
                     }
                     if let Some(track) = missing_media_track(
                         &status.video_format,
                         &status.audio_codec,
-                        status.has_media(),
+                        status.has_media() && !self.media_load_pending,
                         self.media_probe_at.map(|at| at.elapsed()),
                     ) {
                         // 触发一次即清探测点,回退重载会重置。
@@ -4656,6 +4684,8 @@ impl Component for AppShell {
                     {
                         self.player_notice = Some(reason);
                         self.video_loading = false;
+                        // 引擎级错误:装载闸门解除(失败不再等新会话快照)。
+                        self.media_load_pending = false;
                     }
                 }
                 self.sync_smtc(context);
@@ -5143,6 +5173,8 @@ impl Component for AppShell {
                 self.player_notice = Some(format!("视频解析失败:{reason}"));
                 self.playing = false;
                 self.video_loading = false;
+                // 装载闸门解除:失败不再等引擎快照(没有新会话可等)。
+                self.media_load_pending = false;
             }
             Message::ExpandHalfPane => {
                 self.home_half_pane = false;
@@ -6558,9 +6590,13 @@ impl Component for AppShell {
         if is_mobile {
             // iOS 26 悬浮底栏:内容跨行铺到 row1+row2,底栏胶囊浮在内容
             // 之上——composition backdrop 采样到的才是滚动内容(玻璃有物可折)。
+            // 不透明底色必须有:搜索/我的等页面根容器透明,胶囊带区域若无
+            // 不透明重绘,backdrop 会残留上一页(推荐/热门)的旧帧而非实时
+            // 刷新——这层底色保证玻璃后面每帧都有当前页面的像素可采。
             let content_host = Grid::new()
                 .grid_row(1)
                 .grid_row_span(2)
+                .background(ThemeBrush::SolidBackground)
                 .keyed_children({
                 let mut layers = if self.route == Route::Player {
                     vec![

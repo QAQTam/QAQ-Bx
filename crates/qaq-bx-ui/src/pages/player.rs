@@ -55,8 +55,10 @@ pub fn compute_half_pane_video_height(pane_width: f64, max_height: f64) -> f64 {
         .clamp(HALF_PANE_MIN_VIDEO_HEIGHT, max_by_viewport)
 }
 
-pub fn half_pane_shows_volume_slider(pane_width: f64) -> bool {
-    pane_width >= 440.0
+/// 半窗预览音量滑条宽度:随面板宽度自适应,任何宽度都出滑条(竖屏下
+/// 滑条是除静音外唯一的音量控制,不再按 440 DIP 阈值整体隐藏)。
+pub fn half_pane_volume_slider_width(pane_width: f64) -> f64 {
+    if pane_width >= 440.0 { 68.0 } else { 44.0 }
 }
 
 pub fn desktop_transport_compact(left_inner_width: f64) -> bool {
@@ -575,6 +577,12 @@ impl Component for PlayerPage {
                             ) {
                                 items.push(p);
                             }
+                            items.push(volume_slider(
+                                48.0,
+                                input.volume,
+                                &input.on_volume,
+                                &input.on_volume_wheel,
+                            ).into());
                             items.push(mute_btn);
                             items.push(danmaku_btn);
                             items.push(fullscreen_btn);
@@ -2430,7 +2438,8 @@ pub(crate) fn pages_selector(
 }
 
 fn half_pane_transport(input: &HalfPaneInput, pane_width: f64) -> View {
-    let show_slider = half_pane_shows_volume_slider(pane_width);
+    let slider_w = half_pane_volume_slider_width(pane_width);
+    let show_percent = slider_w > 44.0;
     let play_btn = play_pause_button(input.playing, true, false, input.on_toggle.clone());
     let mute_btn = mute_toggle_button(input.volume == 0, true, false, input.on_toggle_mute.clone());
     let danmaku_btn = danmaku_toggle_button(
@@ -2442,8 +2451,8 @@ fn half_pane_transport(input: &HalfPaneInput, pane_width: f64) -> View {
     let fullscreen_btn = fullscreen_toggle_button(false, true, false, input.on_fullscreen.clone());
 
     let mut right_items: Vec<View> = vec![mute_btn];
-    if show_slider {
-        right_items.push(volume_slider(68.0, input.volume, &input.on_volume, &input.on_volume_wheel).into());
+    right_items.push(volume_slider(slider_w, input.volume, &input.on_volume, &input.on_volume_wheel).into());
+    if show_percent {
         right_items.push(
             TextBlock::new()
                 .text(format!("{}%", input.volume))
@@ -2891,7 +2900,7 @@ mod tests {
         VARIANT_COMPACT, VARIANT_DESKTOP, VirtualSourceCache, clamp_half_pane_width,
         comment_row_key, comments_tab_label, comments_virtual_source,
         compute_half_pane_video_height, desktop_transport_compact, format_desc_body,
-        half_pane_shows_volume_slider, volume_wheel_step, related_row_key,
+        half_pane_volume_slider_width, volume_wheel_step, related_row_key,
     };
 
     #[test]
@@ -2946,9 +2955,9 @@ mod tests {
         assert_eq!(compute_half_pane_video_height(340.0, 664.0), 160.0);
         assert_eq!(compute_half_pane_video_height(820.0, 664.0), 425.0);
 
-        // 侧栏与桌面播控条窄宽度档位切换
-        assert!(!half_pane_shows_volume_slider(340.0));
-        assert!(half_pane_shows_volume_slider(480.0));
+        // 侧栏与桌面播控条窄宽度档位切换:滑条任何宽度都显示,宽度自适应
+        assert!(half_pane_volume_slider_width(340.0) > 0.0, "竖屏最窄档也必须出滑条");
+        assert!(half_pane_volume_slider_width(480.0) > half_pane_volume_slider_width(340.0));
         assert!(desktop_transport_compact(416.0)); // 860 DIP 桌面下界左栏宽度
         assert!(!desktop_transport_compact(836.0)); // 1280 DIP 标准桌面左栏宽度
     }
