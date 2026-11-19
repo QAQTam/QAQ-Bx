@@ -259,6 +259,17 @@ pub fn settings_page(
             }
         }
     };
+    let on_portrait = {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |on: bool| {
+            if on != base.portrait_mode {
+                let mut next = base.clone();
+                next.portrait_mode = on;
+                cb.call(next);
+            }
+        }
+    };
 
     let card_padding = if layout.is_mobile() { 16.0 } else { 24.0 };
     let card = |content: StackPanel| {
@@ -431,16 +442,35 @@ pub fn settings_page(
     }
 
     let danmaku_card = card(StackPanel::new().spacing(16.0).children(danmaku_items));
+    let window_card = card(
+        StackPanel::new().spacing(16.0).children((
+            ToggleSwitch::new()
+                .header("竖屏模式（实验）")
+                .on_content("开")
+                .off_content("关")
+                .is_on(settings.portrait_mode)
+                .on_toggled(on_portrait),
+            TextBlock::new()
+                .text("窗口宽度锁定在手机布局档位（底部导航栏保留），最大化按钮变为「贴边到屏幕右缘」，再点还原。立即生效，重启后保持。")
+                .font_size(12.0)
+                .opacity(0.6)
+                .text_wrapping(TextWrapping::Wrap),
+        )),
+    );
     let cards_body: View = if layout.is_single_column() {
         StackPanel::new()
             .spacing(16.0)
-            .children((playback_card, danmaku_card))
+            .children((playback_card, danmaku_card, window_card))
             .into()
     } else {
         Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
             .column_spacing(20.0)
-            .children((playback_card, danmaku_card.grid_column(1)))
+            .children((
+                playback_card,
+                danmaku_card.grid_column(1),
+                window_card.grid_row(1),
+            ))
             .into()
     };
 

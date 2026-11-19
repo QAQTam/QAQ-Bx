@@ -4,7 +4,7 @@ members = ["crates/qaq-bx-core", "crates/qaq-bx-plugin-login", "crates/qaq-bx-cl
 
 [workspace.package]
 edition = "2024"
-version = "0.3.0"
+version = "0.4.0"
 license = "MIT"
 
 [workspace.dependencies]
@@ -53,3 +53,18 @@ qaq-bx-plugin-login = { path = "crates/qaq-bx-plugin-login" }
 qaq-bx-video = { path = "crates/qaq-bx-video" }
 # UI：microsoft/windows-rs 下一代（本地 checkout，0.101 未发布故走 path）
 windows-reactor = { path = "D:/Projects/qaq-winui-reactor/crates/libs/reactor" }
+
+# ── 性能基线(docs/dev-notes/perf-architecture-review.md §R6)────────────────
+# 日常分发跑的是 `just dev` 的 debug 包,而框架的 Elm 式调度每条消息全量重建
+# IR(§R1):这类「每消息小分配 + 深比较」路径在 opt-level=0 下慢 2~20 倍,
+# 是拖框卡顿的第一放大器。自身代码留 opt-level=1(可调试),三方依赖拉满 2
+# (tokio/reqwest/serde 等,一次编译缓存复用)。
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# 发布包:LTO 减帧时(cgu 保守,兼顾 4c 机器构建时长)。
+[profile.release]
+lto = "thin"

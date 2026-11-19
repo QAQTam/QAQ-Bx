@@ -273,7 +273,15 @@ pub fn gamepad_hint_bar(route: Route, focus_title: Option<&str>, compact: bool) 
         return Border::new()
             .corner_radius(16.0)
             .padding(Thickness::xy(10.0, 5.0))
-            .margin(Thickness::new(12.0, 0.0, 12.0, 12.0))
+            // 底边距清出玻璃胶囊带(同「更多」浮层,v0.4.0 遮挡回归):
+            // composition 玻璃 child visual 盖在文档序靠前的 XAML 内容
+            // 之上,提示胶囊与胶囊带重叠即被玻璃遮住(见 widgets/glass.rs)。
+            .margin(Thickness::new(
+                12.0,
+                0.0,
+                12.0,
+                crate::widgets::glass::capsule::FLOATING_CONTENT_BOTTOM_MARGIN,
+            ))
             .background(ThemeBrush::CardBackground)
             .border_brush(ThemeBrush::CardStroke)
             .border_thickness(1.0)

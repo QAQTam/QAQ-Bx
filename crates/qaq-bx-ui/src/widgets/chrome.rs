@@ -31,6 +31,9 @@ pub fn title_search_box_width(window_width: f64) -> f64 {
 #[allow(clippy::too_many_arguments)]
 pub fn build_title_bar(
     layout: ViewportLayout,
+    title_bar_ref: &ElementRef<TitleBar>,
+    portrait_mode: bool,
+    on_toggle_dock: Callback<()>,
     app_icon_png: &'static [u8],
     app_name: &str,
     route_subtitle: &str,
@@ -46,15 +49,17 @@ pub fn build_title_bar(
     on_search_submit: Callback<()>,
     on_toggle_search_overlay: Callback<()>,
     on_open_notifications: Callback<()>,
-    reference: &ElementRef<TitleBar>,
 ) -> TitleBar {
     let mut bar = TitleBar::new()
         .preferred_height(WindowTitleBarHeight::Tall)
         // 上游风暴规避(QAQ-Bx docs/dev-notes/crash-0x359595-xamlroot.md §8.4-B):
-        // 关闭 AutoRefresh 后 TitleBar 仅首帧算一次拖拽区即退订 LayoutUpdated,
-        // 结构变化改由 AppShell 经 reference 按需 RecomputeDragRegions 一次。
+        // 关闭 AutoRefresh 后 TitleBar 仅首帧算一次拖拽区即退订 LayoutUpdated。
+        // 拖框卡顿治理(perf-architecture-review §8.2):控件仍会在自身尺寸/属性
+        // 变化时刷新,覆盖档位切换(搜索框进/出 Content)的主要路径。
         .auto_refresh_drag_regions(false)
-        .element_ref(reference)
+        // §8.2 收口:声明面挂 element_ref,shell 在内容结构档位翻转(窗口静止后)
+        // 经此句柄补算一次拖拽区,兜住不经 TitleBar 自身尺寸/属性变化的残余路径。
+        .element_ref(title_bar_ref)
         .icon(Icon::image_data(EncodedImage::from_static(app_icon_png)))
         .title(app_name)
         .subtitle(if layout.is_mobile() {
@@ -117,6 +122,19 @@ pub fn build_title_bar(
     }
 
     let mut right_items: Vec<View> = Vec::new();
+    if portrait_mode {
+        // 竖屏模式:系统最大化钮已被 presenter 级没收(SetIsMaximizable(false),
+        // 控件将其置灰),这里补「贴边最大化」钮——右缘贴边 × 工作区全高,再点还原。
+        // 放 right_items 最右(紧邻 caption 钮);right_header 是单值 relation,
+        // 必须并入下方统一构建,否则会被搜索/通知钮覆盖。
+        right_items.push(
+            Button::new()
+                .style(ButtonStyle::Subtle)
+                .on_click(on_toggle_dock)
+                .content(SymbolIcon::new().symbol(Symbol::DockRight))
+                .into(),
+        );
+    }
     if layout.shows_title_search_button() {
         right_items.push(
             Button::new()
@@ -232,12 +250,16 @@ pub fn floating_search_layers(
 }
 
 /// Android Material 3 × Fluent Mobile 底部 5-Tab 导航栏（推荐 / 热门 / 搜索 / 我的 / 更多）。
+///
+/// iOS 26「悬浮液态玻璃」形态：脱离边缘的悬浮胶囊 + `widgets::glass` 的
+/// composition 玻璃宿主（胶囊内容由 `GlassBar` 组件承载,backdrop/tint
+/// 圆角视觉垫到 Tab 行之下,见 `widgets/glass.rs`）。
 pub fn compact_bottom_bar(
     active_route: Route,
     more_open: bool,
     on_navigate: impl Fn(Route) -> Callback<()> + Clone,
     on_toggle_more: Callback<()>,
-) -> Grid {
+) -> View {
     let primary: [(Route, &str); 4] = [
         (Route::Home, "推荐"),
         (Route::Popular, "热门"),
@@ -279,7 +301,7 @@ pub fn compact_bottom_bar(
                                     .glyph(symbol_glyph(symbol))
                                     .font_size(14.0)
                                     .foreground(icon_fg)
-                                    .opacity(if selected { 1.0 } else { 0.72 })
+                                    .opacity(if selected { 1.0 } else { 0.85 })
                                     .horizontal_alignment(HorizontalAlignment::Center)
                                     .vertical_alignment(VerticalAlignment::Center),
                             ),
@@ -296,7 +318,7 @@ pub fn compact_bottom_bar(
                             } else {
                                 ThemeBrush::PrimaryText
                             })
-                            .opacity(if selected { 1.0 } else { 0.72 })
+                            .opacity(if selected { 1.0 } else { 0.85 })
                             .horizontal_alignment(HorizontalAlignment::Center),
                     )),
                 )
@@ -319,22 +341,42 @@ pub fn compact_bottom_bar(
 
     children.push(tab_btn(4, Symbol::More, "更多", more_active, on_toggle_more).into());
 
+    use crate::widgets::glass::{capsule, GlassBar, GlassBarInput};
+    let tab_row: View = Grid::new()
+        .columns([
+            GridLength::Star(1.0),
+            GridLength::Star(1.0),
+            GridLength::Star(1.0),
+            GridLength::Star(1.0),
+            GridLength::Star(1.0),
+        ])
+        .children(children)
+        .into();
     Grid::new().children((Border::new()
-        .height(64.0)
-        .background(ThemeBrush::CardBackground)
+        .height(capsule::HEIGHT)
+        .margin(Thickness::new(
+            capsule::FLOAT_MARGIN,
+            0.0,
+            capsule::FLOAT_MARGIN,
+            capsule::FLOAT_MARGIN,
+        ))
+        .corner_radius(capsule::OUTER_RADIUS)
         .border_brush(ThemeBrush::CardStroke)
-        .border_thickness(Thickness::new(0.0, 1.0, 0.0, 0.0))
+        .border_thickness(Thickness::new(1.0, 1.0, 1.0, 1.0))
         .content(
-            Grid::new()
-                .columns([
-                    GridLength::Star(1.0),
-                    GridLength::Star(1.0),
-                    GridLength::Star(1.0),
-                    GridLength::Star(1.0),
-                    GridLength::Star(1.0),
-                ])
-                .children(children),
+            // 玻璃宿主(空内容,只承载 composition 玻璃)与 Tab 行为兄弟:
+            // 实测 SetElementChildVisual 的 child visual 盖在宿主 XAML 内容
+            // 之上,玻璃与 Tab 行同网格混排会把 Tab 行毛玻璃化(只透出
+            // 模糊鬼影);XAML 后绘制的兄弟压在玻璃 child visual 之上,
+            // 所以 Tab 行必须排在玻璃宿主之后(见 widgets/glass.rs)。
+            Grid::new().children((
+                View::component::<GlassBar>(GlassBarInput {
+                    content: Grid::new().into(),
+                }),
+                tab_row,
+            )),
         ),))
+    .into()
 }
 
 /// Mobile 底栏右侧向上展开的 2×3 悬浮菜单（覆盖全部 6 个二级目的地）。
@@ -382,7 +424,16 @@ pub fn compact_more_popup(
 
     Border::new()
         .width(248.0)
-        .margin(Thickness::new(0.0, 0.0, 12.0, 10.0))
+        // 底边距必须整体清出玻璃胶囊带(glass::capsule::FLOATING_CONTENT_
+        // BOTTOM_MARGIN):底栏玻璃是 composition child visual,盖在文档序
+        // 靠前的 XAML 内容之上,浮层与胶囊带几何重叠的下半截会被玻璃
+        // 遮住(竖屏「更多」浮层回归,v0.4.0)。
+        .margin(Thickness::new(
+            0.0,
+            0.0,
+            12.0,
+            crate::widgets::glass::capsule::FLOATING_CONTENT_BOTTOM_MARGIN,
+        ))
         .padding(Thickness::xy(8.0, 8.0))
         .corner_radius(12.0)
         .background(ThemeBrush::SolidBackground)
@@ -438,5 +489,22 @@ mod tests {
         assert_eq!(title_search_box_width(860.0), 240.0);
         assert_eq!(title_search_box_width(700.0), 200.0);
         assert_eq!(title_search_box_width(1280.0), 360.0);
+    }
+
+    /// 竖屏回归:「更多」浮层底边距必须整体清出玻璃胶囊带。底栏玻璃是
+    /// composition child visual,盖在文档序靠前的 XAML 内容之上
+    /// (widgets/glass.rs z 序实测);浮层与胶囊带几何重叠的下半截会被
+    /// 玻璃遮住。`compact_more_popup` 的底边距引用
+    /// `glass::capsule::FLOATING_CONTENT_BOTTOM_MARGIN`,此处钉住两端
+    /// 不漂移。
+    #[test]
+    fn compact_more_popup_bottom_margin_clears_glass_capsule_band() {
+        let capsule = crate::widgets::glass::capsule::FLOATING_CONTENT_BOTTOM_MARGIN;
+        let band = crate::widgets::glass::capsule::FLOAT_MARGIN
+            + crate::widgets::glass::capsule::HEIGHT;
+        assert!(
+            capsule > band,
+            "「更多」浮层底边距 {capsule} 必须清出胶囊带 {band},否则下半截被玻璃遮住"
+        );
     }
 }

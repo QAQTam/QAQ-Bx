@@ -15,6 +15,9 @@ windows-collections = { path = "D:/Projects/qaq-winui-reactor/crates/libs/collec
 windows-reference = { path = "D:/Projects/qaq-winui-reactor/crates/libs/reference" }
 # xamlroot-probe:生成的 winrt bindings 引用 windows_time::TimeSpan。
 windows-time = { path = "D:/Projects/qaq-winui-reactor/crates/libs/time" }
+# 液态玻璃:生成的 winrt bindings 引用 windows_numerics::Vector2
+# (CompositionRoundedRectangleGeometry 的 Size/CornerRadius)。
+windows-numerics = { path = "D:/Projects/qaq-winui-reactor/crates/libs/numerics" }
 windows.workspace = true
 # 弹幕覆盖层:D2D Canvas(reactor 集成)+ DWrite 文本格式。
 windows-canvas = { path = "D:/Projects/qaq-winui-reactor/crates/libs/canvas", features = ["reactor", "composition"] }

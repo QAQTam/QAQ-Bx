@@ -95,6 +95,113 @@ pub fn is_window_fullscreen(hwnd_raw: *mut core::ffi::c_void) -> Option<bool> {
     Some(kind == AppWindowPresenterKind::FullScreen)
 }
 
+/// 竖屏模式:没收/恢复系统最大化钮(presenter 级;未就绪或类型不符返回 false)。
+/// 全屏播放走 FullScreen presenter,与本开关正交;退出全屏回 Default presenter
+/// 后需重按一次(presenter 设置可能随 kind 切换复位)。
+pub fn set_maximizable(hwnd_raw: *mut core::ffi::c_void, enabled: bool) -> bool {
+    if hwnd_raw.is_null() {
+        return false;
+    }
+    let id = WindowId {
+        value: hwnd_raw as usize as u64,
+    };
+    let Ok(app_window) = AppWindow::GetFromWindowId(id) else {
+        eprintln!("[portrait] set_maximizable: GetFromWindowId 失败");
+        return false;
+    };
+    let Ok(presenter) = app_window.Presenter() else {
+        eprintln!("[portrait] set_maximizable: Presenter() 失败");
+        return false;
+    };
+    let Ok(overlapped) = presenter.cast::<OverlappedPresenter>() else {
+        let kind = presenter
+            .Kind()
+            .map(|k| format!("{k:?}"))
+            .unwrap_or_else(|_| "?".into());
+        eprintln!("[portrait] set_maximizable: 非 OverlappedPresenter(kind={kind})");
+        return false;
+    };
+    let ok = overlapped.SetIsMaximizable(enabled).is_ok();
+    eprintln!("[portrait] set_maximizable({enabled}) → {ok}");
+    ok
+}
+
+/// 竖屏模式「贴边最大化」:右缘贴边 × 邻近屏工作区全高,客户区宽对齐
+/// `client_width_dips`(DIP→像素按当前 `inner.width / current_client_dips`
+/// 推算,不依赖任何 DPI API)。返回停靠前外框 (x, y, w, h) 物理像素供还原;
+/// 失败返回 None(调用方保持现状)。
+pub fn dock_window_right(
+    hwnd_raw: *mut core::ffi::c_void,
+    client_width_dips: f64,
+    current_client_dips: f64,
+) -> Option<(i32, i32, i32, i32)> {
+    if hwnd_raw.is_null() || !client_width_dips.is_finite() || client_width_dips <= 0.0 {
+        return None;
+    }
+    let id = WindowId {
+        value: hwnd_raw as usize as u64,
+    };
+    let app_window = AppWindow::GetFromWindowId(id).ok()?;
+    let area = DisplayArea::GetFromWindowId(id, DisplayAreaFallback::Nearest).ok()?;
+    let work = area.WorkArea().ok()?;
+    let outer = app_window.Size().ok()?;
+    let inner = app_window
+        .cast::<IAppWindow2>()
+        .ok()?
+        .ClientSize()
+        .ok()?;
+    let prev = (
+        app_window.Position().ok()?.x,
+        app_window.Position().ok()?.y,
+        outer.width,
+        outer.height,
+    );
+    let scale = if current_client_dips.is_finite() && current_client_dips > 0.0 {
+        f64::from(inner.width) / current_client_dips
+    } else {
+        1.0
+    };
+    let non_client_width = outer.width.saturating_sub(inner.width);
+    let target_client_w = (client_width_dips * scale).round().max(1.0) as i32;
+    let target_outer_w = target_client_w.saturating_add(non_client_width);
+    let target_outer_h = work.height.max(1);
+    let x = work.x.saturating_add(work.width.saturating_sub(target_outer_w));
+    app_window
+        .MoveAndResize(RectInt32 {
+            x,
+            y: work.y,
+            width: target_outer_w,
+            height: target_outer_h,
+        })
+        .ok()?;
+    Some(prev)
+}
+
+/// 还原 `dock_window_right` 记录的停靠前外框几何(工作队列线程调用)。
+pub fn restore_window_bounds(
+    hwnd_raw: *mut core::ffi::c_void,
+    bounds: (i32, i32, i32, i32),
+) -> bool {
+    let (x, y, width, height) = bounds;
+    if hwnd_raw.is_null() || width <= 0 || height <= 0 {
+        return false;
+    }
+    let id = WindowId {
+        value: hwnd_raw as usize as u64,
+    };
+    let Ok(app_window) = AppWindow::GetFromWindowId(id) else {
+        return false;
+    };
+    app_window
+        .MoveAndResize(RectInt32 {
+            x,
+            y,
+            width,
+            height,
+        })
+        .is_ok()
+}
+
 /// 当前焦点是否位于文本输入框（或其模板子元素）内，防止单键播放器快捷键劫持打字。
 pub fn is_text_input_focused() -> bool {
     let Ok(focused) = FocusManager::GetFocusedElement() else {

@@ -80,6 +80,101 @@ const MAX_HOME_SLOTS: usize = 1_200;
 const PLAYBACK_TICK: Duration = Duration::from_millis(250);
 /// P1 网格重建去抖:拖拽期间 VirtualSource 重建延迟到窗口静止后 150ms 一次。
 const GRID_REBUILD_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// 竖屏模式(实验):客户区宽度带上限 = 底栏出现边界 − 1(layout.rs
+/// `ShellChromeMode::from_width` 对 860 用严格 `<`,859 保证 Mobile chrome
+/// 与底栏在任意 DPI 取整下都在)。下限沿用 `MIN_WINDOW_WIDTH`。
+const PORTRAIT_MAX_WIDTH_DIPS: f64 = layout::MOBILE_BREAKPOINT - 1.0;
+
+/// E14:拖框风暴跟踪——连续 `WindowResized`(间隔 ≤250ms)视为一次风暴;收口时输出
+/// `RESIZE-STORM n=… span_ms=… max_gap_ms=…` 到 stderr,供 E14 场景量化 UI 线程
+/// 节拍(F1 合并生效度:n 即风暴期实际消费的消息数,对比脚本侧产出的步数)。
+/// 纯计数器,不改变任何处理路径。
+#[derive(Debug, Default)]
+struct ResizeStormTrack {
+    open: Option<ResizeStorm>,
+}
+
+#[derive(Debug)]
+struct ResizeStorm {
+    start: Instant,
+    last: Instant,
+    count: u32,
+    max_gap_ms: f64,
+}
+
+impl ResizeStormTrack {
+    /// 事件间隔超过该值视为风暴结束。
+    const STORM_GAP_MS: f64 = 250.0;
+    /// 孤立 resize 不输出(阈值防噪声)。
+    const MIN_BURST: u32 = 3;
+
+    /// 记录一次 resize;若上一场风暴已因间隔超限自然结束,先返回其摘要。
+    fn on_resized(&mut self, now: Instant) -> Option<String> {
+        let closed = self.close_stale(now);
+        match &mut self.open {
+            Some(storm) => {
+                let gap = now.duration_since(storm.last).as_secs_f64() * 1000.0;
+                storm.max_gap_ms = storm.max_gap_ms.max(gap);
+                storm.last = now;
+                storm.count += 1;
+            }
+            None => {
+                self.open = Some(ResizeStorm {
+                    start: now,
+                    last: now,
+                    count: 1,
+                    max_gap_ms: 0.0,
+                });
+            }
+        }
+        closed
+    }
+
+    /// 显式收口(去抖 settled / 新风暴开槽);不足 `MIN_BURST` 不输出。
+    fn close(&mut self, reason: &str) -> Option<String> {
+        let storm = self.open.take()?;
+        if storm.count < Self::MIN_BURST {
+            return None;
+        }
+        let span = storm.last.duration_since(storm.start).as_secs_f64() * 1000.0;
+        Some(format!(
+            "RESIZE-STORM n={} span_ms={:.0} max_gap_ms={:.0} ({reason})",
+            storm.count, span, storm.max_gap_ms
+        ))
+    }
+
+    /// 间隔超限的上一场风暴收口。
+    fn close_stale(&mut self, now: Instant) -> Option<String> {
+        let last = self.open.as_ref()?.last;
+        let gap = now.duration_since(last).as_secs_f64() * 1000.0;
+        if gap > Self::STORM_GAP_MS {
+            self.close("gap")
+        } else {
+            None
+        }
+    }
+}
+
+/// §8.2:TitleBar 内容结构档位签名——只有会改变标题栏内容结构的档位
+/// (Mobile 砍副标题/盘钮、Medium 搜索浮窗钮、Expanded 内敛搜索框)才翻签名;
+/// 档内宽度变化不翻,补算不跟每次 resize 走。
+fn title_bar_tier_signature(layout: ViewportLayout) -> u32 {
+    u32::from(layout.is_mobile())
+        | (u32::from(layout.shows_inline_title_search()) << 1)
+        | (u32::from(layout.shows_title_search_button()) << 2)
+}
+
+/// 竖屏模式窗口约束:客户区宽度钳制在底栏边界带 [390, 860) DIP,高度不设限
+/// (presenter 级硬钳制,reactor `WindowConstraints` → `SetPreferredMaximumWidth`)。
+fn portrait_window_constraints() -> WindowConstraints {
+    WindowConstraints {
+        min_width: Some(layout::MIN_WINDOW_WIDTH),
+        min_height: Some(layout::MIN_WINDOW_HEIGHT),
+        max_width: Some(PORTRAIT_MAX_WIDTH_DIPS),
+        max_height: None,
+    }
+}
 /// 设置滑块（音量/透明度）去抖落盘窗口。
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 /// M7:直播间播放项 bvid 前缀(真实稿件不会以此开头;直播恒 mpv 的判据)。
@@ -582,6 +677,18 @@ pub struct AppShell {
     comments_rev: u64,
     playback_avatar_dirty: bool,
     playback_avatar_timer: Option<ComponentTimer>,
+    /// E14:拖框风暴计数器(见 `ResizeStormTrack`;只观测,不改路径)。
+    resize_storm: ResizeStormTrack,
+    /// §8.2:TitleBar 元素句柄(声明面绑定;档位翻转时补算拖拽区)。
+    title_bar_ref: ElementRef<TitleBar>,
+    /// §8.2:上次 settled 时的内容结构档位签名(见 `title_bar_tier_signature`)。
+    title_bar_tier: u32,
+    /// 竖屏模式(实验):贴边停靠态(仅 `settings.portrait_mode` 时有意义)。
+    portrait_docked: bool,
+    /// 竖屏模式:贴边前外框几何(物理像素,供还原;`None` = 无记录)。
+    portrait_dock_restore: Option<(i32, i32, i32, i32)>,
+    /// 竖屏模式:系统最大化没收待执行(None = 已同步);窗口未就绪时逐消息重试。
+    maximizable_pending: Option<bool>,
     playing: bool,
     position: u32,
     mount_tick: u32,
@@ -662,8 +769,6 @@ pub struct AppShell {
     home_half_pane: bool,
     /// 全屏播放状态、同步代次与全局键盘隧道上下文。
     is_fullscreen: bool,
-    /// B 模式 TitleBar 句柄(view() 声明挂 element_ref,供按需重算拖拽区)。
-    title_bar_ref: ElementRef<TitleBar>,
     /// 拖拽区重算结构指纹(路由 tag 长度/首字节、全屏、搜索展开、宽度桶):变化才补算。
     last_title_bar_sig: Cell<(u8, u8, bool, bool, u32)>,
     fullscreen_gen: u64,
@@ -765,6 +870,13 @@ pub enum Message {
         gen_id: u64,
         active: bool,
     },
+    /// 竖屏模式(实验):窗口策略 presenter 手术回执(贴边态对账)。
+    PortraitSynced {
+        docked: bool,
+        restore: Option<(i32, i32, i32, i32)>,
+    },
+    /// 竖屏模式:贴边最大化钮 → 切换停靠态。
+    TogglePortraitDock,
     PlayerHotkey(pages::fullscreen::PlayerHotkey),
     /// 引擎状态节拍(250ms;读引擎快照刷新 UI 单源)。
     PositionTick,
@@ -1915,6 +2027,37 @@ impl AppShell {
             .to_snapshot(self.comments_rev, &self.avatar_cache);
     }
 
+    /// E14:记录一次 resize;风暴因间隔超限自然收口时输出摘要到 stderr。
+    fn track_resize_storm(&mut self) {
+        if let Some(summary) = self.resize_storm.on_resized(Instant::now()) {
+            eprintln!("{summary}");
+        }
+    }
+
+    /// E14:显式收口当前风暴(去抖 settled)。
+    fn close_resize_storm(&mut self, reason: &str) {
+        if let Some(summary) = self.resize_storm.close(reason) {
+            eprintln!("{summary}");
+        }
+    }
+
+    /// 竖屏模式:应用/恢复系统最大化没收(presenter 级;窗口未就绪时逐消息重试)。
+    fn sync_portrait_maximizable(&mut self, context: &ComponentContext<Self>) {
+        let Some(enabled) = self.maximizable_pending else {
+            return;
+        };
+        self.maximizable_pending = None;
+        let docked = self.portrait_docked;
+        let restore = self.portrait_dock_restore;
+        let started = context.run_window(move |window| {
+            crate::winrt_ext::set_maximizable(window.as_raw(), enabled);
+            Message::PortraitSynced { docked, restore }
+        });
+        if !started {
+            self.maximizable_pending = Some(enabled);
+        }
+    }
+
     fn schedule_playback_avatar_flush(&mut self, context: &ComponentContext<Self>) {
         if self.playback_avatar_timer.is_none() {
             self.playback_avatar_timer = Some(
@@ -2302,6 +2445,8 @@ impl AppShell {
         self.related = pages::player::RelatedPane {
             bvid: bvid.clone(),
             loading: true,
+            // F3:换代 +1;absorb/封面回填同契约,PlayerPage 据此重建相关虚拟源。
+            rev: self.related.rev.wrapping_add(1),
             ..pages::player::RelatedPane::default()
         };
         let client = self.feed_client.clone();
@@ -2344,6 +2489,8 @@ impl AppShell {
             return;
         }
         self.related.loading = false;
+        // F3:换代 +1(loading 翻转与 error 路径共同覆盖)。
+        self.related.rev = self.related.rev.wrapping_add(1);
         let items = match res {
             Ok(items) => items,
             Err(err) => {
@@ -2369,6 +2516,7 @@ impl AppShell {
             self.related.items.push(item);
         }
         self.related.loaded_once = true;
+        self.related.rev = self.related.rev.wrapping_add(1);
     }
 
     fn apply_resolved_media(
@@ -2940,8 +3088,14 @@ impl AppShell {
     fn sync_window_fullscreen(&mut self, fullscreen: bool, context: &ComponentContext<Self>) {
         self.fullscreen_gen = self.fullscreen_gen.wrapping_add(1);
         let gen_id = self.fullscreen_gen;
+        let portrait = self.settings.portrait_mode;
         let started = context.run_window(move |window| {
             crate::winrt_ext::set_window_fullscreen(window.as_raw(), fullscreen);
+            // 全屏 presenter 与 OverlappedPresenter 的最大化开关正交,但退出回
+            // Default presenter 时 presenter 设置可能复位——进出都重按一次(幂等)。
+            if portrait {
+                crate::winrt_ext::set_maximizable(window.as_raw(), false);
+            }
             Message::FullscreenSynced {
                 gen_id,
                 active: fullscreen,
@@ -3727,6 +3881,17 @@ impl Component for AppShell {
     type Input = ShellInput;
     type Message = Message;
 
+    /// 最新值语义的消息声明(框架侧 latest-wins 合并,perf-architecture-review
+    /// §R1/F1):拖框风暴里入队未消费的中间尺寸没有意义,合并后每次 drain
+    /// 只处理一条,整页 `view()` 重跑从每 DIP 一次降到每帧至多一次。
+    fn coalesce_key(message: &Self::Message) -> Option<u64> {
+        match message {
+            Message::WindowResized(_) => Some(1),
+            Message::FullscreenProbeResult { .. } => Some(2),
+            _ => None,
+        }
+    }
+
     fn create(input: &ShellInput, context: &ComponentContext<Self>) -> Self {
         crate::winrt_ext::apply_global_font(crate::theme::DEFAULT_FONT_FAMILY);
         let auth_service = Arc::new(Auth::new());
@@ -4044,6 +4209,12 @@ impl Component for AppShell {
             comments_rev: 0,
             playback_avatar_dirty: false,
             playback_avatar_timer: None,
+            resize_storm: ResizeStormTrack::default(),
+            title_bar_ref: ElementRef::new(),
+            title_bar_tier: 0,
+            portrait_docked: false,
+            portrait_dock_restore: None,
+            maximizable_pending: if settings.portrait_mode { Some(false) } else { None },
             playing: false,
             position: 0,
             mount_tick: 0,
@@ -4090,7 +4261,6 @@ impl Component for AppShell {
             home_focus_idx: 0,
             home_half_pane: false,
             is_fullscreen: false,
-            title_bar_ref: ElementRef::default(),
             last_title_bar_sig: Cell::new((0, 0, false, false, 0)),
             fullscreen_gen: 0,
             fullscreen_sync_in_flight: false,
@@ -4113,6 +4283,9 @@ impl Component for AppShell {
         self.refresh_probe();
         #[cfg(feature = "probe")]
         crate::probe::pump();
+        // 竖屏模式:窗口就绪后补上 presenter 级最大化没收(run_window 失败则
+        // 留待下一条消息重试;启动期由首条消息驱动)。
+        self.sync_portrait_maximizable(context);
         match message {
             Message::Back => {
                 if self.is_fullscreen {
@@ -5147,6 +5320,7 @@ impl Component for AppShell {
                 }
             }
             Message::WindowResized(size) => {
+                self.track_resize_storm();
                 let prev_cards = self.viewport_layout.cards;
                 let next_layout = ViewportLayout::from_window_size(size.width, size.height);
                 self.viewport_layout = next_layout;
@@ -5190,6 +5364,15 @@ impl Component for AppShell {
                 }
             }
             Message::WindowResizeSettled => {
+                self.close_resize_storm("settled");
+                // §8.2 收口:auto_refresh 关闭后,内容结构档位翻转不经 TitleBar
+                // 自身尺寸/属性变化;settled(150ms 静止)时新内容已渲染,这里
+                // 补算一次拖拽区。元素未发布/已退役时 reactor 侧静默忽略。
+                let tier = title_bar_tier_signature(self.viewport_layout);
+                if tier != self.title_bar_tier {
+                    self.title_bar_tier = tier;
+                    let _ = self.title_bar_ref.recompute_drag_regions();
+                }
                 self.grid_rebuild_timer = None;
                 if self.pending_grid_rebuild {
                     self.pending_grid_rebuild = false;
@@ -5391,6 +5574,8 @@ impl Component for AppShell {
                         && item.cover.is_none()
                     {
                         item.cover = Some(image);
+                        // F3:封面回填是原位变更,必须换代触发相关虚拟源重建。
+                        self.related.rev = self.related.rev.wrapping_add(1);
                     }
                 }
                 if changed {
@@ -5489,10 +5674,67 @@ impl Component for AppShell {
             }
 
             // ---- 设置 ----
+            Message::TogglePortraitDock => {
+                if !self.settings.portrait_mode {
+                    return;
+                }
+                let docked = !self.portrait_docked;
+                let restore = self.portrait_dock_restore.take();
+                let current_dips = self.viewport_layout.window_width;
+                let target_dips = PORTRAIT_MAX_WIDTH_DIPS;
+                context.run_window(move |window| {
+                    let raw = window.as_raw();
+                    if docked {
+                        let prev = crate::winrt_ext::dock_window_right(
+                            raw,
+                            target_dips,
+                            current_dips,
+                        )
+                        .or(restore);
+                        Message::PortraitSynced {
+                            docked: true,
+                            restore: prev,
+                        }
+                    } else if let Some(prev) = restore {
+                        crate::winrt_ext::restore_window_bounds(raw, prev);
+                        Message::PortraitSynced {
+                            docked: false,
+                            restore: None,
+                        }
+                    } else {
+                        Message::PortraitSynced {
+                            docked: false,
+                            restore: None,
+                        }
+                    }
+                });
+            }
+            Message::PortraitSynced { docked, restore } => {
+                self.portrait_docked = docked;
+                self.portrait_dock_restore = restore;
+            }
             Message::UpdateSettings(next) => {
                 let next = next.normalized();
                 if next == self.settings {
                     return;
+                }
+                // 竖屏模式(实验)翻转:切换系统最大化没收;关闭时若在贴边态
+                // 先还原贴边前几何,再交由 pending 恢复最大化钮。
+                if next.portrait_mode != self.settings.portrait_mode {
+                    self.maximizable_pending = Some(!next.portrait_mode);
+                    if !next.portrait_mode && self.portrait_docked {
+                        let restore = self.portrait_dock_restore.take();
+                        self.portrait_docked = false;
+                        if let Some(prev) = restore {
+                            context.run_window(move |window| {
+                                crate::winrt_ext::restore_window_bounds(window.as_raw(), prev);
+                                Message::PortraitSynced {
+                                    docked: false,
+                                    restore: None,
+                                }
+                            });
+                        }
+                    }
                 }
                 // M7:切引擎要在写入新设置**之后**判定(生效引擎取自 settings)。
                 let engine_before = self.effective_player_engine();
@@ -5970,16 +6212,31 @@ impl Component for AppShell {
 
     fn view(&self, _input: &ShellInput, context: &mut ViewContext<Self>) -> View {
         context.window_title(crate::notifications::APP_DISPLAY_NAME);
+        let portrait = self.settings.portrait_mode;
+        let (client_w, client_h) = if portrait {
+            (PORTRAIT_MAX_WIDTH_DIPS, layout::DEFAULT_WINDOW_HEIGHT)
+        } else {
+            (layout::DEFAULT_WINDOW_WIDTH, layout::DEFAULT_WINDOW_HEIGHT)
+        };
         let mut visuals = WindowVisuals::new()
             .backdrop(WindowBackdrop::Mica)
-            .client_size(layout::DEFAULT_WINDOW_WIDTH, layout::DEFAULT_WINDOW_HEIGHT)
-            .constraints(WindowConstraints {
-                min_width: Some(layout::MIN_WINDOW_WIDTH),
-                min_height: Some(layout::MIN_WINDOW_HEIGHT),
-                max_width: None,
-                max_height: None,
+            .client_size(client_w, client_h)
+            // 竖屏模式:宽度钳制在底栏边界带 [390, 860) DIP——presenter 级
+            // 硬钳制,拖到上限物理拖不动;高度不设限。
+            .constraints(if portrait {
+                portrait_window_constraints()
+            } else {
+                WindowConstraints {
+                    min_width: Some(layout::MIN_WINDOW_WIDTH),
+                    min_height: Some(layout::MIN_WINDOW_HEIGHT),
+                    max_width: None,
+                    max_height: None,
+                }
             });
-        if self.demo.is_none()
+        // 竖屏模式下不恢复上次的(可能超带)窗口位置——初始几何交给
+        // client_size 声明,贴边态由用户主动点钮进入。
+        if !portrait
+            && self.demo.is_none()
             && let Some(bounds) = self.settings.window
         {
             let bounds = clamp_window_bounds(bounds);
@@ -6266,6 +6523,9 @@ impl Component for AppShell {
         );
         let title_bar = chrome::build_title_bar(
             layout,
+            &self.title_bar_ref,
+            self.settings.portrait_mode,
+            context.message(Message::TogglePortraitDock),
             APP_ICON_48_PNG,
             crate::notifications::APP_DISPLAY_NAME,
             route_subtitle,
@@ -6280,7 +6540,6 @@ impl Component for AppShell {
             context.message(Message::SearchSubmitted),
             context.message(Message::ToggleSearchOverlay),
             context.message(Message::OpenNotifications),
-            &self.title_bar_ref,
         );
         // B 模式重算口:结构指纹变化(路由/全屏/搜索展开/宽度桶)时按需补算一次
         // 拖拽区;imperative 队列跑在本轮 reconcile 之后,元素必已发布。
@@ -6297,7 +6556,12 @@ impl Component for AppShell {
         }
 
         if is_mobile {
-            let content_host = Grid::new().grid_row(1).keyed_children({
+            // iOS 26 悬浮底栏:内容跨行铺到 row1+row2,底栏胶囊浮在内容
+            // 之上——composition backdrop 采样到的才是滚动内容(玻璃有物可折)。
+            let content_host = Grid::new()
+                .grid_row(1)
+                .grid_row_span(2)
+                .keyed_children({
                 let mut layers = if self.route == Route::Player {
                     vec![
                         keyed("home", self.home_view(context)),
@@ -6357,7 +6621,11 @@ impl Component for AppShell {
 
             let shell_root = Grid::new()
                 .rows([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
-                .children((title_bar, content_host, bottom_bar.grid_row(2)));
+                .children((
+                    title_bar,
+                    content_host,
+                    Grid::new().grid_row(2).children((bottom_bar,)),
+                ));
 
             return Border::new()
                 .on_preview_key_down(self.global_key_handler.clone())
@@ -6455,6 +6723,100 @@ fn nav_item(tag: &str, label: &str, icon: Option<Symbol>, selected: bool) -> Key
 mod tests {
     use super::*;
     use qaq_bx_core::settings::{CodecPref, QualityPref};
+
+    #[test]
+    fn latest_value_messages_are_coalescable_and_the_rest_are_not() {
+        let size = |width, height| windows_reactor::WindowSize { width, height };
+        assert_eq!(
+            AppShell::coalesce_key(&Message::WindowResized(size(800.0, 600.0))),
+            Some(1),
+            "拖框风暴:中间尺寸无意义,必须 latest-wins"
+        );
+        assert_eq!(
+            AppShell::coalesce_key(&Message::FullscreenProbeResult { gen_id: 7, active: true }),
+            Some(2),
+            "探针只看最新一代的当前态"
+        );
+        // 非「最新值」语义的消息绝不可被合并丢弃:逐条计数/投递的都有副作用。
+        assert_eq!(AppShell::coalesce_key(&Message::PositionTick), None);
+        assert_eq!(AppShell::coalesce_key(&Message::Back), None);
+        assert_eq!(AppShell::coalesce_key(&Message::WindowResizeSettled), None);
+    }
+
+    #[test]
+    fn resize_storm_tracker_bursts_close_and_summarize() {
+        let t0 = Instant::now();
+        // 孤立/双发不足 MIN_BURST:收口不输出。
+        let mut storm = ResizeStormTrack::default();
+        assert!(storm.on_resized(t0).is_none());
+        assert!(storm.on_resized(t0 + Duration::from_millis(55)).is_none());
+        assert!(storm.close("settled").is_none(), "孤立 resize 不算风暴");
+        // 5 连发 55ms 间隔:n=5 / span=220ms / max_gap=55ms。
+        let mut storm = ResizeStormTrack::default();
+        for i in 0..5 {
+            let now = t0 + Duration::from_millis(55 * i);
+            assert!(storm.on_resized(now).is_none(), "第 {i} 拍不应触发收口");
+        }
+        let summary = storm.close("settled").expect("5 连发应输出风暴摘要");
+        assert!(summary.contains("RESIZE-STORM n=5"), "{summary}");
+        assert!(summary.contains("span_ms=220"), "{summary}");
+        assert!(summary.contains("max_gap_ms=55"), "{summary}");
+        // 间隔 >250ms:上一场自动收口并开新风暴。
+        let mut storm = ResizeStormTrack::default();
+        for i in 0..3 {
+            let _ = storm.on_resized(t0 + Duration::from_millis(55 * i));
+        }
+        let closed = storm
+            .on_resized(t0 + Duration::from_millis(110 + 400))
+            .expect("间隔 400ms 应先收口上一场");
+        assert!(closed.contains("RESIZE-STORM n=3"), "{closed}");
+        assert!(
+            storm.close("settled").is_none(),
+            "新风暴仅 1 拍,不足输出门槛"
+        );
+    }
+
+    #[test]
+    fn title_bar_tier_signature_tracks_content_structure_tiers() {
+        use crate::layout::{COMPACT_CONTENT_BREAKPOINT, EXPANDED_BREAKPOINT, MOBILE_BREAKPOINT};
+        // chrome 阈值(860)高于 content 阈值(600):Mobile chrome 段内仍有
+        // Compact/Medium 两个内容档,三档签名 = 1 / 5 / 2。
+        let mobile = ViewportLayout::from_window_size(COMPACT_CONTENT_BREAKPOINT - 100.0, 800.0);
+        let medium = ViewportLayout::from_window_size(MOBILE_BREAKPOINT.min(800.0) - 60.0, 800.0);
+        let expanded = ViewportLayout::from_window_size(EXPANDED_BREAKPOINT + 20.0, 800.0);
+        let signatures = (
+            title_bar_tier_signature(mobile),
+            title_bar_tier_signature(medium),
+            title_bar_tier_signature(expanded),
+        );
+        assert_ne!(signatures.0, signatures.1, "Mobile 档应翻转签名");
+        assert_ne!(signatures.1, signatures.2, "Medium→Expanded 应翻转签名");
+        assert_ne!(signatures.0, signatures.2, "Mobile→Expanded 应翻转签名");
+        // 同档不同宽(Expanded 档内加宽)不翻签名:补算不跟每次 resize 走。
+        let wide_a = ViewportLayout::from_window_size(EXPANDED_BREAKPOINT + 100.0, 800.0);
+        let wide_b = ViewportLayout::from_window_size(EXPANDED_BREAKPOINT + 260.0, 800.0);
+        assert_eq!(
+            title_bar_tier_signature(wide_a),
+            title_bar_tier_signature(wide_b),
+            "档内宽度变化不得触发补算"
+        );
+    }
+
+    #[test]
+    fn portrait_window_constraints_stay_inside_bottom_bar_band() {
+        let constraints = portrait_window_constraints();
+        assert_eq!(
+            constraints.min_width,
+            Some(layout::MIN_WINDOW_WIDTH),
+            "下限沿用既有最小窗宽"
+        );
+        assert_eq!(constraints.max_width, Some(PORTRAIT_MAX_WIDTH_DIPS));
+        assert!(
+            constraints.max_width.unwrap() < crate::layout::MOBILE_BREAKPOINT,
+            "上限必须严格保持在底栏边界之内(任意 DPI 取整后仍不出带)"
+        );
+        assert!(constraints.max_height.is_none(), "高度不设限");
+    }
 
     #[test]
     fn danmaku_segment_math_anchors_six_minute_boundaries() {
