@@ -28,6 +28,7 @@ fn main() {
             "Microsoft.UI.Windowing.DisplayArea.WorkArea",
             "Microsoft.UI.Windowing.DisplayAreaFallback",
             "Microsoft.UI.Windowing.OverlappedPresenter.IsMaximizable",
+            "Microsoft.UI.Windowing.IOverlappedPresenter3",
             "Windows.Graphics.RectInt32",
             "Windows.Graphics.SizeInt32",
             "Windows.Graphics.PointInt32",

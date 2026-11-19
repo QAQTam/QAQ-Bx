@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -78,6 +78,89 @@ impl Drop for SendRaw {
     }
 }
 
+/// 面板 swapchain 挂载代际协调槽（VideoEngine 与 DanmakuStage 共用）：
+/// 通过 `attach_gen` 单调代次隔离旧面板/Resize 前的迟到 completion 回调，
+/// 并在面板卸载时同步复位 `attached`，防止全屏切换时出现偶发黑屏。
+pub(crate) struct SurfaceMountSlot {
+    pending: Mutex<Option<(u64, SendRaw)>>,
+    attached: AtomicBool,
+    attach_gen: AtomicU64,
+}
+
+impl SurfaceMountSlot {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            pending: Mutex::new(None),
+            attached: AtomicBool::new(false),
+            attach_gen: AtomicU64::new(1),
+        })
+    }
+
+    pub(crate) fn current_gen(&self) -> u64 {
+        self.attach_gen.load(Ordering::SeqCst)
+    }
+
+    /// 面板卸载：同步清 `attached` 并推进代次（作废旧面板在途 completion 回调）。
+    pub(crate) fn invalidate_and_detach(&self) -> u64 {
+        self.attached.store(false, Ordering::SeqCst);
+        let next = self.attach_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Ok(mut slot) = self.pending.lock()
+            && slot.as_ref().is_some_and(|(gen_id, _)| *gen_id != next)
+        {
+            *slot = None;
+        }
+        next
+    }
+
+    /// ResizeBuffers 等引擎主动重挂：同步清 `attached` 并以新代次发布待挂载 swapchain。
+    pub(crate) fn republish_new_gen(&self, raw: *mut c_void) -> u64 {
+        self.attached.store(false, Ordering::SeqCst);
+        let next = self.attach_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Ok(mut slot) = self.pending.lock() {
+            *slot = Some((next, SendRaw::new(raw)));
+        } else {
+            drop(SendRaw::new(raw));
+        }
+        next
+    }
+
+    /// 仅当 `gen` 仍为当前有效代次时写入 `pending`（过期直接 drop 释放 COM 引用）。
+    pub(crate) fn publish_if_current(&self, gen_id: u64, raw: *mut c_void) -> bool {
+        let holder = SendRaw::new(raw);
+        if self.attach_gen.load(Ordering::SeqCst) != gen_id {
+            return false;
+        }
+        if let Ok(mut slot) = self.pending.lock() {
+            if self.attach_gen.load(Ordering::SeqCst) != gen_id {
+                return false;
+            }
+            *slot = Some((gen_id, holder));
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn take_pending(&self) -> Option<(u64, *mut c_void)> {
+        let (gen_id, chain) = self.pending.lock().ok()?.take()?;
+        Some((gen_id, chain.into_raw()))
+    }
+
+    /// completion 回写：过期 `gen` 一律忽略并返回 `None`；当前 `gen` 返回 `Some(ok)`。
+    pub(crate) fn mark_attached(&self, gen_id: u64, ok: bool) -> Option<bool> {
+        if self.attach_gen.load(Ordering::SeqCst) != gen_id {
+            return None;
+        }
+        if ok {
+            self.attached.store(true, Ordering::SeqCst);
+        }
+        Some(ok)
+    }
+
+    pub(crate) fn is_attached(&self) -> bool {
+        self.attached.load(Ordering::SeqCst)
+    }
+}
+
 /// 面板物理像素尺寸与组合缩放因子(由 DIP × CompositionScale 换算)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SurfaceMetrics {
@@ -136,6 +219,14 @@ pub struct PlaybackStatus {
     pub pause: bool,
     /// 播放到末尾(keep-open 停在末帧)。
     pub eof: bool,
+    /// 缓存不足暂停缓冲(mpv paused-for-cache)。
+    pub buffering: bool,
+    /// 当前文件已完成解复用头解析(MPV_EVENT_FILE_LOADED)。
+    pub file_loaded: bool,
+    /// 已开始首帧重放或推进进度(MPV_EVENT_PLAYBACK_RESTART / time_pos > 0)。
+    pub playback_started: bool,
+    /// 最近一次已受理并下发 mpv loadfile 的单调装载代次。
+    pub load_seq: u64,
     /// 当前生效视频解码格式(mpv video-format;空 = 视频轨未解出,F4 探测锚)。
     pub video_format: String,
     /// 当前生效音频编解码名(mpv audio-codec-name;空 = 音频轨未解出,F4 探测锚)。
@@ -186,6 +277,7 @@ pub enum EngineCmd {
     /// 加载分轨(B 站头固定在引擎侧;audio_url=None 纯视频)。
     /// `start_secs > 0` 从该位置起播(画质/分 P 无缝切换:先记位后重载)。
     Load {
+        seq: u64,
         video_url: String,
         audio_url: Option<String>,
         start_secs: f64,
@@ -224,8 +316,10 @@ pub enum EngineCmd {
     },
     /// 面板物理像素尺寸与组合缩放变化(0 视为面板未就绪,忽略)。
     Resize(SurfaceMetrics),
-    /// 面板卸载:attached 复位,swapchain 放回待挂载槽(重进播放页再挂)。
-    Detach,
+    /// 面板卸载:同步复位 attached 并递增 gen,引擎线程据此决定是否把 swapchain 放回待挂载槽。
+    Detach {
+        gen_id: u64,
+    },
     /// mpv update_callback 唤醒（新帧到达待合成）。
     FrameDirty,
     Quit,
@@ -406,9 +500,9 @@ impl CompiledDanmakuFilter {
 /// 视频引擎句柄(线程安全;UI 侧克隆共享)。
 pub struct VideoEngine {
     cmd_tx: Sender<EngineCmd>,
-    /// 引擎线程产出的待挂载 swapchain(UI 线程取走挂载;失败放回)。
-    pending: Arc<Mutex<Option<SendRaw>>>,
-    attached: Arc<AtomicBool>,
+    /// swapchain 挂载代际协调槽(UI 线程取走挂载;失败放回;卸载递增代次防迟到回写)。
+    mount: Arc<SurfaceMountSlot>,
+    load_seq: Arc<AtomicU64>,
     status: Arc<Mutex<PlaybackStatus>>,
     error: Arc<Mutex<Option<String>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -417,7 +511,7 @@ pub struct VideoEngine {
 // UI 只比较句柄同一性(reactor Input 约束需要 PartialEq)。
 impl PartialEq for VideoEngine {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.pending, &other.pending)
+        Arc::ptr_eq(&self.mount, &other.mount)
     }
 }
 
@@ -432,26 +526,23 @@ impl VideoEngine {
     pub fn with_config(config: VideoConfig) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let wakeup_tx = cmd_tx.clone();
-        let pending = Arc::new(Mutex::new(None));
-        let attached = Arc::new(AtomicBool::new(false));
+        let mount = SurfaceMountSlot::new();
+        let load_seq = Arc::new(AtomicU64::new(0));
         let status = Arc::new(Mutex::new(PlaybackStatus::default()));
         let error = Arc::new(Mutex::new(None));
         let thread = {
-            let pending = pending.clone();
-            let attached = attached.clone();
+            let mount = mount.clone();
             let status = status.clone();
             let error = error.clone();
             std::thread::Builder::new()
                 .name("video-engine".into())
-                .spawn(move || {
-                    engine_thread(wakeup_tx, cmd_rx, pending, attached, status, error, config)
-                })
+                .spawn(move || engine_thread(wakeup_tx, cmd_rx, mount, status, error, config))
                 .ok()
         };
         Arc::new(Self {
             cmd_tx,
-            pending,
-            attached,
+            mount,
+            load_seq,
             status,
             error,
             thread: Mutex::new(thread),
@@ -460,25 +551,33 @@ impl VideoEngine {
 
     // ---- UI → 引擎命令(发送失败仅线程已死,静默) ----
 
-    /// 加载 B 站分轨(loadfile replace;默认自动播放)。
-    pub fn load(&self, video_url: &str, audio_url: Option<&str>) {
-        self.load_with_options(video_url, audio_url, 0.0, true);
+    /// 加载 B 站分轨(loadfile replace;默认自动播放),返回本次单调装载世代。
+    pub fn load(&self, video_url: &str, audio_url: Option<&str>) -> u64 {
+        self.load_with_options(video_url, audio_url, 0.0, true)
     }
 
-    /// 加载 B 站分轨并指定起播位置与是否自动播放。
+    /// 加载 B 站分轨并指定起播位置与是否自动播放,返回本次单调装载世代。
     pub fn load_with_options(
         &self,
         video_url: &str,
         audio_url: Option<&str>,
         start_secs: f64,
         autoplay: bool,
-    ) {
+    ) -> u64 {
+        let seq = self.load_seq.fetch_add(1, Ordering::SeqCst) + 1;
         _ = self.cmd_tx.send(EngineCmd::Load {
+            seq,
             video_url: video_url.to_string(),
             audio_url: audio_url.map(str::to_string),
             start_secs: start_secs.max(0.0),
             autoplay,
         });
+        seq
+    }
+
+    /// 最近一次发起 `load` 的单调代次。
+    pub fn load_seq(&self) -> u64 {
+        self.load_seq.load(Ordering::SeqCst)
     }
 
     /// 全片弹幕(SetDanmaku;排序由调用方保证)。
@@ -555,39 +654,43 @@ impl VideoEngine {
         _ = self.cmd_tx.send(EngineCmd::Resize(metrics));
     }
 
-    /// 面板卸载(VideoSurface cleanup)。
+    /// 面板卸载(VideoSurface cleanup):同步清 `attached` 并推进代次,
+    /// 拦截退役面板的迟到 completion 回写,然后通知引擎线程重新投递 swapchain。
     pub fn detach_panel(&self) {
-        _ = self.cmd_tx.send(EngineCmd::Detach);
+        let gen_id = self.mount.invalidate_and_detach();
+        _ = self.cmd_tx.send(EngineCmd::Detach { gen_id });
     }
 
     // ---- 挂载协调(UI 线程专用) ----
 
-    /// 取走待挂载 swapchain 原始指针(接管所有权;无则 None:引擎尚未创建
-    /// 完成或已挂载)。UI 侧经 `IUnknown::from_raw` 接管。
-    pub fn take_pending(&self) -> Option<*mut c_void> {
-        let chain = self.pending.lock().ok()?.take()?;
-        Some(chain.into_raw())
+    /// 取走待挂载 swapchain 原始指针及其代次(接管所有权;无则 None)。UI 侧经
+    /// `IUnknown::from_raw` 接管。
+    pub fn take_pending(&self) -> Option<(u64, *mut c_void)> {
+        self.mount.take_pending()
     }
 
-    /// 挂载请求入队失败(面板尚未实例化):放回指针(接管所有权),下轮再试。
-    pub fn put_back_pending(&self, raw: *mut c_void) {
-        if let Ok(mut slot) = self.pending.lock() {
-            *slot = Some(SendRaw(raw));
-        }
+    /// 挂载请求入队失败或面板瞬态不可用(`Unavailable`):仅当 `gen_id` 未过期时
+    /// 放回指针重试(过期则 drop 释放 COM 引用)。
+    pub fn put_back_pending(&self, gen_id: u64, raw: *mut c_void) {
+        let _ = self.mount.publish_if_current(gen_id, raw);
     }
 
-    /// 挂载 completion 回写(成功 → attached + 唤醒渲染首帧;失败 → 记错误)。
-    pub fn mark_attached(&self, ok: bool) {
-        if ok {
-            self.attached.store(true, Ordering::SeqCst);
-            _ = self.cmd_tx.send(EngineCmd::FrameDirty);
-        } else {
-            self.set_error("swapchain 挂载失败(SetSwapChain)");
+    /// 挂载 completion 回写(仅当前 `gen_id` 生效:成功 → attached + 唤醒首帧;
+    /// 真实错误 → 记错误;过期回调静默丢弃)。
+    pub fn mark_attached(&self, gen_id: u64, ok: bool) {
+        match self.mount.mark_attached(gen_id, ok) {
+            Some(true) => {
+                _ = self.cmd_tx.send(EngineCmd::FrameDirty);
+            }
+            Some(false) => {
+                self.set_error("swapchain 挂载失败(SetSwapChain)");
+            }
+            None => {}
         }
     }
 
     pub fn attached(&self) -> bool {
-        self.attached.load(Ordering::SeqCst)
+        self.mount.is_attached()
     }
 
     // ---- 状态读 ----
@@ -659,8 +762,7 @@ unsafe extern "C" fn on_mpv_frame_dirty(ctx: *mut c_void) {
 fn engine_thread(
     wakeup_tx: Sender<EngineCmd>,
     cmd_rx: Receiver<EngineCmd>,
-    pending: Arc<Mutex<Option<SendRaw>>>,
-    attached: Arc<AtomicBool>,
+    mount: Arc<SurfaceMountSlot>,
     status: Arc<Mutex<PlaybackStatus>>,
     error: Arc<Mutex<Option<String>>>,
     initial_config: VideoConfig,
@@ -693,9 +795,8 @@ fn engine_thread(
     // 3) swapchain 交付 UI 挂载(UI 线程 SetSwapChain)。
     match surface.chain.into_unknown_raw() {
         Ok(raw) => {
-            if let Ok(mut slot) = pending.lock() {
-                *slot = Some(SendRaw(raw));
-            }
+            let gen_id = mount.current_gen();
+            let _ = mount.publish_if_current(gen_id, raw);
         }
         Err(e) => {
             report_error(format!("swapchain → IUnknown 失败:{e}"));
@@ -737,8 +838,8 @@ fn engine_thread(
         return;
     }
 
-    // 6) 属性观察 → 状态快照(time-pos/duration/pause/eof)。
-    if let Err(e) = observe_status(&mut player, status.clone()) {
+    // 6) 属性观察 → 状态快照(time-pos/duration/pause/eof/paused-for-cache)。
+    if let Err(e) = observe_status(&mut player, status.clone(), error.clone()) {
         report_error(format!("mpv 属性观察失败:{e}"));
         let _ = player.set_update_callback(None, std::ptr::null_mut());
         drop(player);
@@ -769,6 +870,7 @@ fn engine_thread(
     // P1 resize 合并状态:拖拽期间只记最新目标尺寸,120ms 节流应用。
     let mut pending_resize: Option<SurfaceMetrics> = None;
     let mut resize_first_seen: Option<Instant> = None;
+    let mut active_load_seq: u64 = 0;
     'main: loop {
         // 命令段：若有已取出的首条指令先消费，再一口气排空。
         loop {
@@ -779,13 +881,21 @@ fn engine_thread(
             match next_cmd {
                 Ok(cmd) => match cmd {
                     EngineCmd::Load {
+                        seq,
                         video_url,
                         audio_url,
                         start_secs,
                         autoplay,
                     } => {
+                        active_load_seq = seq;
+                        if let Ok(mut e) = error.lock() {
+                            *e = None;
+                        }
                         if let Ok(mut s) = status.lock() {
-                            *s = PlaybackStatus::default();
+                            *s = PlaybackStatus {
+                                load_seq: seq,
+                                ..PlaybackStatus::default()
+                            };
                         }
                         let pause_val = if autoplay { "no" } else { "yes" };
                         // start 是全局持久选项:每次 load 前显式重置(0 = 片头);
@@ -875,8 +985,14 @@ fn engine_thread(
                         _ = player.stop();
                         overlay.clear();
                         overlay.shrink_to_fit();
+                        if let Ok(mut e) = error.lock() {
+                            *e = None;
+                        }
                         if let Ok(mut s) = status.lock() {
-                            *s = PlaybackStatus::default();
+                            *s = PlaybackStatus {
+                                load_seq: active_load_seq,
+                                ..PlaybackStatus::default()
+                            };
                         }
                         need_repaint = true;
                         mpv_dirty = true;
@@ -902,12 +1018,9 @@ fn engine_thread(
                             need_repaint = true;
                         }
                     }
-                    EngineCmd::Detach => {
-                        attached.store(false, Ordering::SeqCst);
-                        if let Ok(raw) = surface.chain.into_unknown_raw()
-                            && let Ok(mut slot) = pending.lock()
-                        {
-                            *slot = Some(SendRaw(raw));
+                    EngineCmd::Detach { gen_id } => {
+                        if let Ok(raw) = surface.chain.into_unknown_raw() {
+                            let _ = mount.publish_if_current(gen_id, raw);
                         }
                     }
                     EngineCmd::FrameDirty => {
@@ -942,11 +1055,8 @@ fn engine_thread(
                     scale_y = metrics.scale_y;
                     configure_swap_chain(&mut surface.chain, scale_x, scale_y);
                     need_repaint = true;
-                    attached.store(false, Ordering::SeqCst);
-                    if let Ok(raw) = surface.chain.into_unknown_raw()
-                        && let Ok(mut slot) = pending.lock()
-                    {
-                        *slot = Some(SendRaw(raw));
+                    if let Ok(raw) = surface.chain.into_unknown_raw() {
+                        let _ = mount.republish_new_gen(raw);
                     }
                 }
             } else if scale_changed {
@@ -957,7 +1067,7 @@ fn engine_thread(
             }
         }
 
-        let is_attached = attached.load(Ordering::SeqCst);
+        let is_attached = mount.is_attached();
         let (is_paused, raw_t) = match status.lock() {
             Ok(s) => (s.pause, s.time_pos),
             Err(_) => (false, 0.0),
@@ -1294,10 +1404,11 @@ pub(crate) fn draw_danmaku_overlay(
     }
 }
 
-/// 观察 time-pos/duration/pause/eof-reached → 状态快照。
+/// 观察 time-pos/duration/pause/eof-reached/paused-for-cache → 状态快照。
 fn observe_status(
     player: &mut MpvPlayer,
     status: Arc<Mutex<PlaybackStatus>>,
+    error: Arc<Mutex<Option<String>>>,
 ) -> Result<(), crate::error::BiliVideoError> {
     player.observe_property(1, "time-pos", MPV_FORMAT_DOUBLE)?;
     player.observe_property(2, "duration", MPV_FORMAT_DOUBLE)?;
@@ -1309,14 +1420,45 @@ fn observe_status(
     player.observe_property(6, "audio-codec-name", MPV_FORMAT_STRING)?;
     // P2 诊断:硬解实际生效路径(d3d11va / 失败回退 sw)。
     player.observe_property(7, "hwdec-current", MPV_FORMAT_STRING)?;
-    player.start_event_thread(Arc::new(move |event| match event {
+    // 缓冲中状态:缺缓冲暂停时必须驱动 UI 恢复「视频加载中…」动画。
+    player.observe_property(8, "paused-for-cache", MPV_FORMAT_FLAG)?;
+    player.start_event_thread(Arc::new(move |event| apply_mpv_event(&status, &error, event)))?;
+    Ok(())
+}
+
+fn apply_mpv_event(
+    status: &Arc<Mutex<PlaybackStatus>>,
+    error: &Arc<Mutex<Option<String>>>,
+    event: MpvEvent,
+) {
+    const MPV_END_FILE_REASON_EOF: i32 = 0;
+    const MPV_END_FILE_REASON_ERROR: i32 = 4;
+
+    match event {
+        MpvEvent::FileLoaded => {
+            if let Ok(mut s) = status.lock() {
+                s.file_loaded = true;
+            }
+        }
+        MpvEvent::PlaybackRestart => {
+            if let Ok(mut s) = status.lock() {
+                s.playback_started = true;
+                s.buffering = false;
+            }
+        }
         MpvEvent::PropertyChange { name, value } => {
             let Ok(mut s) = status.lock() else { return };
             match (name.as_str(), value) {
-                ("time-pos", PropertyValue::Double(v)) => s.time_pos = v.max(0.0),
+                ("time-pos", PropertyValue::Double(v)) => {
+                    s.time_pos = v.max(0.0);
+                    if s.time_pos > 0.0 {
+                        s.playback_started = true;
+                    }
+                }
                 ("duration", PropertyValue::Double(v)) => s.duration = v.max(0.0),
                 ("pause", PropertyValue::Flag(v)) => s.pause = v,
                 ("eof-reached", PropertyValue::Flag(v)) => s.eof = v,
+                ("paused-for-cache", PropertyValue::Flag(v)) => s.buffering = v,
                 ("video-format", PropertyValue::Text(v)) => s.video_format = v,
                 ("audio-codec-name", PropertyValue::Text(v)) => s.audio_codec = v,
                 ("hwdec-current", PropertyValue::Text(v)) => {
@@ -1327,16 +1469,27 @@ fn observe_status(
                 _ => {}
             }
         }
-        // keep-open:EOF 停在末帧(keep-open-pause 默认 yes → pause 置位),
-        // eof-reached 属性双保险。
-        MpvEvent::EndFile { .. } => {
-            if let Ok(mut s) = status.lock() {
-                s.eof = true;
+        // keep-open:EOF 停在末帧;STOP(切源/replace) 不视为播放完毕也不报错;
+        // ERROR(网络/解码失败) 必须写入错误槽使 UI 收起卡死转圈并提示/回退。
+        MpvEvent::EndFile { reason, error: code } => {
+            if reason == MPV_END_FILE_REASON_EOF {
+                if let Ok(mut s) = status.lock() {
+                    s.eof = true;
+                    s.buffering = false;
+                }
+            } else if reason == MPV_END_FILE_REASON_ERROR {
+                if let Ok(mut s) = status.lock() {
+                    s.buffering = false;
+                    s.file_loaded = false;
+                    s.playback_started = false;
+                }
+                if let Ok(mut slot) = error.lock() {
+                    *slot = Some(format!("mpv 播放失败(code={code})"));
+                }
             }
         }
         _ => {}
-    }))?;
-    Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1713,5 +1866,124 @@ mod tests {
         assert!(pass.is_passthrough());
         let kept4 = pass.filter_batch(vec![mk("草", 6000)], &mut dedup);
         assert_eq!(kept4.len(), 1);
+    }
+
+    #[test]
+    fn surface_mount_slot_ignores_stale_generation_and_clears_attached_on_detach() {
+        let gpu = GpuDevice::new_warp().expect("WARP GPU 设备应可用");
+        let chain = gpu.create_swap_chain(320, 180).expect("swapchain");
+        let raw1 = chain.into_unknown_raw().expect("unknown raw1");
+        let raw2 = chain.into_unknown_raw().expect("unknown raw2");
+
+        let slot = SurfaceMountSlot::new();
+        let g1 = slot.current_gen();
+        assert!(slot.publish_if_current(g1, raw1));
+        assert_eq!(slot.mark_attached(g1, true), Some(true));
+        assert!(slot.is_attached());
+
+        // 卸载瞬间同步清 attached 并推进代次；旧代次延迟回写或放回必须被拦截。
+        let g2 = slot.invalidate_and_detach();
+        assert_ne!(g2, g1);
+        assert!(!slot.is_attached());
+        assert_eq!(slot.mark_attached(g1, true), None);
+        assert!(!slot.is_attached());
+        assert!(!slot.publish_if_current(g1, raw2));
+        assert!(slot.take_pending().is_none());
+
+        // 新代次重新投递并可被认领/放回重试/成功挂载。
+        let raw3 = chain.into_unknown_raw().expect("unknown raw3");
+        assert!(slot.publish_if_current(g2, raw3));
+        let (taken_gen, taken_raw) = slot.take_pending().expect("pending for g2");
+        assert_eq!(taken_gen, g2);
+        assert!(slot.publish_if_current(taken_gen, taken_raw));
+        let (retry_gen, retry_raw) = slot.take_pending().expect("retry pending");
+        assert_eq!(retry_gen, g2);
+        drop(SendRaw::new(retry_raw));
+        assert_eq!(slot.mark_attached(g2, true), Some(true));
+        assert!(slot.is_attached());
+    }
+
+    #[test]
+    fn video_engine_load_advances_load_seq_and_detach_clears_attached() {
+        let engine = VideoEngine::new();
+        assert_eq!(engine.load_seq(), 0);
+        let s1 = engine.load("https://example.com/v1.m4s", Some("https://example.com/a1.m4s"));
+        let s2 = engine.load_with_options("https://example.com/v2.m4s", None, 12.0, false);
+        assert_eq!(s1, 1);
+        assert_eq!(s2, 2);
+        assert_eq!(engine.load_seq(), 2);
+
+        let g1 = engine.mount.current_gen();
+        assert_eq!(engine.mount.mark_attached(g1, true), Some(true));
+        assert!(engine.attached());
+        engine.detach_panel();
+        assert!(!engine.attached(), "detach_panel 必须同步清 attached");
+        // 旧面板的迟到回调不得把 attached 写回 true
+        engine.mark_attached(g1, true);
+        assert!(!engine.attached());
+    }
+
+    #[test]
+    fn apply_mpv_event_tracks_buffering_lifecycle_and_end_file_reasons() {
+        let status = Arc::new(Mutex::new(PlaybackStatus::default()));
+        let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        apply_mpv_event(&status, &error, MpvEvent::FileLoaded);
+        apply_mpv_event(
+            &status,
+            &error,
+            MpvEvent::PropertyChange {
+                name: "paused-for-cache".into(),
+                value: PropertyValue::Flag(true),
+            },
+        );
+        {
+            let s = status.lock().unwrap();
+            assert!(s.file_loaded);
+            assert!(s.buffering);
+            assert!(!s.playback_started);
+        }
+
+        apply_mpv_event(&status, &error, MpvEvent::PlaybackRestart);
+        {
+            let s = status.lock().unwrap();
+            assert!(s.playback_started);
+            assert!(!s.buffering);
+        }
+
+        // STOP (reason=2，如切源 replace) 不置 eof 也不写 error
+        apply_mpv_event(&status, &error, MpvEvent::EndFile { reason: 2, error: 0 });
+        assert!(!status.lock().unwrap().eof);
+        assert!(error.lock().unwrap().is_none());
+
+        // ERROR (reason=4) 写错误槽且不清成 eof
+        apply_mpv_event(
+            &status,
+            &error,
+            MpvEvent::EndFile {
+                reason: 4,
+                error: -13,
+            },
+        );
+        assert!(!status.lock().unwrap().eof);
+        assert_eq!(
+            error.lock().unwrap().as_deref(),
+            Some("mpv 播放失败(code=-13)")
+        );
+
+        // EOF (reason=0) 置 eof
+        apply_mpv_event(&status, &error, MpvEvent::EndFile { reason: 0, error: 0 });
+        assert!(status.lock().unwrap().eof);
+    }
+
+    #[test]
+    fn mpv_player_initializes_network_options_and_comma_ua_cleanly() {
+        let Ok(lib) = crate::ffi::MpvLib::load() else {
+            return;
+        };
+        let player = MpvPlayer::new(lib).expect("MpvPlayer::new 含网络超时选项应成功");
+        player
+            .loadfile("null://", None, BILI_HEADERS)
+            .expect("带逗号 User-Agent 与 Referer 单独设项应成功");
     }
 }

@@ -5,6 +5,7 @@
 
 pub mod account;
 pub mod auth;
+pub mod cdn;
 pub mod credentials;
 pub mod danmaku;
 pub mod error;
@@ -20,6 +21,7 @@ pub mod reply;
 pub mod search;
 pub mod settings;
 pub mod storage;
+pub mod stream_proxy;
 pub mod ticket;
 pub mod wbi;
 

@@ -198,6 +198,7 @@ pub struct VideoStream {
     pub height: i32,
     #[serde(default, deserialize_with = "f64_any")]
     pub frame_rate: f64,
+    #[serde(default)]
     pub base_url: String,
     #[serde(default)]
     pub backup_url: Vec<String>,
@@ -230,6 +231,7 @@ pub struct AudioStream {
     pub codecs: String,
     #[serde(default, deserialize_with = "i64_any")]
     pub bandwidth: i64,
+    #[serde(default)]
     pub base_url: String,
     #[serde(default)]
     pub backup_url: Vec<String>,
@@ -248,6 +250,68 @@ pub struct AudioStream {
     /// 捕获未知键名(B 站 dash 同键双形取证/前向兼容;不参与渲染路径)。
     #[serde(default, flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn resolved_segment_base_from(
+    primary: Option<&SegmentBase>,
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> Option<SegmentBase> {
+    primary.cloned().or_else(|| {
+        extra
+            .get("segment_base")
+            .filter(|v| !v.is_null())
+            .and_then(|v| serde_json::from_value::<SegmentBase>(v.clone()).ok())
+            .filter(|s| !s.initialization.is_empty() || !s.index_range.is_empty())
+    })
+}
+
+impl VideoStream {
+    /// 合并大小写变体后的可用 `SegmentBase`（优先结构化字段，回退 `extra["segment_base"]`）。
+    pub fn resolved_segment_base(&self) -> Option<SegmentBase> {
+        resolved_segment_base_from(self.segment_base.as_ref(), &self.extra)
+    }
+
+    /// 按 CDN 优先级（默认官方 UPOS 优先、mcdn/PCDN 兜底）收集去重后的候选播放 URL。
+    pub fn candidate_urls(&self, prefer_official_cdn: bool) -> Vec<String> {
+        candidate_urls_from(&self.base_url, &self.backup_url, &self.extra, prefer_official_cdn)
+    }
+}
+
+impl AudioStream {
+    /// 合并大小写变体后的可用 `SegmentBase`（优先结构化字段，回退 `extra["segment_base"]`）。
+    pub fn resolved_segment_base(&self) -> Option<SegmentBase> {
+        resolved_segment_base_from(self.segment_base.as_ref(), &self.extra)
+    }
+
+    /// 按 CDN 优先级（默认官方 UPOS 优先、mcdn/PCDN 兜底）收集去重后的候选播放 URL。
+    pub fn candidate_urls(&self, prefer_official_cdn: bool) -> Vec<String> {
+        candidate_urls_from(&self.base_url, &self.backup_url, &self.extra, prefer_official_cdn)
+    }
+}
+
+fn candidate_urls_from(
+    base_url: &str,
+    backup_url: &[String],
+    extra: &serde_json::Map<String, serde_json::Value>,
+    prefer_official_cdn: bool,
+) -> Vec<String> {
+    let resolved_base = if !base_url.trim().is_empty() {
+        base_url
+    } else {
+        extra
+            .get("baseUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or(base_url)
+    };
+    let mut backups: Vec<String> = backup_url.to_vec();
+    if let Some(arr) = extra.get("backupUrl").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                backups.push(s.to_string());
+            }
+        }
+    }
+    crate::cdn::collect_cdn_candidates(resolved_base, &backups, prefer_official_cdn)
 }
 
 /// 选中的一对流（loadfile 参数来源）。
@@ -330,7 +394,7 @@ pub fn select_stream_excluding(
             continue;
         }
         for v in &dash.video {
-            if !v.codecs.starts_with(codec) || v.id > max_qn {
+            if !v.codecs.starts_with(codec) || (max_qn > 0 && v.id > max_qn) {
                 continue;
             }
             best = match best {
@@ -526,7 +590,7 @@ pub fn select_stream(dash: &Dash, max_qn: i64, codec_priority: &[&str]) -> Optio
     let mut best: Option<&VideoStream> = None;
     for codec in codec_priority {
         for v in &dash.video {
-            if !v.codecs.starts_with(codec) || v.id > max_qn {
+            if !v.codecs.starts_with(codec) || (max_qn > 0 && v.id > max_qn) {
                 continue;
             }
             best = match best {
@@ -819,6 +883,148 @@ mod tests {
         assert_eq!(
             dash_missing_reason(&bare),
             "playurl 无 dash（fnval 或权限）"
+        );
+    }
+
+    #[test]
+    fn select_stream_excluding_treats_zero_max_qn_as_unbounded() {
+        let dash: Dash = serde_json::from_value(serde_json::json!({
+            "video": [
+                { "id": 116, "codecs": "av01.0.05M.08", "bandwidth": 5_000_000, "width": 1920, "height": 1080, "frame_rate": 60, "base_url": "https://cdn/av1.m4s" },
+                { "id": 80,  "codecs": "avc1.640032",  "bandwidth": 3_000_000, "width": 1920, "height": 1080, "frame_rate": 30, "base_url": "https://cdn/avc.m4s" }
+            ],
+            "audio": [
+                { "id": 30280, "codecs": "mp4a.40.2", "bandwidth": 128_000, "base_url": "https://cdn/audio.m4s" }
+            ]
+        }))
+        .unwrap();
+
+        let choice = select_stream_excluding(&dash, 0, &["avc1", "hev1", "av01"], &["av01"])
+            .expect("max_qn == 0 must mean unbounded when excluding failed codec buckets");
+        assert_eq!(choice.video.id, 80);
+        assert_eq!(choice.video.base_url, "https://cdn/avc.m4s");
+    }
+
+    #[test]
+    fn resolved_segment_base_handles_pascal_camel_snake_null_and_dual_keys() {
+        let dash: Dash = serde_json::from_value(serde_json::json!({
+            "video": [
+                {
+                    "id": 80, "codecs": "avc1", "base_url": "https://cdn/pascal.m4s",
+                    "SegmentBase": { "initialization": "0-976", "indexRange": "977-1721" }
+                },
+                {
+                    "id": 64, "codecs": "avc1", "base_url": "https://cdn/camel.m4s",
+                    "segmentBase": { "Initialization": "0-500", "IndexRange": "501-900" }
+                },
+                {
+                    "id": 32, "codecs": "avc1", "base_url": "https://cdn/snake.m4s",
+                    "segment_base": { "initialization": "0-300", "index_range": "301-700" }
+                },
+                {
+                    "id": 16, "codecs": "avc1", "base_url": "https://cdn/null.m4s",
+                    "segment_base": null
+                },
+                {
+                    "id": 6, "codecs": "avc1", "base_url": "https://cdn/dual.m4s",
+                    "SegmentBase": { "initialization": "0-111", "indexRange": "112-222" },
+                    "segment_base": { "initialization": "0-999", "index_range": "1000-1222" }
+                }
+            ],
+            "audio": [
+                {
+                    "id": 30280, "codecs": "mp4a.40.2", "base_url": "https://cdn/a.m4s",
+                    "segment_base": { "initialization": "0-400", "index_range": "401-800" }
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            dash.video[0].resolved_segment_base(),
+            Some(SegmentBase {
+                initialization: "0-976".into(),
+                index_range: "977-1721".into(),
+            })
+        );
+        assert_eq!(
+            dash.video[1].resolved_segment_base(),
+            Some(SegmentBase {
+                initialization: "0-500".into(),
+                index_range: "501-900".into(),
+            })
+        );
+        assert_eq!(
+            dash.video[2].resolved_segment_base(),
+            Some(SegmentBase {
+                initialization: "0-300".into(),
+                index_range: "301-700".into(),
+            })
+        );
+        assert_eq!(dash.video[3].resolved_segment_base(), None);
+        // 双键共存时保留 SegmentBase 优先，且不得触发 serde duplicate field 报错。
+        assert_eq!(
+            dash.video[4].resolved_segment_base(),
+            Some(SegmentBase {
+                initialization: "0-111".into(),
+                index_range: "112-222".into(),
+            })
+        );
+        assert_eq!(
+            dash.audio[0].resolved_segment_base(),
+            Some(SegmentBase {
+                initialization: "0-400".into(),
+                index_range: "401-800".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn candidate_urls_merges_camelcase_and_prefers_upos() {
+        let dash: Dash = serde_json::from_value(serde_json::json!({
+            "video": [
+                {
+                    "id": 80,
+                    "codecs": "avc1.640032",
+                    "base_url": "https://xy118.mcdn.bilivideo.cn:8082/v.m4s?os=mcdn",
+                    "baseUrl": "https://xy118.mcdn.bilivideo.cn:8082/v.m4s?os=mcdn",
+                    "backupUrl": [
+                        "https://r6.edge.mountaintoys.cn:4483/v.m4s?os=mcdn",
+                        "https://upos-sz-estgoss.bilivideo.com/v.m4s?os=estgoss"
+                    ],
+                    "backup_url": [
+                        "https://upos-sz-mirrorcoso1.bilivideo.com/v.m4s?os=coso1bv"
+                    ]
+                }
+            ],
+            "audio": [
+                {
+                    "id": 30280,
+                    "codecs": "mp4a.40.2",
+                    "baseUrl": "https://xy9.mcdn.bilivideo.cn:8082/a.m4s?os=mcdn",
+                    "backupUrl": ["https://upos-sz-mirrorhw.bilivideo.com/a.m4s?os=hw"]
+                }
+            ]
+        }))
+        .unwrap();
+
+        let v_urls = dash.video[0].candidate_urls(true);
+        assert_eq!(
+            v_urls,
+            vec![
+                "https://upos-sz-mirrorcoso1.bilivideo.com/v.m4s?os=coso1bv",
+                "https://upos-sz-estgoss.bilivideo.com/v.m4s?os=estgoss",
+                "https://xy118.mcdn.bilivideo.cn:8082/v.m4s?os=mcdn",
+                "https://r6.edge.mountaintoys.cn:4483/v.m4s?os=mcdn",
+            ]
+        );
+        let a_urls = dash.audio[0].candidate_urls(true);
+        assert_eq!(
+            a_urls,
+            vec![
+                "https://upos-sz-mirrorhw.bilivideo.com/a.m4s?os=hw",
+                "https://xy9.mcdn.bilivideo.cn:8082/a.m4s?os=mcdn",
+            ]
         );
     }
 }

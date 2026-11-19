@@ -23,7 +23,6 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -32,8 +31,8 @@ use std::time::{Duration, Instant};
 use windows_canvas::{ColorF, GpuDevice};
 
 use crate::engine::{
-    CompiledDanmakuFilter, DanmakuFilter, DanmakuFonts, OverlayDanmaku, RENDER_BUDGET, SendRaw,
-    SurfaceMetrics, VideoConfig, compute_surface_metrics, configure_swap_chain,
+    CompiledDanmakuFilter, DanmakuFilter, DanmakuFonts, OverlayDanmaku, RENDER_BUDGET,
+    SurfaceMetrics, SurfaceMountSlot, VideoConfig, compute_surface_metrics, configure_swap_chain,
     draw_danmaku_overlay, interpolated_danmaku_time,
 };
 
@@ -68,24 +67,25 @@ pub enum StageCmd {
     Resize(SurfaceMetrics),
     /// 唤醒重绘(挂载完成:attached 由 UI 回写,这里只负责踢一脚)。
     Wake,
-    /// 面板卸载(视图树切走):swapchain 放回待挂载槽。
-    Detach,
+    /// 面板卸载(视图树切走):同步推进代次并把 swapchain 放回待挂载槽。
+    Detach {
+        gen_id: u64,
+    },
     Quit,
 }
 
 /// 弹幕层句柄(线程安全;UI 侧克隆共享)。
 pub struct DanmakuStage {
     cmd_tx: Sender<StageCmd>,
-    /// 层线程产出的待挂载 swapchain(UI 线程取走挂载;失败放回)。
-    pending: Arc<Mutex<Option<SendRaw>>>,
-    attached: Arc<AtomicBool>,
+    /// swapchain 挂载代际协调槽(UI 线程取走挂载;失败放回;卸载递增代次防迟到回写)。
+    mount: Arc<SurfaceMountSlot>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 // UI 只比较句柄同一性(reactor Input 约束需要 PartialEq)。
 impl PartialEq for DanmakuStage {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.pending, &other.pending)
+        Arc::ptr_eq(&self.mount, &other.mount)
     }
 }
 
@@ -97,21 +97,18 @@ impl DanmakuStage {
 
     /// 以给定配置(仅取其弹幕字段)创建层线程。
     pub fn with_config(config: VideoConfig) -> Arc<Self> {
-        let pending: Arc<Mutex<Option<SendRaw>>> = Arc::new(Mutex::new(None));
-        let attached = Arc::new(AtomicBool::new(false));
+        let mount = SurfaceMountSlot::new();
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<StageCmd>();
         let thread = std::thread::Builder::new()
             .name("qaq-bx-danmaku-stage".into())
             .spawn({
-                let pending = pending.clone();
-                let attached = attached.clone();
-                move || stage_thread(cmd_rx, pending, attached, config)
+                let mount = mount.clone();
+                move || stage_thread(cmd_rx, mount, config)
             })
             .ok();
         Arc::new(Self {
             cmd_tx,
-            pending,
-            attached,
+            mount,
             thread: Mutex::new(thread),
         })
     }
@@ -166,36 +163,37 @@ impl DanmakuStage {
     }
 
     pub fn detach_panel(&self) {
-        _ = self.cmd_tx.send(StageCmd::Detach);
+        let gen_id = self.mount.invalidate_and_detach();
+        _ = self.cmd_tx.send(StageCmd::Detach { gen_id });
     }
 
     // ---- 挂载协调(UI 线程专用) ----
 
-    /// 取走待挂载 swapchain 原始指针(接管所有权;无则 None)。
-    pub fn take_pending(&self) -> Option<*mut c_void> {
-        let chain = self.pending.lock().ok()?.take()?;
-        Some(chain.into_raw())
+    /// 取走待挂载 swapchain 原始指针及其代次(接管所有权;无则 None)。
+    pub fn take_pending(&self) -> Option<(u64, *mut c_void)> {
+        self.mount.take_pending()
     }
 
-    /// 挂载请求入队失败(面板尚未实例化):放回指针,下一拍再试。
-    pub fn put_back_pending(&self, raw: *mut c_void) {
-        if let Ok(mut slot) = self.pending.lock() {
-            *slot = Some(SendRaw::new(raw));
-        }
+    /// 挂载请求入队失败或面板瞬态不可用(`Unavailable`):仅当前 `gen_id` 放回重试。
+    pub fn put_back_pending(&self, gen_id: u64, raw: *mut c_void) {
+        let _ = self.mount.publish_if_current(gen_id, raw);
     }
 
-    /// 挂载 completion 回写:成功 → attached + 踢一次重绘首帧。
-    pub fn mark_attached(&self, ok: bool) {
-        if ok {
-            self.attached.store(true, Ordering::SeqCst);
-            _ = self.cmd_tx.send(StageCmd::Wake);
-        } else {
-            eprintln!("[qaq-bx-video] danmaku stage: swapchain 挂载失败(SetSwapChain)");
+    /// 挂载 completion 回写(仅当前 `gen_id` 生效:成功 → attached + 踢重绘首帧)。
+    pub fn mark_attached(&self, gen_id: u64, ok: bool) {
+        match self.mount.mark_attached(gen_id, ok) {
+            Some(true) => {
+                _ = self.cmd_tx.send(StageCmd::Wake);
+            }
+            Some(false) => {
+                eprintln!("[qaq-bx-video] danmaku stage: swapchain 挂载失败(SetSwapChain)");
+            }
+            None => {}
         }
     }
 
     pub fn attached(&self) -> bool {
-        self.attached.load(Ordering::SeqCst)
+        self.mount.is_attached()
     }
 }
 
@@ -213,8 +211,7 @@ impl Drop for DanmakuStage {
 /// 层线程主体:建 device/swapchain → 交付 UI 挂载 → 命令 + 节拍驱动循环。
 fn stage_thread(
     cmd_rx: Receiver<StageCmd>,
-    pending: Arc<Mutex<Option<SendRaw>>>,
-    attached: Arc<AtomicBool>,
+    mount: Arc<SurfaceMountSlot>,
     initial_config: VideoConfig,
 ) {
     // 1) 独立 D3D device(canvas GpuDevice 自建;失败退 WARP,同视频通道口径)。
@@ -235,11 +232,10 @@ fn stage_thread(
         }
     };
     configure_swap_chain(&mut chain, 1.0, 1.0);
+    let init_gen = mount.current_gen();
     match chain.into_unknown_raw() {
         Ok(raw) => {
-            if let Ok(mut slot) = pending.lock() {
-                *slot = Some(SendRaw::new(raw));
-            }
+            let _ = mount.publish_if_current(init_gen, raw);
         }
         Err(e) => {
             eprintln!("[qaq-bx-video] danmaku stage: swapchain → IUnknown 失败:{e}");
@@ -351,12 +347,9 @@ fn stage_thread(
                     StageCmd::Wake => {
                         need_repaint = true;
                     }
-                    StageCmd::Detach => {
-                        attached.store(false, Ordering::SeqCst);
-                        if let Ok(raw) = chain.into_unknown_raw()
-                            && let Ok(mut slot) = pending.lock()
-                        {
-                            *slot = Some(SendRaw::new(raw));
+                    StageCmd::Detach { gen_id } => {
+                        if let Ok(raw) = chain.into_unknown_raw() {
+                            let _ = mount.publish_if_current(gen_id, raw);
                         }
                     }
                     StageCmd::Quit => break 'main,
@@ -396,7 +389,7 @@ fn stage_thread(
             }
         }
 
-        let is_attached = attached.load(Ordering::SeqCst);
+        let is_attached = mount.is_attached();
         let danmaku_active = cfg.danmaku_enabled && !overlay.is_empty();
 
         if is_attached && (need_repaint || (playing && danmaku_active)) {
@@ -540,9 +533,9 @@ mod tests {
         let stage = DanmakuStage::new();
         // 层线程建 swapchain 是异步的:轮询等待首个产物(上限 2s)。
         let deadline = Instant::now() + Duration::from_secs(2);
-        let raw = loop {
-            if let Some(raw) = stage.take_pending() {
-                break raw;
+        let (gen_id, raw) = loop {
+            if let Some(pair) = stage.take_pending() {
+                break pair;
             }
             if Instant::now() > deadline {
                 eprintln!("(跳过)层线程未产出 swapchain");
@@ -552,9 +545,53 @@ mod tests {
         };
         assert!(!raw.is_null());
         assert!(stage.take_pending().is_none(), "同一次产物不得重复交付");
-        stage.put_back_pending(raw);
-        assert!(stage.take_pending().is_some(), "放回后应可重试");
-        stage.mark_attached(true);
+        stage.put_back_pending(gen_id, raw);
+        let (retried_gen, retried_raw) = stage.take_pending().expect("放回后应可重试");
+        assert_eq!(retried_gen, gen_id);
+        let _hold = crate::engine::SendRaw::new(retried_raw);
+        stage.mark_attached(gen_id, true);
+        assert!(stage.attached());
+        drop(stage);
+    }
+
+    #[test]
+    fn detach_advances_generation_and_blocks_stale_mark_attached() {
+        let stage = DanmakuStage::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (old_gen, raw) = loop {
+            if let Some(pair) = stage.take_pending() {
+                break pair;
+            }
+            if Instant::now() > deadline {
+                eprintln!("(跳过)层线程未产出 swapchain");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let _hold1 = crate::engine::SendRaw::new(raw);
+        stage.mark_attached(old_gen, true);
+        assert!(stage.attached());
+
+        stage.detach_panel();
+        assert!(!stage.attached());
+        // 旧面板的迟到 completion 不得重新把 attached 标成 true。
+        stage.mark_attached(old_gen, true);
+        assert!(!stage.attached());
+
+        let deadline2 = Instant::now() + Duration::from_secs(2);
+        let (new_gen, raw2) = loop {
+            if let Some(pair) = stage.take_pending() {
+                break pair;
+            }
+            if Instant::now() > deadline2 {
+                eprintln!("(跳过)层线程 Detach 未重投 swapchain");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let _hold2 = crate::engine::SendRaw::new(raw2);
+        assert!(new_gen > old_gen);
+        stage.mark_attached(new_gen, true);
         assert!(stage.attached());
         drop(stage);
     }

@@ -90,8 +90,10 @@ impl NativeSurface {
             return; // 本实例上一次注入请求仍在途
         }
         // 领取全局注入权:同一份 MediaSource 只允许绑定一个 player。
+        // 若此前 remount_pending 因 1500ms 节流未消费断点,在此由 250ms 节拍补触发。
         let Some((seq, source)) = self.player.claim_pending_source() else {
             self.attaching.store(false, atomic);
+            let _ = self.player.remount_pending();
             return;
         };
         eprintln!("[qaq-bx-ui] native surface: attach attempt(seq={seq})");

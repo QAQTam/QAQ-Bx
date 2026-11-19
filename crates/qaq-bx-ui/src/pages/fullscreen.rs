@@ -441,7 +441,12 @@ impl Component for FullscreenPlayer {
                 tick: input.mount_tick,
             })
         };
-        let surface = surface_with_loading(surface, input.loading);
+        // WinUI 3 DirectComposition workaround: without a non-zero corner radius clip on the
+        // enclosing Border, MediaPlayerPresenter's HWCompMediaNode can be occluded/dropped when
+        // filling the entire fullscreen client rect over a solid backdrop.
+        let surface = Border::new()
+            .corner_radius(1.0)
+            .content(surface_with_loading(surface, input.loading));
 
         let hit_overlay =
             Border::new()

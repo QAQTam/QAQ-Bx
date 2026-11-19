@@ -20,15 +20,16 @@ use qaq_bx_core::notify::{
     AtNotice, FeedCursor, LikeNotice, ReplyNotice, SystemNotice, UnreadSummary, WhisperMessage,
     WhisperSession,
 };
+use qaq_bx_core::cdn::CdnHealthTracker;
 use qaq_bx_core::player::{
-    Dash, PlayerClient, ResolvedMedia, StreamChoice, VideoMeta, VideoPage,
-    is_trial_downgrade_reason,
-    quality_label, quality_menu, select_audio_excluding, select_stream_by_qn,
-    select_stream_excluding,
+    AudioStream, Dash, PlayerClient, ResolvedMedia, StreamChoice, VideoMeta, VideoPage,
+    VideoStream, is_trial_downgrade_reason, quality_label, quality_menu, select_audio_excluding,
+    select_stream_by_qn, select_stream_excluding,
 };
 use qaq_bx_core::reply::{ReplyClient, ReplyCursor, ReplyItem, ReplyPage, ReplySort, SubReplyPage};
 use qaq_bx_core::search::{SearchClient, SearchVideo};
 use qaq_bx_core::settings::{AppSettings, FileSettingsStore, PlayerEngine, SETTINGS_FILE};
+use qaq_bx_core::stream_proxy::StreamProxy;
 use qaq_bx_video::engine::{DanmakuFilter, OverlayDanmaku, VideoConfig, VideoEngine};
 use qaq_bx_video::native::NativePlayer;
 use qaq_bx_video::stage::DanmakuStage;
@@ -84,7 +85,7 @@ const GRID_REBUILD_DEBOUNCE: Duration = Duration::from_millis(150);
 /// 竖屏模式(实验):客户区宽度带上限 = 底栏出现边界 − 1(layout.rs
 /// `ShellChromeMode::from_width` 对 860 用严格 `<`,859 保证 Mobile chrome
 /// 与底栏在任意 DPI 取整下都在)。下限沿用 `MIN_WINDOW_WIDTH`。
-const PORTRAIT_MAX_WIDTH_DIPS: f64 = layout::MOBILE_BREAKPOINT - 1.0;
+const PORTRAIT_MAX_WIDTH_DIPS: f64 = layout::PORTRAIT_MAX_WIDTH_DIPS;
 
 /// E14:拖框风暴跟踪——连续 `WindowResized`(间隔 ≤250ms)视为一次风暴;收口时输出
 /// `RESIZE-STORM n=… span_ms=… max_gap_ms=…` 到 stderr,供 E14 场景量化 UI 线程
@@ -543,6 +544,12 @@ pub struct ShellProbe {
     pub player_engine: String,
     /// M7:系统媒体引擎是否正在驱动播放(控制/弹幕/视图三路分流单源)。
     pub native_playback: bool,
+    /// 竖屏模式（实验）开关状态。
+    pub portrait_mode: bool,
+    /// 当前生效视口布局宽度（DIP）。
+    pub window_width: f64,
+    pub prefer_official_cdn: bool,
+    pub multi_thread_preload: bool,
 }
 
 pub struct AppShell {
@@ -701,6 +708,20 @@ pub struct AppShell {
     /// **旧媒体**的 position/duration/播放态灌进 UI——否则快速切视频时
     /// 新页面会显示旧视频的时长与进度(播放时长残留 bug)。
     media_load_pending: bool,
+    /// native 通路本次装载世代(native_load_choice 提交后快照);
+    /// 配合 `media_load_pending` 识别「新会话已构建完成」。mpv 通路为 None。
+    native_load_epoch: Option<u64>,
+    /// mpv 通路本次装载单调世代(`engine.load_with_options` 返回值);
+    /// 配合 `media_load_pending` 识别「新会话快照已被引擎受理」。native 通路为 None。
+    mpv_load_epoch: Option<u64>,
+    /// Bug 2E：native 通路已出声/走时但 `NaturalVideoWidth/Height == 0` 探测起点(≥3s 回退 mpv)。
+    native_video_probe_at: Option<Instant>,
+    /// 原生引擎持续 Opening/Buffering 无推进的起播/缓冲超时探测起点（≥12s 回退 mpv）。
+    native_stall_probe_at: Option<Instant>,
+    /// 会话级 CDN 节点健康跟踪表与按需启动的本地并发流式代理。
+    cdn_health: Arc<CdnHealthTracker>,
+    stream_proxy: Option<Arc<StreamProxy>>,
+    proxy_session_id: Option<u64>,
     /// 媒体失败/引擎错误提示(播放页显示一次)。
     player_notice: Option<String>,
     /// 视频加载态:解析/缓冲中为 true(驱动 ProgressRing 环形指示);
@@ -774,6 +795,8 @@ pub struct AppShell {
     home_half_pane: bool,
     /// 全屏播放状态、同步代次与全局键盘隧道上下文。
     is_fullscreen: bool,
+    /// 全屏 HUD 专用实时窗口宽度（全屏期间冻结底层 `viewport_layout`，避免污染非全屏壳层与虚拟列表）。
+    fullscreen_window_width: f64,
     /// 拖拽区重算结构指纹(路由 tag 长度/首字节、全屏、搜索展开、宽度桶):变化才补算。
     last_title_bar_sig: Cell<(u8, u8, bool, bool, u32)>,
     fullscreen_gen: u64,
@@ -1252,6 +1275,10 @@ impl AppShell {
         out.live_first_roomid = self.live.cards.first().map_or(0, |c| c.room.roomid);
         out.player_engine = self.effective_player_engine().tag().to_string();
         out.native_playback = self.native_playback;
+        out.portrait_mode = self.settings.portrait_mode;
+        out.window_width = self.viewport_layout.window_width;
+        out.prefer_official_cdn = self.settings.prefer_official_cdn;
+        out.multi_thread_preload = self.settings.multi_thread_preload;
     }
 
     fn submit_search(&mut self, context: &ComponentContext<Self>) {
@@ -1463,6 +1490,74 @@ impl AppShell {
         self.native_enabled()
     }
 
+    fn ensure_stream_proxy(&mut self) -> Option<Arc<StreamProxy>> {
+        if let Some(proxy) = &self.stream_proxy {
+            return Some(Arc::clone(proxy));
+        }
+        match StreamProxy::start(
+            crate::runtime::shared_runtime().handle().clone(),
+            Arc::clone(&self.cdn_health),
+        ) {
+            Ok(proxy) => {
+                self.stream_proxy = Some(Arc::clone(&proxy));
+                Some(proxy)
+            }
+            Err(err) => {
+                eprintln!("[qaq-bx-ui] stream-proxy start failed, fallback direct url: {err}");
+                None
+            }
+        }
+    }
+
+    fn release_stream_proxy_session(&mut self) {
+        if let Some(session_id) = self.proxy_session_id.take()
+            && let Some(proxy) = &self.stream_proxy
+        {
+            proxy.unregister_session(session_id);
+        }
+    }
+
+    /// 为 DASH 音视频流生成实际传输 URL（默认开启本地并发代理与多 CDN 容灾；关闭或建代理失败回退直连最优 CDN）。
+    fn prepare_dash_transport_urls(
+        &mut self,
+        video: &VideoStream,
+        audio: &AudioStream,
+    ) -> (String, String) {
+        let prefer_official = self.settings.prefer_official_cdn;
+        let v_ranked = self
+            .cdn_health
+            .rank_candidates(&video.candidate_urls(prefer_official));
+        let a_ranked = self
+            .cdn_health
+            .rank_candidates(&audio.candidate_urls(prefer_official));
+        let v_fallback = v_ranked
+            .first()
+            .cloned()
+            .unwrap_or_else(|| video.base_url.clone());
+        let a_fallback = a_ranked
+            .first()
+            .cloned()
+            .unwrap_or_else(|| audio.base_url.clone());
+
+        self.release_stream_proxy_session();
+        if self.settings.multi_thread_preload
+            && !v_ranked.is_empty()
+            && !a_ranked.is_empty()
+            && let Some(proxy) = self.ensure_stream_proxy()
+        {
+            let v_count = v_ranked.len();
+            let a_count = a_ranked.len();
+            let pair = proxy.register_dash_pair(v_ranked, a_ranked, true);
+            self.proxy_session_id = Some(pair.session_id);
+            eprintln!(
+                "[qaq-bx-ui] stream-proxy route qn={} v_cands={} a_cands={} prefer_upos={}",
+                video.id, v_count, a_count, prefer_official
+            );
+            return (pair.video_url, pair.audio_url);
+        }
+        (v_fallback, a_fallback)
+    }
+
     /// v0.3:native 引擎接管装载(系统 DASH 管线;UI 线程只提交请求)。
     /// 返回 false = native 未启用,调用方走 mpv 路径。MPD→MediaSource 的网络+
     /// 解析在引擎装载线程,产物由 `NativeSurface` 的挂载节拍注入;失败经
@@ -1485,6 +1580,8 @@ impl AppShell {
             );
             return false;
         }
+        let (video_transport, audio_transport) =
+            self.prepare_dash_transport_urls(&choice.video, &choice.audio);
         let player = match &self.native_player {
             Some(player) => player.clone(),
             None => {
@@ -1502,18 +1599,38 @@ impl AppShell {
         );
         if let Err(e) = player.load(
             &mpd,
-            &choice.video.base_url,
-            Some(&choice.audio.base_url),
+            &video_transport,
+            Some(&audio_transport),
             autoplay,
             start_secs,
         ) {
             eprintln!("[qaq-bx-ui] native engine load failed: {e}");
-            self.player_notice = Some(format!("系统媒体引擎装载失败:{e}"));
-            return true;
+            let _ = player.stop();
+            self.native_playback = false;
+            self.native_load_epoch = None;
+            self.native_video_probe_at = None;
+            self.native_stall_probe_at = None;
+            self.release_stage();
+            return false;
+        }
+        // Bug 2B：进入 native 通道前停掉 mpv 解码并清 mpv 世代，防止双引擎同播（音频串音/资源竞争）。
+        if let Some(engine) = &self.engine {
+            engine.stop();
+        }
+        self.mpv_load_epoch = None;
+        self.media_probe_at = None;
+        self.native_video_probe_at = None;
+        self.native_stall_probe_at = None;
+        if !self.native_playback {
+            self.reset_smtc_writer(true);
         }
         // 弹幕改由透明层承接(视频面归 MPE,mpv 引擎保持 idle)。
         self.ensure_stage();
         self.native_playback = true;
+        self.media_load_pending = true;
+        self.video_loading = true;
+        // 记账本次装载世代:begin() 在 load() 内同步自增,快照即新世代。
+        self.native_load_epoch = Some(player.status().request_seq);
         // 音量先记账(未 attach 时 SetVolume 无对象,attach 时由引擎统一施加)。
         let _ = player.set_volume(f64::from(self.volume));
         self.playing = autoplay;
@@ -1630,14 +1747,16 @@ impl AppShell {
                     eprintln!("[qaq-bx-ui] player engine: {target}(当前档位无可选分轨)");
                     return;
                 };
-                let engine = self.ensure_engine();
-                let start = engine.status().time_pos.max(f64::from(self.position));
+                let start = self
+                    .engine
+                    .as_ref()
+                    .map(|engine| engine.status().time_pos)
+                    .unwrap_or(0.0)
+                    .max(f64::from(self.position));
                 let want_play = self.playing;
                 eprintln!(
                     "[qaq-bx-ui] player engine switch: mpv -> {target} resume={start:.1} play={want_play}"
                 );
-                engine.stop();
-                self.reset_smtc_writer(true);
                 self.video_loading = true;
                 if self.native_load_choice(&choice, want_play, start) {
                     self.current_video_url = choice.video.base_url;
@@ -1645,6 +1764,8 @@ impl AppShell {
                     self.player_notice = None;
                     self.reseed_danmaku(start, context);
                     self.sync_smtc(context);
+                } else {
+                    self.mpv_load_choice(&choice, start, want_play, context);
                 }
             }
             EngineSwitchAction::ReloadMpv => {
@@ -1672,38 +1793,71 @@ impl AppShell {
                 "[qaq-bx-ui] native fallback: codec {bucket} 解码失败,记入本会话回退名单"
             );
         }
-        self.switch_to_mpv_now(context);
-        self.player_notice = Some(format!(
-            "系统媒体引擎解码失败，已自动切换 mpv 兼容通道({reason})"
-        ));
+        eprintln!("[qaq-bx-ui] native fallback -> mpv: {reason}");
+        if !self.switch_to_mpv_now(context) {
+            // Bug 2A：仅当无可用分轨导致 mpv 也无法接管时才设 player_notice（否则会卸载 VideoSurface 只剩音频）。
+            self.player_notice = Some(format!("系统媒体引擎解码失败({reason})"));
+            self.playing = false;
+            self.video_loading = false;
+            self.media_load_pending = false;
+        }
+    }
+
+    /// 经 CDN 择优与本地并发代理装入一对 DASH 分轨到 mpv。
+    fn mpv_load_choice(
+        &mut self,
+        choice: &StreamChoice,
+        start_secs: f64,
+        autoplay: bool,
+        context: &ComponentContext<Self>,
+    ) -> u64 {
+        let (video_transport, audio_transport) =
+            self.prepare_dash_transport_urls(&choice.video, &choice.audio);
+        self.mpv_load_streams(
+            &video_transport,
+            Some(&audio_transport),
+            start_secs,
+            autoplay,
+            context,
+        )
+    }
+
+    /// Bug 2B：切回/下发 mpv 装载单源，确保停掉 native 侧并记录 `mpv_load_epoch` 与 `media_load_pending`。
+    fn mpv_load_streams(
+        &mut self,
+        video_url: &str,
+        audio_url: Option<&str>,
+        start_secs: f64,
+        autoplay: bool,
+        context: &ComponentContext<Self>,
+    ) -> u64 {
+        self.teardown_native_side(context);
+        let engine = self.ensure_engine();
+        engine.set_volume(f64::from(self.volume));
+        let seq = engine.load_with_options(video_url, audio_url, start_secs, autoplay);
+        self.media_load_pending = true;
+        self.video_loading = true;
+        self.mpv_load_epoch = Some(seq);
+        self.native_load_epoch = None;
+        self.native_video_probe_at = None;
+        self.native_stall_probe_at = None;
+        seq
     }
 
     /// S3/S4 共享:native → mpv 立即接管(同分轨同进度;常驻播放层里换 surface 分支)。
-    fn switch_to_mpv_now(&mut self, context: &ComponentContext<Self>) {
+    fn switch_to_mpv_now(&mut self, context: &ComponentContext<Self>) -> bool {
         let target = self.effective_player_engine().tag();
         let Some(choice) = self.current_choice() else {
             eprintln!("[qaq-bx-ui] player engine: {target}(当前档位无可选分轨)");
-            return;
+            self.teardown_native_side(context);
+            return false;
         };
         let start = self.native_position().max(f64::from(self.position));
         let want_play = self.playing;
         eprintln!(
             "[qaq-bx-ui] player engine switch: native -> {target} resume={start:.1} play={want_play}"
         );
-        if let Some(player) = self.native_player.clone() {
-            let _ = player.pause();
-        }
-        self.reset_smtc_writer(false);
-        self.native_playback = false;
-        self.release_stage();
-        let engine = self.ensure_engine();
-        engine.set_volume(f64::from(self.volume));
-        engine.load_with_options(
-            &choice.video.base_url,
-            Some(&choice.audio.base_url),
-            start,
-            want_play,
-        );
+        self.mpv_load_choice(&choice, start, want_play, context);
         self.current_video_url = choice.video.base_url;
         self.current_audio_url = choice.audio.base_url;
         self.media_probe_at = Some(Instant::now());
@@ -1715,6 +1869,7 @@ impl AppShell {
         self.playing = want_play;
         self.reseed_danmaku(start, context);
         self.sync_smtc(context);
+        true
     }
 
     /// S3:当前档位在 DASH 里的分轨对照(切引擎定点续播用)。
@@ -1757,12 +1912,13 @@ impl AppShell {
     }
     /// M7:把 native 通路的附属资源整体下线(切回 mpv / 直播在播时共用)。
     fn teardown_native_side(&mut self, context: &ComponentContext<Self>) {
-        if self.native_playback
-            && let Some(player) = self.native_player.clone()
-        {
-            let _ = player.pause();
+        if let Some(player) = self.native_player.clone() {
+            let _ = player.stop();
         }
         self.native_playback = false;
+        self.native_load_epoch = None;
+        self.native_video_probe_at = None;
+        self.native_stall_probe_at = None;
         self.release_stage();
         self.reset_smtc_writer(false);
         self.sync_smtc(context);
@@ -1954,7 +2110,11 @@ impl AppShell {
         self.playback_avatar_dirty = false;
         self.playback_avatar_timer = None;
         // 视频引擎仍是播放页的渲染前提(native 模式下它保持 idle)。
-        self.ensure_engine();
+        if let Some(engine) = &self.engine {
+            engine.stop();
+        } else {
+            self.ensure_engine();
+        }
         // 清弹幕层:投递口按当前模式分流(native → 透明层;mpv → 引擎同帧)。
         self.danmaku_replace(Vec::new());
         // U1:新视频重置评论输入态。
@@ -1967,9 +2127,23 @@ impl AppShell {
         self.playing = self.settings.autoplay;
         self.position = 0;
         self.engine_duration = None;
+        // 若仍留在 native 通路只停播放会话（保留 stage/surface 避免同页切集表面闪断）；
+        // 切非 native 或后续回退 mpv 时由 teardown_native_side 收口释放。
+        if self.native_enabled() {
+            if let Some(player) = &self.native_player {
+                let _ = player.stop();
+            }
+        } else {
+            self.teardown_native_side(context);
+        }
         // 新视频装载闸门:解析在途期间引擎仍持有旧媒体快照,PositionTick
         // 不得把旧时长/进度灌进 UI(见字段注释)。
         self.media_load_pending = true;
+        self.native_load_epoch = None;
+        self.mpv_load_epoch = None;
+        self.native_video_probe_at = None;
+        self.native_stall_probe_at = None;
+        self.release_stream_proxy_session();
         self.player_notice = None;
         self.video_loading = true;
         self.comments_session.reset(item.aid, item.author_mid);
@@ -2049,7 +2223,7 @@ impl AppShell {
         }
     }
 
-    /// 竖屏模式:应用/恢复系统最大化没收(presenter 级;窗口未就绪时逐消息重试)。
+    /// 竖屏模式:应用/恢复系统最大化没收与 presenter 宽度硬约束(窗口未就绪时逐消息重试)。
     fn sync_portrait_maximizable(&mut self, context: &ComponentContext<Self>) {
         let Some(enabled) = self.maximizable_pending else {
             return;
@@ -2057,8 +2231,19 @@ impl AppShell {
         self.maximizable_pending = None;
         let docked = self.portrait_docked;
         let restore = self.portrait_dock_restore;
+        let portrait = !enabled;
+        let current_dips = self.viewport_layout.window_width;
         let started = context.run_window(move |window| {
-            crate::winrt_ext::set_maximizable(window.as_raw(), enabled);
+            let raw = window.as_raw();
+            crate::winrt_ext::set_maximizable(raw, enabled);
+            crate::winrt_ext::enforce_portrait_window_policy(
+                raw,
+                layout::MIN_WINDOW_WIDTH,
+                layout::MIN_WINDOW_HEIGHT,
+                portrait.then_some(PORTRAIT_MAX_WIDTH_DIPS),
+                current_dips,
+                portrait,
+            );
             Message::PortraitSynced { docked, restore }
         });
         if !started {
@@ -2377,10 +2562,11 @@ impl AppShell {
         self.meta_fetch_inflight_seq = None;
         self.playback_avatar_dirty = false;
         self.playback_avatar_timer = None;
-        // 直播恒走 mpv(FLV,MF 不支持):弹幕必须送回视频引擎,透明层不接管。
-        self.native_playback = false;
-        self.release_stage();
-        self.ensure_engine().set_danmaku(Vec::new());
+        // 直播恒走 mpv(FLV,MF 不支持):先彻底停掉上一视频的双引擎残余。
+        self.teardown_native_side(context);
+        let engine = self.ensure_engine();
+        engine.stop();
+        engine.set_danmaku(Vec::new());
         self.comment_draft.clear();
         self.composer_notice = None;
         let mut item = minimal_video_item(&format!("{LIVE_BVID_PREFIX}{roomid}"), &title);
@@ -2389,6 +2575,12 @@ impl AppShell {
         self.playing = self.settings.autoplay;
         self.position = 0;
         self.engine_duration = None;
+        self.media_load_pending = true;
+        self.native_load_epoch = None;
+        self.mpv_load_epoch = None;
+        self.native_video_probe_at = None;
+        self.native_stall_probe_at = None;
+        self.release_stream_proxy_session();
         self.player_notice = None;
         self.video_loading = true;
         self.comments_session.reset(0, 0);
@@ -2545,19 +2737,18 @@ impl AppShell {
         self.media_probe_at = Some(Instant::now());
         // v0.3 spike:native 引擎接管时,mpv 引擎仍需创建(播放页以 engine 存在
         // 为渲染前提),但不 loadfile —— 保持 idle。
-        let engine = self.ensure_engine();
+        let _ = self.ensure_engine();
         if self.native_load_choice(&choice, self.settings.autoplay, 0.0) {
             self.playing = self.settings.autoplay;
             self.current_meta = Some(meta);
             self.fetch_danmaku(seq, 0.0, context);
             return;
         }
-        engine.set_volume(f64::from(self.volume));
-        engine.load_with_options(
-            &choice.video.base_url,
-            Some(&choice.audio.base_url),
+        self.mpv_load_choice(
+            &choice,
             0.0,
             self.settings.autoplay,
+            context,
         );
         self.playing = self.settings.autoplay;
         self.current_meta = Some(meta);
@@ -2579,7 +2770,7 @@ impl AppShell {
     }
 
     /// F4:视频轨解码失败自动回退——按失败桶重选编码,记忆进度无缝换流。
-    fn apply_video_fallback(&mut self) {
+    fn apply_video_fallback(&mut self, context: &ComponentContext<Self>) {
         let Some(dash) = self.playback_dash.clone() else {
             return;
         };
@@ -2601,6 +2792,13 @@ impl AppShell {
         let Some(choice) =
             select_stream_excluding(&dash, 0, self.settings.codec.priority(), &failed)
         else {
+            // Bug 2D：所有视频编码桶均失败时必须停掉 mpv（否则 UI 显示错误提示同时音轨仍继续出声）。
+            if let Some(engine) = &self.engine {
+                engine.stop();
+            }
+            self.mpv_load_epoch = None;
+            self.media_load_pending = false;
+            self.video_loading = false;
             self.player_notice = Some(
                 "视频轨无法解码(所有编码桶均失败)。可尝试切换清晰度/编码或更新系统解码组件。"
                     .to_string(),
@@ -2613,17 +2811,10 @@ impl AppShell {
             .as_ref()
             .map(|engine| engine.status().time_pos)
             .unwrap_or(0.0);
-        if let Some(engine) = &self.engine {
-            engine.load_with_options(
-                &choice.video.base_url,
-                Some(&choice.audio.base_url),
-                start,
-                self.playing,
-            );
-        }
+        self.mpv_load_choice(&choice, start, self.playing, context);
         eprintln!(
             "[qaq-bx-ui] video-track fallback: {} -> {}",
-            failed.join("+"),
+            self.failed_video_prefixes.join("+"),
             choice.video.codecs
         );
         self.current_video_url = choice.video.base_url;
@@ -2634,12 +2825,13 @@ impl AppShell {
     }
 
     /// F4:音频轨缺失自动回退——换次高带宽音轨,原画质不动。
-    fn apply_audio_fallback(&mut self) {
+    fn apply_audio_fallback(&mut self, context: &ComponentContext<Self>) {
         let Some(dash) = self.playback_dash.clone() else {
             return;
         };
         let Some(audio) = select_audio_excluding(&dash, &self.current_audio_url) else {
-            self.player_notice = Some("音频轨不可用(无备选音轨)。".to_string());
+            // Bug 2D：无备选音轨时保留正常播放的视频画面（不能设置 player_notice 卸载 VideoSurface）。
+            eprintln!("[qaq-bx-ui] audio-track fallback: 无备选音轨,保留当前视频播放");
             return;
         };
         let start = self
@@ -2647,19 +2839,31 @@ impl AppShell {
             .as_ref()
             .map(|engine| engine.status().time_pos)
             .unwrap_or(0.0);
-        if let Some(engine) = &self.engine {
-            engine.load_with_options(
-                &self.current_video_url,
-                Some(&audio.base_url),
+        let fallback_audio_url = audio.base_url.clone();
+        let fallback_audio_id = audio.id;
+        if let Some(video) = dash
+            .video
+            .iter()
+            .find(|v| v.base_url == self.current_video_url)
+            .or_else(|| dash.video.iter().find(|v| v.id == self.current_qn))
+            .cloned()
+        {
+            let choice = StreamChoice { video, audio };
+            self.mpv_load_choice(&choice, start, self.playing, context);
+        } else {
+            self.mpv_load_streams(
+                &self.current_video_url.clone(),
+                Some(&fallback_audio_url),
                 start,
                 self.playing,
+                context,
             );
         }
         eprintln!(
             "[qaq-bx-ui] audio-track fallback: {} -> id={}",
-            self.current_audio_url, audio.id
+            self.current_audio_url, fallback_audio_id
         );
-        self.current_audio_url = audio.base_url;
+        self.current_audio_url = fallback_audio_url;
         self.media_probe_at = Some(Instant::now());
         self.player_notice = None;
     }
@@ -3097,12 +3301,24 @@ impl AppShell {
         self.fullscreen_gen = self.fullscreen_gen.wrapping_add(1);
         let gen_id = self.fullscreen_gen;
         let portrait = self.settings.portrait_mode;
+        let current_dips = self.viewport_layout.window_width;
         let started = context.run_window(move |window| {
-            crate::winrt_ext::set_window_fullscreen(window.as_raw(), fullscreen);
-            // 全屏 presenter 与 OverlappedPresenter 的最大化开关正交,但退出回
-            // Default presenter 时 presenter 设置可能复位——进出都重按一次(幂等)。
+            let raw = window.as_raw();
+            crate::winrt_ext::set_window_fullscreen(raw, fullscreen);
+            // 全屏 presenter 与 OverlappedPresenter 的最大化开关/宽度约束正交,但退出回
+            // Default presenter 时新 presenter 的设置可能复位——进出都重按一次(幂等)。
             if portrait {
-                crate::winrt_ext::set_maximizable(window.as_raw(), false);
+                crate::winrt_ext::set_maximizable(raw, false);
+                if !fullscreen {
+                    crate::winrt_ext::enforce_portrait_window_policy(
+                        raw,
+                        layout::MIN_WINDOW_WIDTH,
+                        layout::MIN_WINDOW_HEIGHT,
+                        Some(PORTRAIT_MAX_WIDTH_DIPS),
+                        current_dips,
+                        true,
+                    );
+                }
             }
             Message::FullscreenSynced {
                 gen_id,
@@ -3112,13 +3328,21 @@ impl AppShell {
         self.fullscreen_sync_in_flight = started;
     }
 
+    fn clear_native_remount_throttle(&self) {
+        if let Some(player) = self.native_sink() {
+            player.allow_immediate_remount();
+        }
+    }
+
     fn enter_fullscreen(&mut self, context: &ComponentContext<Self>) {
         if self.is_fullscreen || !self.can_enter_fullscreen() {
             return;
         }
+        self.clear_native_remount_throttle();
         self.more_menu_open = false;
         self.search_overlay_open = false;
         self.is_fullscreen = true;
+        self.fullscreen_window_width = self.viewport_layout.window_width;
         self.sync_window_fullscreen(true, context);
         self.sync_key_route_ctx();
     }
@@ -3127,7 +3351,9 @@ impl AppShell {
         if !self.is_fullscreen {
             return;
         }
+        self.clear_native_remount_throttle();
         self.is_fullscreen = false;
+        self.fullscreen_window_width = self.viewport_layout.window_width;
         self.sync_window_fullscreen(false, context);
         self.sync_key_route_ctx();
     }
@@ -3158,7 +3384,17 @@ impl AppShell {
         }
         // M7:关播即下线 native 附属资源(常驻层线程 + 独立 D3D device;直播/设置页
         // 走不到引擎切换收口,这里统一收)。
+        if let Some(player) = &self.native_player {
+            let _ = player.stop();
+        }
         self.native_playback = false;
+        self.media_load_pending = false;
+        self.native_load_epoch = None;
+        self.mpv_load_epoch = None;
+        self.native_video_probe_at = None;
+        self.native_stall_probe_at = None;
+        self.media_probe_at = None;
+        self.release_stream_proxy_session();
         self.release_stage();
         self.sync_smtc(context);
     }
@@ -3270,6 +3506,8 @@ impl AppShell {
                 notice: self.player_notice.clone(),
                 loading: self.video_loading,
                 engine: engine.clone(),
+                native: self.native_sink().cloned(),
+                stage: self.stage_sink().cloned(),
                 comments: self.comments_snapshot.clone(),
                 comment_cb,
                 on_toggle: context.message(Message::TogglePlay),
@@ -3776,6 +4014,103 @@ pub(crate) enum MissingTrack {
     Audio,
 }
 
+/// native 装载闸门是否放行：
+/// - `epoch == None`：PlayURL 仍在解析、尚未提交 `NativePlayer::load`，保持闸门隔离旧视频状态；
+/// - `has_error` 或 `injected_seq >= Some(epoch)`：新会话已注入接管或失败，解除闸门。
+pub(crate) fn native_load_gate_settled(
+    epoch: Option<u64>,
+    injected_seq: Option<u64>,
+    has_error: bool,
+) -> bool {
+    match epoch {
+        Some(ep) => has_error || injected_seq.is_some_and(|inj| inj >= ep),
+        None => false,
+    }
+}
+
+/// mpv 装载闸门是否放行：
+/// - `epoch == None`：PlayURL 仍在解析、尚未提交 `loadfile`，保持闸门隔离旧快照；
+/// - `has_error` 或 `load_seq >= epoch`：引擎线程已受理新代次并刷新状态快照，解除闸门。
+pub(crate) fn mpv_load_gate_settled(
+    epoch: Option<u64>,
+    load_seq: u64,
+    has_error: bool,
+) -> bool {
+    match epoch {
+        Some(ep) => has_error || load_seq >= ep,
+        None => false,
+    }
+}
+
+/// native 是否仍在加载/打开/缓冲（供 UI 显示居中 `ProgressRing`）。
+/// 只有明确处于 Playing、或主动 Pause 且已有媒体打开、或报错/结束时才熄灭；
+/// Opening / Buffering / 尚未 MediaOpened 时必须保持加载动画，避免黑屏无转圈。
+pub(crate) fn native_should_show_loading(
+    status: &qaq_bx_video::native::NativeStatus,
+    gate_pending: bool,
+) -> bool {
+    if status.error.is_some() || status.finished {
+        return false;
+    }
+    if gate_pending || status.loading || status.opening || status.buffering {
+        return true;
+    }
+    if status.playing {
+        return false;
+    }
+    if status.paused {
+        return status.wants_play && !status.media_opened && status.natural_video_width == 0;
+    }
+    status.wants_play || !status.media_opened
+}
+
+/// native 通路起播或缓冲卡死超过阈值（12s），触发回退 mpv。
+pub(crate) fn native_load_stalled(
+    wants_play: bool,
+    loading_active: bool,
+    playing: bool,
+    stalled_for: Option<Duration>,
+) -> bool {
+    const NATIVE_STALL_TIMEOUT: Duration = Duration::from_secs(12);
+    if !wants_play || !loading_active || playing {
+        return false;
+    }
+    stalled_for.is_some_and(|elapsed| elapsed >= NATIVE_STALL_TIMEOUT)
+}
+
+/// mpv 是否仍在加载/缓冲中（含 `paused-for-cache` 与首帧前阶段）。
+pub(crate) fn mpv_should_show_loading(
+    status: &qaq_bx_video::engine::PlaybackStatus,
+    gate_pending: bool,
+    has_error: bool,
+) -> bool {
+    if has_error || status.eof {
+        return false;
+    }
+    if gate_pending || status.buffering {
+        return true;
+    }
+    if !status.file_loaded && !status.has_media() {
+        return true;
+    }
+    !status.playback_started && !status.pause && status.time_pos <= 0.0
+}
+
+/// Bug 2E：native 通路已非 loading 且在播/走时，但 `NaturalVideoWidth/Height == 0`
+/// 持续 ≥3s → 仅音频无视频画面（触发回退 mpv）。
+pub(crate) fn missing_native_video_track(
+    natural_w: u32,
+    natural_h: u32,
+    active: bool,
+    probing_for: Option<Duration>,
+) -> bool {
+    const PROBE_GRACE: Duration = Duration::from_secs(3);
+    if !active || (natural_w > 0 && natural_h > 0) {
+        return false;
+    }
+    probing_for.is_some_and(|elapsed| elapsed >= PROBE_GRACE)
+}
+
 /// U3 分P菜单:(cid, "P{page} {part}");少于 2 个分P返回空(不渲染选择器)。
 pub(crate) fn pages_menu_from(pages: &[VideoPage]) -> Vec<(u64, String)> {
     let mut menu: Vec<(u64, String)> = pages
@@ -3970,8 +4305,8 @@ impl Component for AppShell {
             nav.clone(),
         ));
         let feed_session = Arc::new(Mutex::new(FeedSession::new()));
-        let initial_layout = ViewportLayout::default();
-        // 视口自适应首批逻辑页（默认 1280x800 → 48 条）：先分配完整骨架槽位框架再拉数据。
+        let initial_layout = ViewportLayout::initial(settings.portrait_mode);
+        // 视口自适应首批逻辑页（默认 1280x800 → 48 条，竖屏 859x800 → 24 条）：先分配完整骨架槽位框架再拉数据。
         let initial_target = feed_pager::logical_page_target_for(
             initial_layout.cards,
             initial_layout.content_height(),
@@ -4231,6 +4566,13 @@ impl Component for AppShell {
             settings,
             engine_duration: None,
             media_load_pending: false,
+            native_load_epoch: None,
+            mpv_load_epoch: None,
+            native_video_probe_at: None,
+            native_stall_probe_at: None,
+            cdn_health: Arc::new(CdnHealthTracker::new()),
+            stream_proxy: None,
+            proxy_session_id: None,
             player_notice: None,
             video_loading,
             engine,
@@ -4270,6 +4612,7 @@ impl Component for AppShell {
             home_focus_idx: 0,
             home_half_pane: false,
             is_fullscreen: false,
+            fullscreen_window_width: initial_layout.window_width,
             last_title_bar_sig: Cell::new((0, 0, false, false, 0)),
             fullscreen_gen: 0,
             fullscreen_sync_in_flight: false,
@@ -4488,12 +4831,16 @@ impl Component for AppShell {
                 if gen_id == self.fullscreen_gen {
                     self.fullscreen_sync_in_flight = false;
                     if !active {
+                        if self.is_fullscreen {
+                            self.clear_native_remount_throttle();
+                        }
                         self.is_fullscreen = false;
                     }
                 }
             }
             Message::FullscreenProbeResult { gen_id, active } => {
                 if gen_id == self.fullscreen_gen && self.is_fullscreen && !active {
+                    self.clear_native_remount_throttle();
                     self.is_fullscreen = false;
                 }
             }
@@ -4567,24 +4914,42 @@ impl Component for AppShell {
                         );
                     }
                     // 装载在途(工作线程建源)保持遮罩,别用旧会话的状态提前解除。
-                    // 新视频装载闸门:解析在途期间引擎仍是旧会话快照,位置/时长/
-                    // 播放态一律冻结在 start_playback 的重置值;status.loading
-                    // 翻 true = 装载请求已受理,交回常规遮罩逻辑。
-                    if self.media_load_pending {
-                        if status.loading {
-                            self.media_load_pending = false;
-                        }
-                    } else {
-                        if !status.loading && (!status.playing || status.position_secs > 0.0) {
-                            self.video_loading = false;
-                        }
+                    // 新视频装载闸门:解析在途或建源在途期间,旧会话快照一律
+                    // 冻结;新会话信号 =「本次装载世代命中 && !loading」
+                    // (loading 单独不可靠:快速建源时首个节拍前就翻回 false,
+                    // 旧信号会让闸门永不解除 → 进度冻结/遮罩常驻/全屏黑屏)。
+                    if self.media_load_pending
+                        && native_load_gate_settled(
+                            self.native_load_epoch,
+                            status.injected_seq,
+                            status.error.is_some(),
+                        )
+                    {
+                        self.media_load_pending = false;
+                        self.native_load_epoch = None;
+                    }
+                    let loading_now = native_should_show_loading(&status, self.media_load_pending);
+                    self.video_loading = loading_now;
+                    if !self.media_load_pending {
                         self.position = status
                             .position_secs
                             .round()
                             .clamp(0.0, f64::from(u32::MAX)) as u32;
-                        self.playing = status.playing && !status.loading;
-                        if status.duration_secs > 0.0 && !status.loading {
+                        self.playing = status.playing
+                            || (loading_now
+                                && status.wants_play
+                                && !status.finished
+                                && status.error.is_none());
+                        if status.duration_secs > 0.0 {
                             self.engine_duration = Some(status.duration_secs);
+                        }
+                        if loading_now && !status.playing && status.wants_play && status.error.is_none()
+                        {
+                            if self.native_stall_probe_at.is_none() {
+                                self.native_stall_probe_at = Some(Instant::now());
+                            }
+                        } else {
+                            self.native_stall_probe_at = None;
                         }
                         // 弹幕透明层时基:节拍喂真实播放位置与播放态(暂停即冻结);
                         // 层内用墙钟外推到满刷新率,与 mpv 通道的弹幕手感一致。
@@ -4592,6 +4957,44 @@ impl Component for AppShell {
                             stage.set_time(status.position_secs);
                             stage.set_playing(status.playing);
                         }
+                        // Bug 2E：native 通路已出声/走时但 NaturalVideoWidth/Height == 0 持续 ≥3s → 回退 mpv。
+                        let native_active = !status.loading
+                            && status.error.is_none()
+                            && (status.playing || status.position_secs > 0.0);
+                        if native_active
+                            && (status.natural_video_width == 0 || status.natural_video_height == 0)
+                        {
+                            if self.native_video_probe_at.is_none() {
+                                self.native_video_probe_at = Some(Instant::now());
+                            }
+                        } else {
+                            self.native_video_probe_at = None;
+                        }
+                        if missing_native_video_track(
+                            status.natural_video_width,
+                            status.natural_video_height,
+                            native_active,
+                            self.native_video_probe_at.map(|at| at.elapsed()),
+                        ) {
+                            self.native_video_probe_at = None;
+                            self.fallback_native_to_mpv(
+                                "系统媒体引擎无视频画面(仅音频/解码缺失)",
+                                context,
+                            );
+                        } else if native_load_stalled(
+                            status.wants_play,
+                            loading_now,
+                            status.playing,
+                            self.native_stall_probe_at.map(|at| at.elapsed()),
+                        ) {
+                            self.native_stall_probe_at = None;
+                            self.fallback_native_to_mpv(
+                                "系统媒体引擎加载超时",
+                                context,
+                            );
+                        }
+                    } else {
+                        self.native_stall_probe_at = None;
                     }
                     if let Some(reason) = &status.error {
                         // S4:native 通路失败不再只弹通知 —— 自动回退 mpv 同进度接管。
@@ -4622,15 +5025,22 @@ impl Component for AppShell {
                 let engine = self.engine.clone();
                 if let Some(engine) = engine {
                     let status = engine.status();
-                    // 新视频装载闸门:引擎 Load 会把快照清零(PlaybackStatus::default),
-                    // 看到旧快照消失(!has_media)即视为新会话开始。置位期间旧媒体的
-                    // 位置/时长/播放态不得灌进 UI,loading 遮罩保持。
-                    if self.media_load_pending {
-                        if !status.has_media() {
-                            self.media_load_pending = false;
-                        }
-                    } else if status.has_media() {
-                        self.video_loading = false;
+                    // 新视频装载闸门:仅当本次 mpv_load_epoch 已被引擎受理(load_seq >= epoch)
+                    // 或引擎报错时解除,隔离切视频窗口期间旧媒体的残余位置/时长快照。
+                    let engine_err = engine.error();
+                    if self.media_load_pending
+                        && mpv_load_gate_settled(
+                            self.mpv_load_epoch,
+                            status.load_seq,
+                            engine_err.is_some(),
+                        )
+                    {
+                        self.media_load_pending = false;
+                        self.mpv_load_epoch = None;
+                    }
+                    self.video_loading =
+                        mpv_should_show_loading(&status, self.media_load_pending, engine_err.is_some());
+                    if !self.media_load_pending && (status.has_media() || status.file_loaded) {
                         self.position =
                             status.time_pos.round().clamp(0.0, f64::from(u32::MAX)) as u32;
                         self.playing = !status.pause && !status.eof;
@@ -4657,13 +5067,13 @@ impl Component for AppShell {
                             MissingTrack::Video => {
                                 if !self.video_fallback_done {
                                     self.video_fallback_done = true;
-                                    self.apply_video_fallback();
+                                    self.apply_video_fallback(context);
                                 }
                             }
                             MissingTrack::Audio => {
                                 if !self.audio_fallback_done {
                                     self.audio_fallback_done = true;
-                                    self.apply_audio_fallback();
+                                    self.apply_audio_fallback(context);
                                 }
                             }
                         }
@@ -4686,6 +5096,7 @@ impl Component for AppShell {
                         self.video_loading = false;
                         // 引擎级错误:装载闸门解除(失败不再等新会话快照)。
                         self.media_load_pending = false;
+                        self.mpv_load_epoch = None;
                     }
                 }
                 self.sync_smtc(context);
@@ -4716,36 +5127,36 @@ impl Component for AppShell {
                     return;
                 };
                 // 定点换流:记住当前进度与播放态,mpv `start` 直达,弹幕/相关推荐不动。
-                // v0.3 spike:native 走重载 + SetPosition。
-                if self.native_active() {
-                    let start = self.native_position();
-                    if self.native_load_choice(&choice, self.playing, start) {
-                        self.current_qn = qn;
-                        self.current_video_url = choice.video.base_url.clone();
-                        self.current_audio_url = choice.audio.base_url.clone();
-                        self.media_probe_at = Some(Instant::now());
-                        self.player_notice = None;
-                        return;
-                    }
+                // v0.3 spike:native 走重载 + SetPosition;若新档位触发 native 回退则无缝交回 mpv。
+                let was_native = self.native_active();
+                let start = if was_native {
+                    self.native_position().max(f64::from(self.position))
+                } else {
+                    self.engine
+                        .as_ref()
+                        .map(|engine| engine.status().time_pos)
+                        .unwrap_or(0.0)
+                };
+                self.video_loading = true;
+                self.native_stall_probe_at = None;
+                if was_native && self.native_load_choice(&choice, self.playing, start) {
+                    self.current_qn = qn;
+                    self.current_video_url = choice.video.base_url.clone();
+                    self.current_audio_url = choice.audio.base_url.clone();
+                    self.media_probe_at = None;
+                    self.native_video_probe_at = None;
+                    self.player_notice = None;
+                    return;
                 }
-                let start = self
-                    .engine
-                    .as_ref()
-                    .map(|engine| engine.status().time_pos)
-                    .unwrap_or(0.0);
-                if let Some(engine) = &self.engine {
-                    engine.load_with_options(
-                        &choice.video.base_url,
-                        Some(&choice.audio.base_url),
-                        start,
-                        self.playing,
-                    );
-                }
+                self.mpv_load_choice(&choice, start, self.playing, context);
                 self.current_qn = qn;
                 self.current_video_url = choice.video.base_url.clone();
                 self.current_audio_url = choice.audio.base_url.clone();
                 self.media_probe_at = Some(Instant::now());
                 self.player_notice = None;
+                if was_native {
+                    self.reseed_danmaku(start, context);
+                }
             }
             Message::SelectPage(cid) => {
                 // U3 分P切换:重取 playurl(cid) → 定点换流 + 弹幕/进度联动。
@@ -4755,6 +5166,8 @@ impl Component for AppShell {
                 let Some(item) = self.now_playing.clone() else {
                     return;
                 };
+                self.video_loading = true;
+                self.native_stall_probe_at = None;
                 let nav = self.auth_service.nav_client();
                 let (max_qn, codecs) = resolve_params_for(&self.settings, &nav);
                 let auth = self.auth_service.clone();
@@ -4791,7 +5204,8 @@ impl Component for AppShell {
                                 self.current_audio_url = choice.audio.base_url;
                                 self.playback_dash = Some(dash.clone());
                                 self.quality_qns = quality_menu(&dash.video, 0);
-                                self.media_probe_at = Some(Instant::now());
+                                self.media_probe_at = None;
+                                self.native_video_probe_at = None;
                                 self.player_notice = None;
                                 if let Some(meta) = &mut self.current_meta {
                                     meta.cid = cid;
@@ -4807,14 +5221,7 @@ impl Component for AppShell {
                             .as_ref()
                             .map(|engine| engine.status().time_pos)
                             .unwrap_or(0.0);
-                        if let Some(engine) = &self.engine {
-                            engine.load_with_options(
-                                &choice.video.base_url,
-                                Some(&choice.audio.base_url),
-                                start,
-                                self.playing,
-                            );
-                        }
+                        self.mpv_load_choice(&choice, start, self.playing, context);
                         self.current_cid = cid;
                         self.current_qn = choice.video.id;
                         self.current_video_url = choice.video.base_url;
@@ -4832,6 +5239,7 @@ impl Component for AppShell {
                         self.fetch_danmaku(gen_id, start, context);
                     }
                     Err(reason) => {
+                        self.video_loading = false;
                         self.player_notice = Some(format!("切换分P失败:{reason}"));
                     }
                 }
@@ -4859,10 +5267,7 @@ impl Component for AppShell {
                 }
                 match result {
                     Ok(url) => {
-                        if let Some(engine) = &self.engine {
-                            engine.set_volume(f64::from(self.volume));
-                            engine.load_with_options(&url, None, 0.0, self.settings.autoplay);
-                        }
+                        self.mpv_load_streams(&url, None, 0.0, self.settings.autoplay, context);
                         self.playing = self.settings.autoplay;
                         self.current_video_url = url;
                         self.media_probe_at = Some(Instant::now());
@@ -4870,6 +5275,8 @@ impl Component for AppShell {
                     Err(reason) => {
                         self.player_notice = Some(format!("直播间打开失败:{reason}"));
                         self.video_loading = false;
+                        self.media_load_pending = false;
+                        self.mpv_load_epoch = None;
                     }
                 }
             }
@@ -5175,6 +5582,9 @@ impl Component for AppShell {
                 self.video_loading = false;
                 // 装载闸门解除:失败不再等引擎快照(没有新会话可等)。
                 self.media_load_pending = false;
+                self.native_load_epoch = None;
+                self.mpv_load_epoch = None;
+                self.native_video_probe_at = None;
             }
             Message::ExpandHalfPane => {
                 self.home_half_pane = false;
@@ -5353,9 +5763,28 @@ impl Component for AppShell {
             }
             Message::WindowResized(size) => {
                 self.track_resize_storm();
+                if self.is_fullscreen {
+                    // 全屏期间窗口被系统扩至屏幕分辨率(如 1920x1080):冻结底层
+                    // `viewport_layout` 与首页网格,避免退出全屏首帧闪回桌面双栏布局
+                    // 及连续二次拆装 XAML 视觉树导致卡顿;仅更新全屏 HUD 宽度并探针。
+                    if size.width.is_finite() && size.width > 0.0 {
+                        self.fullscreen_window_width = size.width;
+                    }
+                    if !self.fullscreen_sync_in_flight {
+                        let gen_id = self.fullscreen_gen;
+                        let _ = context.run_window(move |window| {
+                            let active =
+                                crate::winrt_ext::is_window_fullscreen(window.as_raw()).unwrap_or(true);
+                            Message::FullscreenProbeResult { gen_id, active }
+                        });
+                    }
+                    return;
+                }
                 let prev_cards = self.viewport_layout.cards;
-                let next_layout = ViewportLayout::from_window_size(size.width, size.height);
+                let next_layout =
+                    ViewportLayout::for_window(size.width, size.height, self.settings.portrait_mode);
                 self.viewport_layout = next_layout;
+                self.fullscreen_window_width = next_layout.window_width;
                 self.home_viewport_w = next_layout.content_width();
                 self.home_viewport_h = next_layout.content_height();
 
@@ -5368,21 +5797,13 @@ impl Component for AppShell {
                 if !next_layout.uses_whisper_drilldown() {
                     self.whisper_detail_open = false;
                 }
-                if !self.is_fullscreen && next_layout.is_mobile() && self.home_half_pane {
+                if next_layout.is_mobile() && self.home_half_pane {
                     self.home_half_pane = false;
                     if self.now_playing.is_some() && self.route == Route::Home {
                         self.history.push(Route::Home);
                         self.route = Route::Player;
                         crate::trace::note("route->player (移动布局半屏收起)");
                     }
-                }
-                if self.is_fullscreen && !self.fullscreen_sync_in_flight {
-                    let gen_id = self.fullscreen_gen;
-                    let _ = context.run_window(move |window| {
-                        let active =
-                            crate::winrt_ext::is_window_fullscreen(window.as_raw()).unwrap_or(true);
-                        Message::FullscreenProbeResult { gen_id, active }
-                    });
                 }
                 if next_layout.should_rebuild_grid(prev_cards) {
                     // 轻量字段即时更新(探针/分页目标依赖);重量级 VirtualSource
@@ -5750,11 +6171,35 @@ impl Component for AppShell {
                 if next == self.settings {
                     return;
                 }
-                // 竖屏模式(实验)翻转:切换系统最大化没收;关闭时若在贴边态
-                // 先还原贴边前几何,再交由 pending 恢复最大化钮。
+                // 竖屏模式(实验)翻转:切换系统最大化没收与宽度硬约束;
+                // 开启时当帧将 `viewport_layout` 收敛入竖屏宽度带 [390, 859] 并同步重建网格,
+                // 关闭时若在贴边态先还原贴边前几何,再交由 pending 恢复最大化钮。
                 if next.portrait_mode != self.settings.portrait_mode {
                     self.maximizable_pending = Some(!next.portrait_mode);
-                    if !next.portrait_mode && self.portrait_docked {
+                    if next.portrait_mode {
+                        let prev_cards = self.viewport_layout.cards;
+                        let next_layout = ViewportLayout::for_window(
+                            self.viewport_layout.window_width,
+                            self.viewport_layout.window_height,
+                            true,
+                        );
+                        self.viewport_layout = next_layout;
+                        if !self.is_fullscreen {
+                            self.fullscreen_window_width = next_layout.window_width;
+                        }
+                        self.home_viewport_w = next_layout.content_width();
+                        self.home_viewport_h = next_layout.content_height();
+                        self.home_half_pane = false;
+                        if next_layout.should_rebuild_grid(prev_cards) {
+                            self.home_state.grid_cols = next_layout.cards.cols;
+                            self.pending_grid_rebuild = false;
+                            self.grid_rebuild_timer = None;
+                            self.home_active_rows.clear();
+                            self.home_anchor_row = 0;
+                            self.home_last_evict_row = 0;
+                            self.rebuild_home_source();
+                        }
+                    } else if self.portrait_docked {
                         let restore = self.portrait_dock_restore.take();
                         self.portrait_docked = false;
                         if let Some(prev) = restore {
@@ -5767,6 +6212,7 @@ impl Component for AppShell {
                             });
                         }
                     }
+                    self.sync_portrait_maximizable(context);
                 }
                 // M7:切引擎要在写入新设置**之后**判定(生效引擎取自 settings)。
                 let engine_before = self.effective_player_engine();
@@ -5803,10 +6249,32 @@ impl Component for AppShell {
                     // 规则变化 → 承接线程编译并对已缓存弹幕全量重滤(热更新)。
                     self.danmaku_filter(danmaku_filter_from(&next));
                 }
+                let transport_changed = next.prefer_official_cdn != self.settings.prefer_official_cdn
+                    || next.multi_thread_preload != self.settings.multi_thread_preload;
                 self.settings = next;
                 // M7:播放引擎变更 → 收口(只记账,下一次装载按新引擎;直播不受影响)。
-                if self.effective_player_engine() != engine_before {
+                let engine_changed = self.effective_player_engine() != engine_before;
+                if engine_changed {
                     self.switch_player_engine(context);
+                } else if transport_changed
+                    && self.now_playing.is_some()
+                    && self.current_qn != 0
+                    && !self.current_is_live()
+                    && let Some(choice) = self.current_choice()
+                {
+                    let start = if self.native_playback {
+                        self.native_position().max(f64::from(self.position))
+                    } else {
+                        self.engine
+                            .as_ref()
+                            .map(|engine| engine.status().time_pos)
+                            .unwrap_or(0.0)
+                            .max(f64::from(self.position))
+                    };
+                    let want_play = self.playing;
+                    if !self.native_load_choice(&choice, want_play, start) {
+                        self.mpv_load_choice(&choice, start, want_play, context);
+                    }
                 }
                 self.schedule_settings_save(context);
             }
@@ -6302,7 +6770,7 @@ impl Component for AppShell {
                     mount_tick: self.mount_tick,
                     notice: self.player_notice.clone(),
                     loading: self.video_loading,
-                    window_width: layout.window_width,
+                    window_width: self.fullscreen_window_width,
                     engine: engine.clone(),
                     native: self.native_sink().cloned(),
                     stage: self.stage_sink().cloned(),
@@ -7247,5 +7715,171 @@ mod tests {
         assert_eq!(snap.rev, 7);
         assert_eq!(snap.data.replies.len(), 1);
         assert!(snap.data.avatars.contains_key(&thumb));
+    }
+
+    #[test]
+    fn native_and_mpv_load_gates_enforce_monotonic_epoch() {
+        // PlayURL 解析未完成（epoch == None）：无论引擎残留什么旧代次或错误，均禁止解除闸门。
+        assert!(!native_load_gate_settled(None, Some(9), true));
+        assert!(!mpv_load_gate_settled(None, 9, true));
+
+        // 世代已提交，但旧会话快照尚未被新会话替换（seq < epoch 且无错）：保持阻塞。
+        assert!(!native_load_gate_settled(Some(5), None, false));
+        assert!(!native_load_gate_settled(Some(5), Some(4), false));
+        assert!(!mpv_load_gate_settled(Some(5), 4, false));
+
+        // 新会话已注入/受理（seq >= epoch）或发生明确错误：放行解除闸门。
+        assert!(native_load_gate_settled(Some(5), Some(5), false));
+        assert!(native_load_gate_settled(Some(5), Some(6), false));
+        assert!(native_load_gate_settled(Some(5), Some(2), true));
+        assert!(mpv_load_gate_settled(Some(5), 5, false));
+        assert!(mpv_load_gate_settled(Some(5), 7, false));
+        assert!(mpv_load_gate_settled(Some(5), 1, true));
+    }
+
+    #[test]
+    fn missing_native_video_track_triggers_only_when_active_zero_dim_for_3s() {
+        assert!(!missing_native_video_track(
+            0,
+            0,
+            false,
+            Some(Duration::from_secs(10))
+        ));
+        assert!(!missing_native_video_track(
+            1920,
+            1080,
+            true,
+            Some(Duration::from_secs(10))
+        ));
+        assert!(!missing_native_video_track(0, 0, true, None));
+        assert!(!missing_native_video_track(
+            0,
+            0,
+            true,
+            Some(Duration::from_millis(2900))
+        ));
+        assert!(missing_native_video_track(
+            0,
+            0,
+            true,
+            Some(Duration::from_secs(3))
+        ));
+        assert!(missing_native_video_track(
+            1920,
+            0,
+            true,
+            Some(Duration::from_secs(4))
+        ));
+        assert!(missing_native_video_track(
+            0,
+            1080,
+            true,
+            Some(Duration::from_secs(4))
+        ));
+    }
+
+    #[test]
+    fn native_should_show_loading_keeps_spinner_during_opening_and_buffering() {
+        use qaq_bx_video::native::NativeStatus;
+
+        // 闸门在途：必显
+        let base = NativeStatus::default();
+        assert!(native_should_show_loading(&base, true));
+
+        // 注入已完成（gate_pending=false，build loading=false）但处于 Opening / Buffering / None 且有意播放：
+        // 旧逻辑 `!status.loading && !status.playing` 会在这里提前抹掉动画，现在必须保持 true！
+        let opening = NativeStatus {
+            loading: false,
+            opening: true,
+            wants_play: true,
+            ..NativeStatus::default()
+        };
+        assert!(native_should_show_loading(&opening, false));
+
+        let buffering = NativeStatus {
+            loading: false,
+            buffering: true,
+            wants_play: true,
+            media_opened: true,
+            position_secs: 42.0,
+            ..NativeStatus::default()
+        };
+        assert!(native_should_show_loading(&buffering, false));
+
+        let pre_open_none = NativeStatus {
+            loading: false,
+            wants_play: true,
+            media_opened: false,
+            ..NativeStatus::default()
+        };
+        assert!(native_should_show_loading(&pre_open_none, false));
+
+        // 真正进入 Playing：关闭加载指示
+        let playing = NativeStatus {
+            playing: true,
+            wants_play: true,
+            media_opened: true,
+            natural_video_width: 1920,
+            natural_video_height: 1080,
+            ..NativeStatus::default()
+        };
+        assert!(!native_should_show_loading(&playing, false));
+
+        // 用户主动 Pause（media_opened=true）：关闭加载指示
+        let user_paused = NativeStatus {
+            paused: true,
+            wants_play: false,
+            media_opened: true,
+            ..NativeStatus::default()
+        };
+        assert!(!native_should_show_loading(&user_paused, false));
+
+        // 出错或播完：关闭加载指示
+        let errored = NativeStatus {
+            opening: true,
+            wants_play: true,
+            error: Some("失败".into()),
+            ..NativeStatus::default()
+        };
+        assert!(!native_should_show_loading(&errored, false));
+    }
+
+    #[test]
+    fn native_load_stalled_triggers_only_after_threshold_while_waiting_play() {
+        assert!(!native_load_stalled(false, true, false, Some(Duration::from_secs(30))));
+        assert!(!native_load_stalled(true, false, false, Some(Duration::from_secs(30))));
+        assert!(!native_load_stalled(true, true, true, Some(Duration::from_secs(30))));
+        assert!(!native_load_stalled(true, true, false, Some(Duration::from_secs(11))));
+        assert!(native_load_stalled(true, true, false, Some(Duration::from_secs(12))));
+    }
+
+    #[test]
+    fn mpv_should_show_loading_tracks_cache_buffering_and_errors() {
+        use qaq_bx_video::engine::PlaybackStatus;
+
+        assert!(mpv_should_show_loading(&PlaybackStatus::default(), false, false));
+
+        // 已解出 duration 但刚卡缓冲（paused-for-cache=true）时必须保持转圈
+        let stalled = PlaybackStatus {
+            duration: 120.0,
+            file_loaded: true,
+            playback_started: true,
+            buffering: true,
+            ..PlaybackStatus::default()
+        };
+        assert!(mpv_should_show_loading(&stalled, false, false));
+
+        // 首帧起播且非 buffering：熄灭
+        let started = PlaybackStatus {
+            duration: 120.0,
+            file_loaded: true,
+            playback_started: true,
+            buffering: false,
+            ..PlaybackStatus::default()
+        };
+        assert!(!mpv_should_show_loading(&started, false, false));
+
+        // 引擎出错或结束：熄灭
+        assert!(!mpv_should_show_loading(&stalled, false, true));
     }
 }

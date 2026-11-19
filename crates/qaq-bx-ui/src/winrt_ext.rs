@@ -202,6 +202,77 @@ pub fn restore_window_bounds(
         .is_ok()
 }
 
+/// 竖屏模式 presenter 宽度约束与几何钳制：
+/// - 退出全屏 (`SetPresenterByKind(Default)`) 后，新 presenter 的 `PreferredMaximumWidth`
+///   等约束可能被重置，且运行时开启竖屏模式时当前窗口宽度可能超出 `max_client_width_dips`；
+/// - 本函数在 UI 线程重申 `IOverlappedPresenter3` 最小/最大宽高硬钳制，并在 `shrink_if_wider`
+///   为真且当前客户区超宽时，主动将窗口外框宽度收缩至 `max_client_width_dips`。
+pub fn enforce_portrait_window_policy(
+    hwnd_raw: *mut core::ffi::c_void,
+    min_client_width_dips: f64,
+    min_client_height_dips: f64,
+    max_client_width_dips: Option<f64>,
+    current_client_dips: f64,
+    shrink_if_wider: bool,
+) -> bool {
+    if hwnd_raw.is_null() {
+        return false;
+    }
+    let id = WindowId {
+        value: hwnd_raw as usize as u64,
+    };
+    let Ok(app_window) = AppWindow::GetFromWindowId(id) else {
+        return false;
+    };
+    let Ok(outer) = app_window.Size() else {
+        return false;
+    };
+    let Ok(inner) = app_window.cast::<IAppWindow2>().and_then(|w| w.ClientSize()) else {
+        return false;
+    };
+    let scale = if current_client_dips.is_finite() && current_client_dips > 0.0 && inner.width > 0 {
+        (f64::from(inner.width) / current_client_dips).clamp(0.5, 4.0)
+    } else {
+        1.0
+    };
+    let non_client_w = outer.width.saturating_sub(inner.width);
+    let non_client_h = outer.height.saturating_sub(inner.height);
+    let to_outer_w = |dips: f64| ((dips * scale).round().max(1.0) as i32).saturating_add(non_client_w);
+    let to_outer_h = |dips: f64| ((dips * scale).round().max(1.0) as i32).saturating_add(non_client_h);
+
+    if let Ok(presenter) = app_window.Presenter()
+        && let Ok(p3) = presenter.cast::<IOverlappedPresenter3>()
+    {
+        let min_w = Some(to_outer_w(min_client_width_dips));
+        let min_h = Some(to_outer_h(min_client_height_dips));
+        let max_w = max_client_width_dips.map(to_outer_w);
+        let _ = p3.SetPreferredMinimumWidth(min_w);
+        let _ = p3.SetPreferredMinimumHeight(min_h);
+        let _ = p3.SetPreferredMaximumWidth(max_w);
+        let _ = p3.SetPreferredMaximumHeight(None);
+    }
+
+    if shrink_if_wider
+        && let Some(max_dips) = max_client_width_dips
+        && max_dips.is_finite()
+        && max_dips > 0.0
+    {
+        let max_outer_w = to_outer_w(max_dips);
+        if outer.width > max_outer_w
+            && let Ok(pos) = app_window.Position()
+        {
+            let min_outer_h = to_outer_h(min_client_height_dips);
+            let _ = app_window.MoveAndResize(RectInt32 {
+                x: pos.x,
+                y: pos.y,
+                width: max_outer_w,
+                height: outer.height.max(min_outer_h),
+            });
+        }
+    }
+    true
+}
+
 /// 当前焦点是否位于文本输入框（或其模板子元素）内，防止单键播放器快捷键劫持打字。
 pub fn is_text_input_focused() -> bool {
     let Ok(focused) = FocusManager::GetFocusedElement() else {
@@ -265,5 +336,13 @@ mod tests {
         assert!(!set_window_fullscreen(std::ptr::null_mut(), true));
         assert!(!set_window_fullscreen(std::ptr::null_mut(), false));
         assert_eq!(is_window_fullscreen(std::ptr::null_mut()), None);
+        assert!(!enforce_portrait_window_policy(
+            std::ptr::null_mut(),
+            390.0,
+            640.0,
+            Some(859.0),
+            859.0,
+            true,
+        ));
     }
 }

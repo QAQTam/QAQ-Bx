@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use windows_core::{IUnknown, Interface as _};
 use windows_reactor::{
-    Component, ComponentContext, ElementRef, SwapChainPanel, SwapChainPanelEvent, View, ViewContext,
+    Component, ComponentContext, ElementRef, IntegrationError, SwapChainPanel,
+    SwapChainPanelEvent, View, ViewContext,
 };
 
 use qaq_bx_video::stage::DanmakuStage;
@@ -106,19 +107,27 @@ impl Component for DanmakuSurface {
 
 /// 尝试把层的待挂载 swapchain 挂上 panel(UI 线程;无 pending 则空操作)。
 fn attach_pending(stage: &Arc<DanmakuStage>, panel: &ElementRef<SwapChainPanel>) {
-    let Some(raw) = stage.take_pending() else {
+    let Some((gen_id, raw)) = stage.take_pending() else {
         return;
     };
     let Some(chain) = adopt_swap_chain(raw) else {
         return;
     };
     let stage_on_attach = stage.clone();
-    let accepted = panel.request_set_swap_chain(chain.clone(), move |result| {
-        stage_on_attach.mark_attached(result.is_ok())
+    let chain_on_err = chain.clone();
+    let accepted = panel.request_set_swap_chain(chain.clone(), move |result| match result {
+        Ok(()) => stage_on_attach.mark_attached(gen_id, true),
+        Err(IntegrationError::Unavailable) => {
+            stage_on_attach.put_back_pending(gen_id, chain_on_err.clone().into_raw());
+        }
+        Err(e) => {
+            eprintln!("[qaq-bx-ui] DanmakuSurface SetSwapChain 失败(gen={gen_id}):{e:?}");
+            stage_on_attach.mark_attached(gen_id, false);
+        }
     });
     if !accepted {
-        // 入队失败(面板未实例化):原件放回,由下一拍(tick)重试。
-        stage.put_back_pending(chain.into_raw());
+        // 入队失败(面板未实例化):原件放回当前 gen 槽,由下一拍(tick)重试。
+        stage.put_back_pending(gen_id, chain.into_raw());
     }
 }
 

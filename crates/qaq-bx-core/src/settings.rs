@@ -285,7 +285,17 @@ pub struct AppSettings {
     /// 竖屏模式(实验):窗口客户区钳制在底栏边界带 [390, 860) DIP,没收系统
     /// 最大化钮并改供「贴边最大化」(右缘贴边 × 工作区全高)。移动布局自动接管。
     pub portrait_mode: bool,
+    /// 优先选择官方商业 CDN（如 `upos-*`），将 `mcdn`/PCDN 节点后置兜底。
+    #[serde(default = "default_true")]
+    pub prefer_official_cdn: bool,
+    /// 开启多线程分块预加载与自动节点容灾（本地有界滑窗代理）。
+    #[serde(default = "default_true")]
+    pub multi_thread_preload: bool,
     pub window: Option<WindowBounds>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppSettings {
@@ -313,6 +323,8 @@ impl Default for AppSettings {
             player_engine: PlayerEngine::default(),
             webp_hint_shown: false,
             portrait_mode: false,
+            prefer_official_cdn: true,
+            multi_thread_preload: true,
             window: None,
         }
     }
@@ -435,6 +447,8 @@ mod tests {
             player_engine: PlayerEngine::Native,
             webp_hint_shown: true,
             portrait_mode: true,
+            prefer_official_cdn: false,
+            multi_thread_preload: false,
             window: Some(WindowBounds {
                 x: 100,
                 y: 80,
@@ -606,4 +620,19 @@ fn portrait_mode_defaults_off_and_roundtrips() {
     let parsed: AppSettings =
         serde_json::from_str(&serde_json::to_string(&next).unwrap()).unwrap();
     assert!(parsed.portrait_mode, "serde 往返必须保真");
+}
+
+#[test]
+fn playback_cdn_and_preload_settings_default_true_and_roundtrip() {
+    let legacy: AppSettings = serde_json::from_str("{}").unwrap();
+    assert!(legacy.prefer_official_cdn, "旧配置缺字段默认优先官方 CDN");
+    assert!(legacy.multi_thread_preload, "旧配置缺字段默认开启多线程预加载");
+
+    let mut next = AppSettings::default();
+    next.prefer_official_cdn = false;
+    next.multi_thread_preload = false;
+    let parsed: AppSettings =
+        serde_json::from_str(&serde_json::to_string(&next).unwrap()).unwrap();
+    assert!(!parsed.prefer_official_cdn);
+    assert!(!parsed.multi_thread_preload);
 }

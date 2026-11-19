@@ -45,7 +45,7 @@
 | 3 | 系统最大化钮 | 可用 | **没收**(presenter `SetIsMaximizable(false)`,控件渲染置灰、真实点击无效——已真机验证 WS_MAXIMIZEBOX=CLEAR) | B |
 | 4 | 最大化语义 | 系统最大化 | **贴边最大化**:右缘贴合工作区 × 全高 × 宽 859,再点还原(dock_window_right,DIP→px 用 inner/当前 dips 推 scale,零 DPI API) | B |
 | 5 | 贴边钮 | 无 | TitleBar right_items 最右(紧邻 caption 钮;与搜索/通知钮同容器,避免单值 relation 覆盖) | B |
-| 6 | **全屏播放** | 保留 | **保留**(用户钦定)——走 FullScreen presenter 独立通道,与最大化没收正交;进出全屏后在 `sync_window_fullscreen` 重按一次没收(防 presenter kind 切换复位) | 共有(特殊处理) |
+| 6 | **全屏播放** | 保留 | **保留**(用户钦定)——走 FullScreen presenter 独立通道,与最大化没收正交;全屏期间冻结底层 `viewport_layout`(仅更新 `fullscreen_window_width` 供 HUD 使用),退出全屏首帧直接命中原竖屏 Mobile 树(0 Desktop 闪回);退出回 `Default` presenter 后在 `sync_window_fullscreen` 重申 `set_maximizable(false)` 与 `enforce_portrait_window_policy`(恢复 `IOverlappedPresenter3` 859 DIP 最大宽度硬钳制) | 共有(特殊处理) |
 | 7 | 上次窗口位置记忆 | settings.window 恢复 | 竖屏期不写不读(贴边/钳制几何由模式自管);未来可拆两套记忆 | B(前瞻) |
 | 8 | 右栏相关推荐/双栏 | 有 | 移动布局自动(相关推荐进 Tab) | A(自动) |
 | 9 | 半屏抽屉 | 桌面限定 | 移动布局自动不触发 | A(自动) |

@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use windows_core::{IUnknown, Interface as _};
 use windows_reactor::{
-    Component, ComponentContext, ElementRef, SwapChainPanel, SwapChainPanelEvent, View, ViewContext,
+    Component, ComponentContext, ElementRef, IntegrationError, SwapChainPanel,
+    SwapChainPanelEvent, View, ViewContext,
 };
 
 use qaq_bx_video::engine::VideoEngine;
@@ -124,20 +125,28 @@ fn apply_surface_metrics(
 
 /// 尝试把引擎的待挂载 swapchain 挂上 panel(UI 线程;无 pending 则空操作)。
 fn attach_pending(engine: &Arc<VideoEngine>, panel: &ElementRef<SwapChainPanel>) {
-    let Some(raw) = engine.take_pending() else {
+    let Some((gen_id, raw)) = engine.take_pending() else {
         return;
     };
     let Some(chain) = adopt_swap_chain(raw) else {
         return;
     };
-    // request 接管克隆引用;入队失败(面板未实例化)时原件放回引擎槽,
+    // request 接管克隆引用;入队失败或面板瞬态 Unavailable 时原件放回当前 gen 槽,
     // 由 250ms 后的下一拍重试(input.tick 持续递增)。
     let engine_on_attach = engine.clone();
-    let accepted = panel.request_set_swap_chain(chain.clone(), move |result| {
-        engine_on_attach.mark_attached(result.is_ok())
+    let chain_on_err = chain.clone();
+    let accepted = panel.request_set_swap_chain(chain.clone(), move |result| match result {
+        Ok(()) => engine_on_attach.mark_attached(gen_id, true),
+        Err(IntegrationError::Unavailable) => {
+            engine_on_attach.put_back_pending(gen_id, chain_on_err.clone().into_raw());
+        }
+        Err(e) => {
+            eprintln!("[qaq-bx-ui] VideoSurface SetSwapChain 失败(gen={gen_id}):{e:?}");
+            engine_on_attach.mark_attached(gen_id, false);
+        }
     });
     if !accepted {
-        engine.put_back_pending(chain.into_raw());
+        engine.put_back_pending(gen_id, chain.into_raw());
     }
 }
 

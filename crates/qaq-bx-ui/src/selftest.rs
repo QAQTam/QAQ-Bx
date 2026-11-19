@@ -579,7 +579,97 @@ fn fullscreen(s: &mut Scenario) -> Result<(), String> {
         assert_eq!(p.route_tag, "home");
         // 后台播放(park)产品默认关:导航离开即关播并释放会话。
         assert!(p.now_playing_bvid.is_none());
+    }
+
+    // 6. 竖屏模式(实验)全屏进退彻底隔离回归:
+    // 在 1280x800 桌面尺寸下开启 portrait_mode → 立即收敛至竖屏 Mobile 2 列(859 DIP);
+    // 打开视频 → 进入全屏 → 收到 1920x1080 全屏 WindowResized → 底层视口保持 Mobile 2 列不被污染;
+    // 退出全屏首帧立即维持 Mobile 2 列,0 闪回 Desktop 布局。
+    s.send(Message::WindowResized(windows_reactor::WindowSize {
+        width: 1280.0,
+        height: 800.0,
+    }))?;
+    s.sync()?;
+    assert!(!s.probe.borrow().is_mobile, "前置应为桌面 1280 宽");
+    s.send(Message::UpdateSettings(AppSettings {
+        portrait_mode: true,
+        player_engine: PlayerEngine::Mpv,
+        ..AppSettings::default()
+    }))?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(p.portrait_mode, "竖屏模式开关应已置位");
+        assert!(p.is_mobile, "开启竖屏模式当帧必须立即切换为 Mobile 壳层");
+        assert_eq!(p.grid_cols, 2, "开启竖屏模式当帧必须立即收敛为 2 列");
+        assert!(
+            p.window_width < crate::layout::MOBILE_BREAKPOINT,
+            "开启竖屏模式后有效布局宽度必须被钳制在 < 860 DIP"
+        );
+    }
+    s.send(Message::OpenVideo(TEST_BV.into()))?;
+    s.wait_for(Duration::from_secs(60), |p| {
+        p.route_tag == "player"
+            && p.now_playing_bvid.as_deref() == Some(TEST_BV)
+            && p.engine_attached
+            && !p.video_loading
+    })
+    .map_err(|err| format!("竖屏全屏前置视频未就绪:{err}"))?;
+    {
+        let p = s.probe.borrow();
+        if p.quality_count >= 2 {
+            let target_qn = if p.current_qn == 32 { 16 } else { 32 };
+            drop(p);
+            s.send(Message::SelectQuality(target_qn))?;
+            s.sync()?;
+            assert!(
+                s.probe.borrow().is_mobile,
+                "竖屏模式切换画质期间必须保持 Mobile 布局不 panic"
+            );
         }
+    }
+    s.send(Message::EnterFullscreen)?;
+    s.send(Message::WindowResized(windows_reactor::WindowSize {
+        width: 1920.0,
+        height: 1080.0,
+    }))?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(p.is_fullscreen, "竖屏模式下应正常进入全屏");
+        assert!(
+            p.is_mobile && p.grid_cols == 2 && p.window_width < crate::layout::MOBILE_BREAKPOINT,
+            "全屏 1920x1080 WindowResized 严禁污染底层竖屏布局(is_mobile={}, cols={}, w={})",
+            p.is_mobile,
+            p.grid_cols,
+            p.window_width
+        );
+    }
+    s.send(Message::ExitFullscreen)?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(!p.is_fullscreen, "ExitFullscreen 应立即退出全屏");
+        assert!(
+            p.is_mobile && p.grid_cols == 2 && p.window_width < crate::layout::MOBILE_BREAKPOINT,
+            "退出全屏首帧(窗口尚未异步缩回前)必须严格保持竖屏 Mobile 布局,不得闪回 Desktop"
+        );
+    }
+    // 即使在非全屏下收到异常超宽 WindowResized,竖屏模式也必须死锁在 Mobile 2 列
+    s.send(Message::WindowResized(windows_reactor::WindowSize {
+        width: 1920.0,
+        height: 1080.0,
+    }))?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(
+            p.is_mobile && p.grid_cols == 2 && p.window_width < crate::layout::MOBILE_BREAKPOINT,
+            "竖屏模式开启期间任意超宽 WindowResized 均不得突破 Mobile 边界"
+        );
+    }
+    s.send(Message::NavTagSelected(Some("home".into())))?;
+    s.sync()?;
 
     Ok(())
 }
@@ -708,6 +798,71 @@ fn engine(s: &mut Scenario) -> Result<(), String> {
     Ok(())
 }
 
+/// 场景 15:加载动画与 CDN/预加载策略状态机集成测试（开播/换画质/切配置 0 panic）。
+fn loading_state(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(p.prefer_official_cdn, "默认应优先官方 CDN");
+        assert!(p.multi_thread_preload, "默认应开启多线程并发预加载");
+    }
+
+    s.send(Message::OpenVideo(TEST_BV.into()))?;
+    s.sync()?;
+    assert!(
+        s.probe.borrow().video_loading,
+        "打开视频瞬间必须立刻置位 video_loading 展示加载动画"
+    );
+
+    s.wait_for(Duration::from_secs(60), |p| {
+        p.route_tag == "player"
+            && p.now_playing_bvid.as_deref() == Some(TEST_BV)
+            && p.engine_attached
+            && !p.video_loading
+    })
+    .map_err(|err| format!("视频起播未落定:{err}"))?;
+
+    // 切换画质必须再次触发 video_loading=true 并在重载完成后熄灭。
+    let next_qn = {
+        let p = s.probe.borrow();
+        if p.quality_count >= 2 {
+            Some(if p.current_qn == 32 { 16 } else { 32 })
+        } else {
+            None
+        }
+    };
+    if let Some(qn) = next_qn {
+        s.send(Message::SelectQuality(qn))?;
+        s.sync()?;
+        assert!(
+            s.probe.borrow().video_loading,
+            "切换画质后在途装载必须显示加载动画"
+        );
+        s.wait_for(Duration::from_secs(60), |p| {
+            p.current_qn == qn && !p.video_loading
+        })
+        .map_err(|err| format!("切换画质后未能重新落定:{err}"))?;
+    }
+
+    // 热切换 CDN/预加载设置项并切设置页不崩溃。
+    s.send(Message::UpdateSettings(AppSettings {
+        prefer_official_cdn: false,
+        multi_thread_preload: false,
+        player_engine: PlayerEngine::Mpv,
+        ..AppSettings::default()
+    }))?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(!p.prefer_official_cdn);
+        assert!(!p.multi_thread_preload);
+    }
+    s.send(Message::NavTagSelected(Some("settings".into())))?;
+    s.sync()?;
+    assert_eq!(s.probe.borrow().route_tag, "settings");
+    Ok(())
+}
+
 const SCENARIOS: &[(&str, &str, fn(&mut Scenario) -> Result<(), String>)] = &[
     ("boot", "FullPlayer", boot),
     ("nav", "FullPlayer", nav),
@@ -723,6 +878,7 @@ const SCENARIOS: &[(&str, &str, fn(&mut Scenario) -> Result<(), String>)] = &[
     ("mobile", "HalfPane", mobile),
     ("fullscreen", "FullPlayer", fullscreen),
     ("engine", "FullPlayer", engine),
+    ("loading-state", "FullPlayer", loading_state),
 ];
 
 /// 解析 `--selftest [scenario]`;非 selftest 调用返回 `None` 走正常启动。

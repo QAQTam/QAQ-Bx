@@ -9,7 +9,50 @@ use std::time::Instant;
 use qaq_bx_core::reply::{ReplyItem, ReplySort};
 use qaq_bx_video::engine::VideoEngine;
 use qaq_bx_video::native::NativePlayer;
+use qaq_bx_video::stage::DanmakuStage;
 use windows_reactor::*;
+
+fn opt_arc_ptr_eq<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn player_surface_view(
+    engine: &Arc<VideoEngine>,
+    native: Option<&Arc<NativePlayer>>,
+    stage: Option<&Arc<DanmakuStage>>,
+    tick: u32,
+) -> View {
+    if let Some(native) = native {
+        // 两层结构固定:系统媒体引擎渲染面 + 同 cell 弹幕透明层,避免组件树重建产生合成空窗。
+        let mut layers: Vec<View> = Vec::with_capacity(2);
+        layers.push(
+            View::component::<NativeSurface>(NativeSurfaceInput {
+                player: native.clone(),
+                tick,
+            })
+            .into(),
+        );
+        if let Some(stage) = stage {
+            layers.push(
+                View::component::<DanmakuSurface>(DanmakuSurfaceInput {
+                    stage: stage.clone(),
+                    tick,
+                })
+                .into(),
+            );
+        }
+        Grid::new().children(layers).into()
+    } else {
+        View::component::<VideoSurface>(VideoSurfaceInput {
+            engine: engine.clone(),
+            tick,
+        })
+    }
+}
 
 use crate::auth::avatar_thumbnail_url;
 use crate::data::VideoItem;
@@ -244,16 +287,8 @@ impl PartialEq for PlayerInput {
             && self.notice == other.notice
             && self.loading == other.loading
             && Arc::ptr_eq(&self.engine, &other.engine)
-            && match (&self.native, &other.native) {
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                (None, None) => true,
-                _ => false,
-            }
-            && match (&self.stage, &other.stage) {
-                (Some(a), Some(b)) => a == b,
-                (None, None) => true,
-                _ => false,
-            }
+            && opt_arc_ptr_eq(&self.native, &other.native)
+            && opt_arc_ptr_eq(&self.stage, &other.stage)
             && self.comments == other.comments
             && self.comment_cb == other.comment_cb
             && self.related == other.related
@@ -453,32 +488,13 @@ impl Component for PlayerPage {
                         )),
                 )
                 .into()
-        } else if let Some(native) = &input.native {
-            // v0.3:系统媒体引擎渲染面(MediaPlayerElement)+ 同 cell 弹幕透明层。
-            // 两层结构固定(不因弹幕开关翻转),避免组件树重建导致合成空窗。
-            let mut layers: Vec<View> = Vec::with_capacity(2);
-            layers.push(
-                View::component::<NativeSurface>(NativeSurfaceInput {
-                    player: native.clone(),
-                    tick: input.mount_tick,
-                })
-                .into(),
-            );
-            if let Some(stage) = &input.stage {
-                layers.push(
-                    View::component::<DanmakuSurface>(DanmakuSurfaceInput {
-                        stage: stage.clone(),
-                        tick: input.mount_tick,
-                    })
-                    .into(),
-                );
-            }
-            Grid::new().children(layers).into()
         } else {
-            View::component::<VideoSurface>(VideoSurfaceInput {
-                engine: input.engine.clone(),
-                tick: input.mount_tick,
-            })
+            player_surface_view(
+                &input.engine,
+                input.native.as_ref(),
+                input.stage.as_ref(),
+                input.mount_tick,
+            )
         };
         let surface = surface_with_loading(surface, input.loading);
         let surface = surface_with_double_click(
@@ -522,75 +538,36 @@ impl Component for PlayerPage {
         let is_single_col = input.layout.is_single_column();
         let is_mobile = input.layout.is_mobile();
         let margin_x = input.layout.page_margin_x();
-        let left_inner_w = (input.layout.content_width() - RIGHT_RAIL_WIDTH - 28.0).max(320.0);
-        let compact_desktop = desktop_transport_compact(left_inner_w);
-        let compact_btn = is_single_col || compact_desktop;
-
-        let play_btn =
-            play_pause_button(input.playing, compact_btn, false, input.on_toggle.clone());
-        let mute_btn = mute_toggle_button(
-            input.volume == 0,
-            compact_btn,
-            false,
-            input.on_toggle_mute.clone(),
-        );
-        let danmaku_btn = danmaku_toggle_button(
-            input.danmaku_enabled,
-            compact_btn,
-            false,
-            input.on_toggle_danmaku.clone(),
-        );
-        let fullscreen_btn =
-            fullscreen_toggle_button(false, compact_btn, false, input.on_enter_fullscreen.clone());
 
         let transport: View = if is_single_col {
-            Grid::new()
-                .columns([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
-                .margin(Thickness::new(margin_x, 4.0, margin_x, 0.0))
-                .children((
-                    play_btn,
-                    seek_slider(input.position, input.duration_secs, input.on_seek.clone())
-                        .grid_column(1)
-                        .margin(Thickness::xy(8.0, 0.0))
-                        .vertical_alignment(VerticalAlignment::Center),
-                    StackPanel::new()
-                        .grid_column(2)
-                        .orientation(Orientation::Horizontal)
-                        .spacing(6.0)
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .children({
-                            let mut items: Vec<View> =
-                                vec![time_label(input.position, input.duration_secs, 11.0).into()];
-                            if let Some(q) = quality_selector(
-                                &input.quality_menu,
-                                input.current_qn,
-                                &input.on_select_quality,
-                                true,
-                            ) {
-                                items.push(q);
-                            }
-                            if let Some(p) = pages_selector(
-                                &input.pages_menu,
-                                input.current_cid,
-                                &input.on_select_page,
-                                true,
-                            ) {
-                                items.push(p);
-                            }
-                            items.push(volume_slider(
-                                48.0,
-                                input.volume,
-                                &input.on_volume,
-                                &input.on_volume_wheel,
-                            ).into());
-                            items.push(mute_btn);
-                            items.push(danmaku_btn);
-                            items.push(fullscreen_btn);
-                            items
-                        }),
-                ))
-                .into()
+            single_column_transport(input, margin_x)
         } else {
+            let left_inner_w = (input.layout.content_width() - RIGHT_RAIL_WIDTH - 28.0).max(320.0);
+            let compact_desktop = desktop_transport_compact(left_inner_w);
+            let play_btn = play_pause_button(
+                input.playing,
+                compact_desktop,
+                false,
+                input.on_toggle.clone(),
+            );
+            let mute_btn = mute_toggle_button(
+                input.volume == 0,
+                compact_desktop,
+                false,
+                input.on_toggle_mute.clone(),
+            );
+            let danmaku_btn = danmaku_toggle_button(
+                input.danmaku_enabled,
+                compact_desktop,
+                false,
+                input.on_toggle_danmaku.clone(),
+            );
+            let fullscreen_btn = fullscreen_toggle_button(
+                false,
+                compact_desktop,
+                false,
+                input.on_enter_fullscreen.clone(),
+            );
             let mut right_items: Vec<View> = vec![
                 mute_btn,
                 volume_slider(
@@ -1284,6 +1261,68 @@ fn related_virtual_source(
     )
 }
 
+/// 评论发布器:单行三列 Grid `[头像 | 输入框 | 发布]`,未登录按钮置灰 +
+/// 行内提示(notice 占第 2 行输入框列)。草稿/提交走 shell 单源。
+/// 容器必须是 Grid——子元素的 Grid.Column 附加属性只有 Grid 布局会读,
+/// 挂 StackPanel 会静默竖堆(v0.2.0 回归,见 composer 布局回归测试)。
+fn comment_composer(
+    my_avatar: Option<&EncodedImage>,
+    cb: &CommentCallbacks,
+    draft: &str,
+) -> View {
+    let submit_btn = if cb.can_post {
+        Button::new()
+            .grid_column(2)
+            .style(ButtonStyle::Accent)
+            .content("发布")
+            .on_click(cb.on_submit.clone())
+    } else {
+        Button::new()
+            .grid_column(2)
+            .style(ButtonStyle::Subtle)
+            .is_enabled(false)
+            .content("发布")
+    };
+    let mut composer_rows: Vec<View> = vec![
+        theme::avatar_view(my_avatar, "我", 34.0, 17.0)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into(),
+        TextBox::new()
+            .grid_column(1)
+            .margin(Thickness::xy(10.0, 0.0))
+            .placeholder_text(if cb.can_post {
+                "发一条友善的评论…"
+            } else {
+                "登录后即可发布评论"
+            })
+            .text(draft.to_string())
+            .on_text_changed({
+                let on_draft = cb.on_draft.clone();
+                move |text: Rc<str>| on_draft.call(text)
+            })
+            .into(),
+        submit_btn.into(),
+    ];
+    if let Some(notice) = &cb.composer_notice {
+        composer_rows.push(
+            TextBlock::new()
+                .grid_column(1)
+                .grid_row(1)
+                .text(notice.clone())
+                .font_size(11.5)
+                .foreground(Brush::Solid(Color::rgb(196, 43, 28)))
+                .margin(Thickness::new(10.0, 6.0, 0.0, 0.0))
+                .into(),
+        );
+    }
+    // 无 notice 时第 2 行 Auto 收零高,不影响单行形态。
+    Grid::new()
+        .columns([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
+        .rows([GridLength::Auto, GridLength::Auto])
+        .children(composer_rows)
+        .into()
+}
+
 fn comments_panel_with(
     snapshot: &CommentsSnapshot,
     my_avatar: Option<&EncodedImage>,
@@ -1352,52 +1391,7 @@ fn comments_panel_with(
                 )),
         ));
 
-    // U1 评论发布接线:未登录按钮置灰 + 行内提示;草稿/提交走 shell 单源。
-    let submit_btn = if cb.can_post {
-        Button::new()
-            .grid_column(2)
-            .style(ButtonStyle::Accent)
-            .content("发布")
-            .on_click(cb.on_submit.clone())
-    } else {
-        Button::new()
-            .grid_column(2)
-            .style(ButtonStyle::Subtle)
-            .is_enabled(false)
-            .content("发布")
-    };
-    let mut composer_rows: Vec<View> = vec![
-        theme::avatar_view(my_avatar, "我", 34.0, 17.0)
-            .vertical_alignment(VerticalAlignment::Center)
-            .into(),
-        TextBox::new()
-            .grid_column(1)
-            .margin(Thickness::xy(10.0, 0.0))
-            .placeholder_text(if cb.can_post {
-                "发一条友善的评论…"
-            } else {
-                "登录后即可发布评论"
-            })
-            .text(draft.to_string())
-            .on_text_changed({
-                let on_draft = cb.on_draft.clone();
-                move |text: Rc<str>| on_draft.call(text)
-            })
-            .into(),
-        submit_btn.into(),
-    ];
-    if let Some(notice) = &cb.composer_notice {
-        composer_rows.push(
-            TextBlock::new()
-                .grid_column(1)
-                .text(notice.clone())
-                .font_size(11.5)
-                .foreground(Brush::Solid(Color::rgb(196, 43, 28)))
-                .margin(Thickness::new(10.0, 6.0, 0.0, 0.0))
-                .into(),
-        );
-    }
-    let composer = StackPanel::new().spacing(0.0).children(composer_rows);
+    let composer = comment_composer(my_avatar, cb, draft);
 
     let mut rows: Vec<KeyedView> = vec![
         KeyedView::new("c-header", header),
@@ -2289,7 +2283,13 @@ pub(crate) fn fullscreen_toggle_button(
     on_dark: bool,
     on_toggle: Callback<()>,
 ) -> View {
+    let auto_id = if is_fullscreen {
+        "player-exit-fullscreen"
+    } else {
+        "player-enter-fullscreen"
+    };
     if compact {
+        let on_pointer = on_toggle.clone();
         Border::new()
             .width(28.0)
             .height(28.0)
@@ -2297,22 +2297,31 @@ pub(crate) fn fullscreen_toggle_button(
             .background(hud_chip_background(on_dark))
             .border_brush(hud_chip_border(on_dark))
             .border_thickness(if on_dark { 0.0 } else { 1.0 })
-            .on_pointer_released(move |_| on_toggle.call(()))
+            .on_pointer_released(move |_| on_pointer.call(()))
             .content(
-                FontIcon::new()
-                    .glyph(if is_fullscreen {
-                        "\u{E73F}"
-                    } else {
-                        "\u{E740}"
-                    })
-                    .font_size(12.0)
-                    .foreground(hud_foreground(on_dark))
-                    .horizontal_alignment(HorizontalAlignment::Center)
-                    .vertical_alignment(VerticalAlignment::Center),
+                Button::new()
+                    .automation_id(auto_id)
+                    .style(ButtonStyle::Subtle)
+                    .horizontal_alignment(HorizontalAlignment::Stretch)
+                    .vertical_alignment(VerticalAlignment::Stretch)
+                    .on_click(on_toggle)
+                    .content(
+                        FontIcon::new()
+                            .glyph(if is_fullscreen {
+                                "\u{E73F}"
+                            } else {
+                                "\u{E740}"
+                            })
+                            .font_size(12.0)
+                            .foreground(hud_foreground(on_dark))
+                            .horizontal_alignment(HorizontalAlignment::Center)
+                            .vertical_alignment(VerticalAlignment::Center),
+                    ),
             )
             .into()
     } else {
         AppBarButton::new()
+            .automation_id(auto_id)
             .icon(Icon::symbol(if is_fullscreen {
                 Symbol::BackToWindow
             } else {
@@ -2374,7 +2383,8 @@ pub(crate) fn time_label(position: u32, duration_secs: u32, font_size: f64) -> T
 }
 
 /// 播放页画质选择器（F2）：ComboBox 呈现当前档，菜单按 dash 实际下发档降序；
-/// 少于 2 档（或未加载）返回 None 不渲染。
+/// 少于 2 档（或未加载）返回 None 不渲染。紧凑/竖屏布局省去“画质”页眉，
+/// 避免单行播控出现冗余解释性文本与高度错位。
 pub(crate) fn quality_selector(
     menu: &[(i64, String)],
     current_qn: i64,
@@ -2390,20 +2400,85 @@ pub(crate) fn quality_selector(
         .position(|(qn, _)| *qn == current_qn && current_qn > 0)
         .unwrap_or(0);
     let on_change = on_select.clone();
-    Some(
-        ComboBox::new()
-            .header("画质")
-            .items_source(menu.iter().map(|(_, label)| label.clone()))
-            .selected_index(selected)
-            .on_selection_changed(move |index: Option<usize>| {
-                if let Some((qn, _)) = index.and_then(|idx| menu.get(idx)) {
-                    on_change.call(*qn);
-                }
-            })
-            .min_width(if compact { 88.0 } else { 108.0 })
-            .vertical_alignment(VerticalAlignment::Center)
-            .into(),
-    )
+    let mut combo = ComboBox::new()
+        .automation_id("player-quality-selector")
+        .items_source(menu.iter().map(|(_, label)| label.clone()))
+        .selected_index(selected)
+        .on_selection_changed(move |index: Option<usize>| {
+            if let Some((qn, _)) = index.and_then(|idx| menu.get(idx)) {
+                on_change.call(*qn);
+            }
+        })
+        .min_width(if compact { 88.0 } else { 108.0 })
+        .vertical_alignment(VerticalAlignment::Center);
+    if !compact {
+        combo = combo.header("画质");
+    }
+    Some(combo.into())
+}
+
+/// 竖屏/单列播放页单行紧凑播控条。
+pub(crate) fn single_column_transport(input: &PlayerInput, margin_x: f64) -> View {
+    let play_btn = play_pause_button(input.playing, true, false, input.on_toggle.clone());
+    let mute_btn = mute_toggle_button(input.volume == 0, true, false, input.on_toggle_mute.clone());
+    let danmaku_btn = danmaku_toggle_button(
+        input.danmaku_enabled,
+        true,
+        false,
+        input.on_toggle_danmaku.clone(),
+    );
+    let fullscreen_btn =
+        fullscreen_toggle_button(false, true, false, input.on_enter_fullscreen.clone());
+
+    Grid::new()
+        .columns([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
+        .margin(Thickness::new(margin_x, 4.0, margin_x, 0.0))
+        .children((
+            play_btn,
+            seek_slider(input.position, input.duration_secs, input.on_seek.clone())
+                .grid_column(1)
+                .margin(Thickness::xy(8.0, 0.0))
+                .vertical_alignment(VerticalAlignment::Center),
+            StackPanel::new()
+                .grid_column(2)
+                .orientation(Orientation::Horizontal)
+                .spacing(6.0)
+                .vertical_alignment(VerticalAlignment::Center)
+                .children({
+                    let mut items: Vec<View> =
+                        vec![time_label(input.position, input.duration_secs, 11.0).into()];
+                    if let Some(q) = quality_selector(
+                        &input.quality_menu,
+                        input.current_qn,
+                        &input.on_select_quality,
+                        true,
+                    ) {
+                        items.push(q);
+                    }
+                    if let Some(p) = pages_selector(
+                        &input.pages_menu,
+                        input.current_cid,
+                        &input.on_select_page,
+                        true,
+                    ) {
+                        items.push(p);
+                    }
+                    items.push(
+                        volume_slider(
+                            48.0,
+                            input.volume,
+                            &input.on_volume,
+                            &input.on_volume_wheel,
+                        )
+                        .into(),
+                    );
+                    items.push(mute_btn);
+                    items.push(danmaku_btn);
+                    items.push(fullscreen_btn);
+                    items
+                }),
+        ))
+        .into()
 }
 
 /// 分P选择器（U3）：ComboBox 呈现 "P{n} 标题"；少于 2 个分P返回 None。
@@ -2512,6 +2587,8 @@ pub struct HalfPaneInput {
     /// 解析/缓冲中:半窗视频面叠加环形加载指示(与全播放页同源状态)。
     pub loading: bool,
     pub engine: Arc<VideoEngine>,
+    pub native: Option<Arc<NativePlayer>>,
+    pub stage: Option<Arc<DanmakuStage>>,
     pub comments: CommentsSnapshot,
     pub comment_cb: CommentCallbacks,
     pub on_toggle: Callback<()>,
@@ -2545,6 +2622,8 @@ impl PartialEq for HalfPaneInput {
             && self.notice == other.notice
             && self.loading == other.loading
             && Arc::ptr_eq(&self.engine, &other.engine)
+            && opt_arc_ptr_eq(&self.native, &other.native)
+            && opt_arc_ptr_eq(&self.stage, &other.stage)
             && self.comments == other.comments
             && self.comment_cb == other.comment_cb
             && self.on_toggle == other.on_toggle
@@ -2674,10 +2753,12 @@ impl Component for HalfPanePreview {
                 )
                 .into()
         } else {
-            View::component::<VideoSurface>(VideoSurfaceInput {
-                engine: input.engine.clone(),
-                tick: input.mount_tick,
-            })
+            player_surface_view(
+                &input.engine,
+                input.native.as_ref(),
+                input.stage.as_ref(),
+                input.mount_tick,
+            )
         };
         let surface = surface_with_loading(surface, input.loading);
         let surface = surface_with_double_click(
@@ -3001,7 +3082,8 @@ mod tests {
 
     /// F1 反馈契约:全屏 HUD 底衬为半透明黑、深色态控件走白前景;普通
     /// 播放条保持主题配色不受影响。
-    /// F2 契约:菜单少于 2 档不渲染;≥2 档时选中项与回调命中正确档。
+    /// F2 契约:菜单少于 2 档不渲染;≥2 档时选中项与回调命中正确档;
+    /// 紧凑/竖屏布局省去"画质"页眉,桌面非紧凑档保留。
     #[test]
     fn quality_selector_requires_two_tiers_and_maps_selection() {
         let cb = super::Callback::new(|_: i64| {});
@@ -3015,7 +3097,91 @@ mod tests {
             (80, "1080P".into()),
             (64, "720P".into()),
         ];
-        assert!(super::quality_selector(&menu, 80, &cb, false).is_some());
+        let desktop_view = super::quality_selector(&menu, 80, &cb, false).expect("桌面选择器应渲染");
+        let desktop_dbg = format!("{desktop_view:?}");
+        assert!(desktop_dbg.contains("player-quality-selector"));
+        assert!(desktop_dbg.contains("画质"), "桌面非紧凑档保留画质页眉");
+
+        let compact_view = super::quality_selector(&menu, 80, &cb, true).expect("紧凑选择器应渲染");
+        let compact_dbg = format!("{compact_view:?}");
+        assert!(compact_dbg.contains("player-quality-selector"));
+        assert!(compact_dbg.contains("1080P"));
+        assert!(
+            !compact_dbg.contains("画质"),
+            "竖屏/紧凑布局不得渲染多余的“画质”解释性页眉"
+        );
+    }
+
+    #[test]
+    fn portrait_single_column_transport_omits_quality_header() {
+        let engine = super::VideoEngine::new();
+        let item = super::VideoItem {
+            bvid: "BV1GJ411x7h7".into(),
+            aid: 1,
+            cid: 2,
+            title: "test".into(),
+            author: "up".into(),
+            author_mid: 3,
+            author_face_url: None,
+            duration_secs: 60,
+            play_count: 10,
+            danmaku_count: 5,
+            like_count: None,
+            coin_count: None,
+            favorite_count: None,
+            share_count: None,
+            cover: None,
+            pic_url: None,
+        };
+        let noop_unit = super::Callback::new(|()| {});
+        let noop_f64 = super::Callback::new(|_: f64| {});
+        let layout = super::ViewportLayout::initial(true);
+        assert!(layout.is_single_column(), "竖屏模式应走单列布局");
+        let input = super::PlayerInput {
+            item,
+            author_avatar: None,
+            my_avatar: None,
+            desc: None,
+            playing: true,
+            position: 11,
+            volume: 60,
+            danmaku_enabled: true,
+            quality_menu: vec![(80, "1080P 高清".into()), (32, "480P 清晰".into())],
+            current_qn: 80,
+            pages_menu: Vec::new(),
+            current_cid: 2,
+            layout,
+            mount_tick: 1,
+            duration_secs: 256,
+            notice: None,
+            loading: false,
+            engine,
+            native: None,
+            stage: None,
+            comments: super::CommentsSnapshot::default(),
+            comment_cb: test_callbacks(),
+            on_open_video: super::Callback::new(|_: String| {}),
+            on_related_retry: noop_unit.clone(),
+            on_toggle: noop_unit.clone(),
+            on_seek: noop_f64.clone(),
+            on_volume: noop_f64,
+            on_volume_wheel: super::Callback::new(|_: i32| {}),
+            on_toggle_mute: noop_unit.clone(),
+            on_toggle_danmaku: noop_unit.clone(),
+            on_select_quality: super::Callback::new(|_: i64| {}),
+            on_select_page: super::Callback::new(|_: u64| {}),
+            on_enter_fullscreen: noop_unit,
+            related: super::RelatedPane::default(),
+            demo_override: None,
+        };
+        let transport = super::single_column_transport(&input, input.layout.page_margin_x());
+        let dbg = format!("{transport:?}");
+        assert!(dbg.contains("player-quality-selector"));
+        assert!(dbg.contains("1080P 高清"));
+        assert!(
+            !dbg.contains("画质"),
+            "竖屏模式视频页面播控条不得出现“画质”二字"
+        );
     }
 
     #[test]
@@ -3150,6 +3316,75 @@ mod tests {
         assert_ne!(comment_row_key(0, 2, 42), comment_row_key(1, 2, 42));
     }
 
+    /// composer 布局回归(v0.2.0 事故):容器必须是三列 Grid,输入框/发布钮
+    /// 带 Grid.Column 1/2;误挂垂直 StackPanel 时附加属性被静默忽略,头像/
+    /// 输入框/发布钮竖堆三行。notice 必须落第 2 行输入框列。
+    #[test]
+    fn composer_is_three_column_grid_with_notice_on_second_row() {
+        let mut cb = test_callbacks();
+        let plain = format!("{:?}", super::comment_composer(None, &cb, ""));
+        // 容器契约:根节点必须是 Grid,且不得混入 StackPanel(竖堆回归)。
+        assert!(
+            plain.starts_with("View(Declaration { kind: Grid,"),
+            "composer 容器必须是 Grid: {plain}"
+        );
+        assert!(
+            !plain.contains("StackPanel"),
+            "composer 不得退回 StackPanel(竖堆三行回归)"
+        );
+        // 三列 [Auto, Star, Auto]:输入框列必须弹性占满剩余宽。
+        assert!(plain.contains("id: GridColumns"), "必须声明三列");
+        assert!(plain.contains("Star(1.0)"), "输入框列必须为 Star 弹性列");
+        // 列号绑定到正确元素:TextBox 段落含 Grid.Column=1,Button 段落含 2。
+        let (_, rest) = plain
+            .split_once("kind: TextBox")
+            .expect("composer 应含输入框");
+        let (textbox_seg, button_seg) = rest
+            .split_once("kind: Button")
+            .expect("composer 应含发布钮");
+        assert!(
+            textbox_seg.contains("id: GridColumn, value: I32(1)"),
+            "输入框必须落第 2 列"
+        );
+        assert!(
+            button_seg.contains("id: GridColumn, value: I32(2)"),
+            "发布钮必须落第 3 列"
+        );
+        assert!(
+            !plain.contains("id: GridRow,"),
+            "无 notice 时不得出现第 2 行元素"
+        );
+        // 未登录:置灰 + 登录占位文案。
+        assert!(plain.contains("登录后即可发布评论"));
+        assert!(plain.contains("IsEnabled, value: Bool(false)"));
+
+        // notice 必须落第 2 行输入框列(Grid.Row=1 + Grid.Column=1)。
+        cb.composer_notice = Some("评论失败,请重试".into());
+        let noticed = format!("{:?}", super::comment_composer(None, &cb, ""));
+        let notice_seg = noticed
+            .rsplit_once("Declaration { kind: TextBlock")
+            .expect("notice 应为末尾 TextBlock")
+            .1;
+        assert!(
+            notice_seg.contains("id: GridRow, value: I32(1)"),
+            "notice 必须落第 2 行: {notice_seg}"
+        );
+        assert!(
+            notice_seg.contains("id: GridColumn, value: I32(1)"),
+            "notice 必须缩进到输入框列"
+        );
+        assert!(notice_seg.contains("评论失败,请重试"));
+
+        // 已登录:Accent 发布钮 + 友善占位文案,按钮不再置灰。
+        cb.composer_notice = None;
+        cb.can_post = true;
+        let posted = format!("{:?}", super::comment_composer(None, &cb, "草稿"));
+        assert!(posted.contains("发一条友善的评论…"));
+        assert!(posted.contains("ButtonStyle(Accent)"));
+        assert!(!posted.contains("IsEnabled, value: Bool(false)"));
+        assert!(posted.contains("Text, value: String(\"草稿\")"));
+    }
+
     #[test]
     fn related_row_keys_unique_per_row() {
         assert_ne!(related_row_key(0, "BV1"), related_row_key(1, "BV1"));
@@ -3180,6 +3415,81 @@ mod tests {
         assert_ne!(
             pane, clone,
             "rev 必须参与判等:封面回填/原位 push 依赖它触发换代"
+        );
+    }
+
+    #[test]
+    fn half_pane_input_tracks_native_and_stage_identity() {
+        let engine = super::VideoEngine::new();
+        let native = Arc::new(super::NativePlayer::new());
+        let stage = super::DanmakuStage::new();
+        let item = super::VideoItem {
+            bvid: "BV1GJ411x7h7".into(),
+            aid: 1,
+            cid: 2,
+            title: "test".into(),
+            author: "up".into(),
+            author_mid: 3,
+            author_face_url: None,
+            duration_secs: 60,
+            play_count: 10,
+            danmaku_count: 5,
+            like_count: None,
+            coin_count: None,
+            favorite_count: None,
+            share_count: None,
+            cover: None,
+            pic_url: None,
+        };
+        let noop_unit = super::Callback::new(|()| {});
+        let noop_f64 = super::Callback::new(|_: f64| {});
+        let base = super::HalfPaneInput {
+            item,
+            author_avatar: None,
+            my_avatar: None,
+            desc: None,
+            playing: true,
+            position: 0,
+            duration_secs: 60,
+            volume: 80,
+            danmaku_enabled: true,
+            mount_tick: 1,
+            width: 480.0,
+            max_width: 800.0,
+            max_height: 600.0,
+            notice: None,
+            loading: false,
+            engine,
+            native: None,
+            stage: None,
+            comments: super::CommentsSnapshot::default(),
+            comment_cb: test_callbacks(),
+            on_toggle: noop_unit.clone(),
+            on_seek: noop_f64.clone(),
+            on_volume: noop_f64.clone(),
+            on_volume_wheel: super::Callback::new(|_: i32| {}),
+            on_toggle_mute: noop_unit.clone(),
+            on_toggle_danmaku: noop_unit.clone(),
+            on_fullscreen: noop_unit.clone(),
+            on_expand: noop_unit.clone(),
+            on_close: noop_unit,
+            on_resize: noop_f64,
+        };
+        assert!(base == base.clone());
+
+        let with_native = super::HalfPaneInput {
+            native: Some(native),
+            ..base.clone()
+        };
+        assert!(base != with_native, "native 通道接入必须触发半窗表面重建");
+
+        let with_stage = super::HalfPaneInput {
+            stage: Some(stage),
+            ..with_native.clone()
+        };
+        assert!(
+            with_native != with_stage,
+            "stage 接入必须触发半窗弹幕透明层同步更新"
         );
     }
 }

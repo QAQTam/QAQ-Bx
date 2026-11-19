@@ -52,6 +52,8 @@ const MPD_CONTENT_TYPE: &str = "application/dash+xml";
 /// 面板重建换源的最小间隔:快速伸缩窗口会连续拆树/重建,每个节拍都重建既浪费
 /// 线程,也让管线反复开局。节流期内断点保持未消费,由后续节拍继续。
 const REBUILD_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1_500);
+/// `AdaptiveMediaSource::CreateFromStreamWithDownloaderAsync` 建源超时阈值。
+const BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 /// `CoInitializeEx` 的 COINIT_MULTITHREADED(与 `codec.rs` WIC 探测同一口径)。
 const COINIT_MULTITHREADED: u32 = 0;
 
@@ -59,12 +61,27 @@ const COINIT_MULTITHREADED: u32 = 0;
 #[derive(Debug, Clone, Default)]
 pub struct NativeStatus {
     pub playing: bool,
+    pub opening: bool,
+    pub buffering: bool,
+    pub paused: bool,
+    pub wants_play: bool,
+    pub media_opened: bool,
+    pub buffering_progress: f64,
     pub position_secs: f64,
     pub duration_secs: f64,
     pub finished: bool,
     /// 装载在途(工作线程正在建 MediaSource):UI 据此保持「加载中」遮罩。
     pub loading: bool,
     pub error: Option<String>,
+    /// 装载世代(`LoadLedger::begin` 同步自增;load() 返回即已落账)。UI 用
+    /// 「本次 load 的世代 && !loading」识别新会话已构建完成——loading 单独
+    /// 不可靠:快速建源时它在首个 UI 节拍前就可能翻回 false。
+    pub request_seq: u64,
+    /// 已被 UI 注入并接管的最近世代。
+    pub injected_seq: Option<u64>,
+    /// 当前视频流解码后的固有像素尺寸(0x0 表示尚未就绪或无视频轨)。
+    pub natural_video_width: u32,
+    pub natural_video_height: u32,
 }
 
 /// 事件 revoker 存活盒:WinRT 事件 revoker 内部 COM 指针 Agile 但未标 Send,
@@ -78,6 +95,7 @@ struct PendingSource {
     /// 该产物所属装载世代(与 `LoadLedger.built_seq` 一致)。
     seq: u64,
     source: windows::core::IUnknown,
+    keep: Vec<AgileBox>,
 }
 
 /// 一次装载的收尾结论(工作线程 → 引擎槽位)。
@@ -144,6 +162,9 @@ impl LoadLedger {
                 Finish::Failed
             }
             None => {
+                // 全新 MediaSource 尚未放入 pending 也未被任何 MediaPlayer 绑定,
+                // 若此前面板卸载落在在途建源期间,可直接由新面板认领该新产物。
+                self.awaiting_rebuild = false;
                 self.built_seq = Some(seq);
                 self.load_error = None;
                 let (autoplay, start_secs) = self.intent.unwrap_or((false, 0.0));
@@ -200,9 +221,29 @@ impl LoadLedger {
         if seq == self.request_seq { self.intent } else { None }
     }
 
-    /// 快照视图:在途 / 结束 / 生效错误(装载错误优先)。
-    fn view(&self) -> (bool, bool, Option<String>) {
-        (self.loading, self.finished, self.load_error.clone().or_else(|| self.media_error.clone()))
+    /// 快照视图:在途 / 结束 / 生效错误(装载错误优先) / 请求世代 / 已注入世代。
+    fn view(&self) -> (bool, bool, Option<String>, u64, Option<u64>) {
+        (
+            self.loading,
+            self.finished,
+            self.load_error.clone().or_else(|| self.media_error.clone()),
+            self.request_seq,
+            self.injected_seq,
+        )
+    }
+
+    /// 显式停播/切离 native 时复位账本并推进请求世代，令所有在途建源自动落为 Stale。
+    fn reset_stopped(&mut self) {
+        self.request_seq += 1;
+        self.intent = None;
+        self.built_seq = None;
+        self.injected_seq = None;
+        self.inflight_seq = None;
+        self.loading = false;
+        self.awaiting_rebuild = false;
+        self.load_error = None;
+        self.media_error = None;
+        self.finished = false;
     }
 
     /// 面板拆走:旧元素自持的 player 作废,标记「等重建换源」并撤回注入权。
@@ -248,15 +289,31 @@ pub struct NativePlayer {
     last_rebuild_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// 期望音量(0..=100 bits;attach 前设定也不丢,接管时统一施加)。
     volume: AtomicU64,
-    /// 事件 revoker / 已注入 MediaSource 保活。
-    _keep: std::sync::Mutex<Vec<AgileBox>>,
+    /// 最近接管世代(供 MediaOpened 异步回调识别是否对应当前 pending_seek)。
+    attached_seq: Arc<AtomicU64>,
+    /// 即将注入/已触发 MediaOpened 的世代（早于 attach_player 前写入，防首次回调竞态）。
+    opened_seq: Arc<AtomicU64>,
+    /// 正在领取等待 SetMediaSource 的世代。
+    claiming_seq: Arc<AtomicU64>,
+    /// 待在 MediaOpened 时兜底施加的断点位置(attach 时 session 可能尚未 Opened)。
+    pending_seek: Arc<std::sync::Mutex<Option<(u64, f64)>>>,
+    /// 当前生效 AdaptiveMediaSource 及 DownloadRequested revoker（切源/停播即释，O(1) 内存）。
+    active_keep: std::sync::Mutex<Vec<AgileBox>>,
     /// player 事件 revoker(面板卸载即释放 = 退订旧元素自持的 player)。
     event_keep: std::sync::Mutex<Vec<AgileBox>>,
     /// 用户侧播放意愿(Play/Pause 调用与装载意图写;面板重建续播以此为准,
     /// 不受「刚装载还没开播」的瞬时状态影响)。
-    want_play: AtomicBool,
+    want_play: Arc<AtomicBool>,
     /// 至少成功注入过一次(= 有画面可看)。
     loaded: AtomicBool,
+}
+
+fn seek_session(session: &MediaPlaybackSession, secs: f64) -> Result<(), String> {
+    session
+        .SetPosition(TimeSpan {
+            duration: (secs.max(0.0) * 10_000_000.0) as i64,
+        })
+        .map_err(|e| format!("Seek 失败:{e}"))
 }
 
 // fork 对 MediaPlayer/会话对象 unsafe impl Send/Sync(Media_Core feature),
@@ -281,9 +338,13 @@ impl NativePlayer {
             resume: std::sync::Mutex::new(None),
             last_rebuild_at: std::sync::Mutex::new(None),
             volume: AtomicU64::new(100.0f64.to_bits()),
-            _keep: std::sync::Mutex::new(Vec::new()),
+            attached_seq: Arc::new(AtomicU64::new(0)),
+            opened_seq: Arc::new(AtomicU64::new(0)),
+            claiming_seq: Arc::new(AtomicU64::new(0)),
+            pending_seek: Arc::new(std::sync::Mutex::new(None)),
+            active_keep: std::sync::Mutex::new(Vec::new()),
             event_keep: std::sync::Mutex::new(Vec::new()),
-            want_play: AtomicBool::new(false),
+            want_play: Arc::new(AtomicBool::new(false)),
             loaded: AtomicBool::new(false),
         }
     }
@@ -299,6 +360,7 @@ impl NativePlayer {
         let session = player
             .PlaybackSession()
             .map_err(|e| format!("PlaybackSession 获取失败:{e}"))?;
+        self.attached_seq.store(seq, Ordering::SeqCst);
         // MediaEnded / MediaFailed → 世代账本(仅订阅一次)。
         let subscribed = self
             .player
@@ -307,9 +369,41 @@ impl NativePlayer {
             .unwrap_or(false);
         if !subscribed {
             let ledger_ended = self.ledger.clone();
+            let opened_player = player.clone();
+            let opened_session = session.clone();
+            let opened_seq = self.attached_seq.clone();
+            let opened_claiming_seq = self.claiming_seq.clone();
+            let opened_seq_ack = self.opened_seq.clone();
+            let opened_seek = self.pending_seek.clone();
+            let opened_want_play = self.want_play.clone();
             let opened = player
                 .MediaOpened(move |_, _| {
-                    eprintln!("[qaq-bx-video] native media opened");
+                    let cur_seq = opened_seq
+                        .load(Ordering::SeqCst)
+                        .max(opened_claiming_seq.load(Ordering::SeqCst));
+                    if cur_seq > 0 {
+                        opened_seq_ack.store(cur_seq, Ordering::SeqCst);
+                    }
+                    let nw = opened_session.NaturalVideoWidth().unwrap_or(0);
+                    let nh = opened_session.NaturalVideoHeight().unwrap_or(0);
+                    eprintln!("[qaq-bx-video] native media opened (nat={nw}x{nh})");
+                    if let Ok(mut slot) = opened_seek.lock()
+                        && let Some((target_seq, target_secs)) = *slot
+                        && target_seq == opened_seq.load(Ordering::SeqCst)
+                    {
+                        *slot = None;
+                        let cur = opened_session
+                            .Position()
+                            .ok()
+                            .map(|t| t.duration as f64 / 10_000_000.0)
+                            .unwrap_or(0.0);
+                        if target_secs > 0.0 && cur < (target_secs - 1.0).max(0.5) {
+                            let _ = seek_session(&opened_session, target_secs);
+                        }
+                    }
+                    if opened_want_play.load(Ordering::SeqCst) {
+                        let _ = opened_player.Play();
+                    }
                 })
                 .map(|r| AgileBox(Box::new(r)));
             let ended = player
@@ -357,7 +451,7 @@ impl NativePlayer {
             }
         }
         *self.player.lock().unwrap_or_else(|e| e.into_inner()) = Some(player.clone());
-        *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
+        *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
         self.apply_volume(&player);
 
         // 注入的是最新产物 → 回放该世代的时序语义;过期世代的注入只做接管。
@@ -367,12 +461,31 @@ impl NativePlayer {
         };
         if let Some((autoplay, start_secs)) = intent {
             if start_secs > 0.0 {
-                let _ = self.seek(start_secs);
+                *self.pending_seek.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((seq, start_secs));
+                let _ = seek_session(&session, start_secs);
+            } else {
+                *self.pending_seek.lock().unwrap_or_else(|e| e.into_inner()) = None;
             }
             if autoplay {
                 let _ = player.Play();
             }
             self.loaded.store(true, Ordering::SeqCst);
+        }
+        // 新 MediaSource 已完成绑定：将其保活句柄切为当前 active_keep，淘汰上一条流的 AMS/revoker。
+        if let Some(pending_keep) = self
+            .pending
+            .lock()
+            .ok()
+            .and_then(|mut slot| {
+                if slot.as_ref().is_some_and(|p| p.seq == seq) {
+                    slot.take().map(|p| p.keep)
+                } else {
+                    None
+                }
+            })
+        {
+            *self.active_keep.lock().unwrap_or_else(|e| e.into_inner()) = pending_keep;
         }
         Ok(())
     }
@@ -388,6 +501,7 @@ impl NativePlayer {
             let mut ledger = self.ledger.lock().ok()?;
             ledger.claim()?
         };
+        self.claiming_seq.store(seq, Ordering::SeqCst);
         let slot = self.pending.lock().ok()?;
         let source = slot
             .as_ref()
@@ -397,6 +511,7 @@ impl NativePlayer {
             Some(source) => Some((seq, source)),
             None => {
                 // 槽位与世代不一致(理论上不该发生):放回注入权,别把它卡死。
+                self.claiming_seq.store(0, Ordering::SeqCst);
                 if let Ok(mut ledger) = self.ledger.lock() {
                     ledger.release(seq);
                 }
@@ -456,10 +571,13 @@ impl NativePlayer {
             let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
             ledger.begin(autoplay, start_secs)
         };
-        // 用户给了新的播放意图,旧的「面板重建续播」计划作废。
+        self.opened_seq.store(0, Ordering::SeqCst);
+        self.claiming_seq.store(0, Ordering::SeqCst);
+        // 用户给了新的播放意图,旧的「面板重建续播」及待补 seek 计划作废。
         if let Ok(mut slot) = self.resume.lock() {
             *slot = None;
         }
+        *self.pending_seek.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.last_request.lock().unwrap_or_else(|e| e.into_inner()) = Some(request.clone());
         // 旧媒体先静音:新产物注入前 MPE 仍在放上一首(换视频/换画质都会听到
         // 残留声轨)。
@@ -477,27 +595,34 @@ impl NativePlayer {
         self.spawn_build(request.mpd, request.video_base_url, request.audio_base_url, seq);
     }
 
-    /// 渲染面板卸载(NativeSurface 随视图树拆走):元素自持的 player/session
-    /// 一并作废(并退订其事件),记住断点(播放意愿 + 位置)等新面板挂载续播。
+    /// 渲染面板卸载(NativeSurface 随视图树拆走):暂停并作废旧元素自持的
+    /// player/session(并退订其事件),记住断点(播放意愿 + 位置)等新面板挂载续播。
     ///
     /// 关键约束:旧 MediaSource 已被那个作废的 player 绑走,**不能**给新元素复用
     /// (否则管线报 SourceNotSupported),所以这里只置「待续播」+「等换源」标记,
     /// 由 `remount_pending` 重新构建一份新产物。
     pub fn note_surface_detached(&self) {
-        let position = self
+        let old_player = self.player.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(player) = old_player {
+            // WinUI 3 MPE 离树不会自动 Pause MediaPlayer，必须显式暂停避免残留声音。
+            let _ = player.Pause();
+        }
+        let session_pos = self
             .session
             .lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().cloned())
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
             .and_then(|session| session.Position().ok())
-            .map(|t| t.duration as f64 / 10_000_000.0)
-            .unwrap_or(0.0);
-        *self.player.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *self.session.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            .map(|t| t.duration as f64 / 10_000_000.0);
+        self.attached_seq.store(0, Ordering::SeqCst);
+        *self.pending_seek.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // 账本:旧产物作废(不得再注入新元素),撤回在途注入权。
-        if let Ok(mut ledger) = self.ledger.lock() {
+        let intent_start = if let Ok(mut ledger) = self.ledger.lock() {
             ledger.note_rebuild();
-        }
+            ledger.intent.map(|(_, s)| s).unwrap_or(0.0)
+        } else {
+            0.0
+        };
         // 退订旧 player 事件(revoker Drop 即 remove;新元素会重新订阅)。
         if let Ok(mut keep) = self.event_keep.lock() {
             keep.clear();
@@ -509,12 +634,47 @@ impl NativePlayer {
             .unwrap_or(false);
         if resumable {
             let autoplay = self.want_play.load(Ordering::SeqCst);
-            if let Ok(mut slot) = self.resume.lock() {
-                *slot = Some((autoplay, position));
-            }
+            let mut slot = self.resume.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_pos = slot.map(|(_, p)| p).unwrap_or(0.0);
+            let position = match session_pos {
+                Some(p) if p > 0.0 => p,
+                Some(_) if prev_pos > 0.0 => prev_pos,
+                Some(p) => p,
+                None if prev_pos > 0.0 => prev_pos,
+                None => intent_start,
+            };
+            *slot = Some((autoplay, position));
             eprintln!(
                 "[qaq-bx-video] native surface detached: resume(autoplay={autoplay},pos={position:.1})"
             );
+        }
+    }
+
+    /// 显式停播/切离 native 通路:暂停并释放全部原生对象、断点与待装载请求。
+    pub fn stop(&self) {
+        self.want_play.store(false, Ordering::SeqCst);
+        self.loaded.store(false, Ordering::SeqCst);
+        self.attached_seq.store(0, Ordering::SeqCst);
+        self.opened_seq.store(0, Ordering::SeqCst);
+        self.claiming_seq.store(0, Ordering::SeqCst);
+        if let Some(player) = self.player.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = player.Pause();
+        }
+        *self.session.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.resume.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.last_request.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.pending_seek.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.active_keep
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.event_keep
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        if let Ok(mut ledger) = self.ledger.lock() {
+            ledger.reset_stopped();
         }
     }
 
@@ -556,6 +716,14 @@ impl NativePlayer {
         true
     }
 
+    /// 显式布局切换（如进入/退出全屏）清除重挂节流冷却，确保立即换源续播，
+    /// 同时保留快速缩放风暴期 1500ms 节流防护。
+    pub fn allow_immediate_remount(&self) {
+        if let Ok(mut slot) = self.last_rebuild_at.lock() {
+            *slot = None;
+        }
+    }
+
     pub fn play(&self) -> Result<(), String> {
         self.want_play.store(true, Ordering::SeqCst);
         if let Some(player) = self.player.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
@@ -573,13 +741,10 @@ impl NativePlayer {
     }
 
     pub fn seek(&self, secs: f64) -> Result<(), String> {
+        *self.pending_seek.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let session = self.session.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(session) = session {
-            session
-                .SetPosition(TimeSpan {
-                    duration: (secs * 10_000_000.0) as i64,
-                })
-                .map_err(|e| format!("Seek 失败:{e}"))?;
+            seek_session(&session, secs)?;
         }
         Ok(())
     }
@@ -598,16 +763,22 @@ impl NativePlayer {
     }
 
     pub fn status(&self) -> NativeStatus {
-        let (loading, finished, error) = {
+        let (loading, finished, error, request_seq, injected_seq) = {
             let ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
             ledger.view()
         };
+        let wants_play = self.want_play.load(Ordering::SeqCst);
+        let attached = self.attached_seq.load(Ordering::SeqCst);
+        let opened = self.opened_seq.load(Ordering::SeqCst);
         let session = self.session.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let Some(session) = session else {
             return NativeStatus {
+                wants_play,
                 loading,
                 finished,
                 error,
+                request_seq,
+                injected_seq,
                 ..NativeStatus::default()
             };
         };
@@ -622,13 +793,35 @@ impl NativePlayer {
             .ok()
             .map(|t| t.duration as f64 / 10_000_000.0)
             .unwrap_or(0.0);
+        let natural_video_width = session.NaturalVideoWidth().unwrap_or(0);
+        let natural_video_height = session.NaturalVideoHeight().unwrap_or(0);
+        let buffering_progress = session.BufferingProgress().unwrap_or(0.0);
+        let playing = state == Some(MediaPlaybackState::Playing);
+        let opening = state == Some(MediaPlaybackState::Opening);
+        let buffering = state == Some(MediaPlaybackState::Buffering);
+        let paused = state == Some(MediaPlaybackState::Paused);
+        let media_opened = (attached > 0 && opened == attached && attached == request_seq)
+            || playing
+            || paused
+            || natural_video_width > 0
+            || duration > 0.0;
         NativeStatus {
-            playing: state == Some(MediaPlaybackState::Playing),
+            playing,
+            opening,
+            buffering,
+            paused,
+            wants_play,
+            media_opened,
+            buffering_progress,
             position_secs: position,
             duration_secs: duration,
             finished,
             loading,
             error,
+            request_seq,
+            injected_seq,
+            natural_video_width,
+            natural_video_height,
         }
     }
 
@@ -675,7 +868,7 @@ impl NativePlayer {
 
     /// 工作线程产物回收:仅最新世代入 pending 槽;过期结果直接丢弃,
     /// 失败写入 ledger(经 `status()` 上报 shell)。
-    fn collect_build(&self, seq: u64, outcome: Result<MediaSource, String>) {
+    fn collect_build(&self, seq: u64, outcome: Result<(MediaSource, Vec<AgileBox>), String>) {
         let error = outcome.as_ref().err().cloned();
         let finish = {
             let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
@@ -689,10 +882,11 @@ impl NativePlayer {
                 // 错误文本已由 build_source / ledger 上报,此处不重复打印。
             }
             Finish::Ready { autoplay, start_secs } => {
-                let Ok(source) = outcome else { return };
+                let Ok((source, keep)) = outcome else { return };
                 *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingSource {
                     seq,
                     source: source.into(),
+                    keep,
                 });
                 eprintln!(
                     "[qaq-bx-video] native build_source ok(seq={seq},autoplay={autoplay},start={start_secs:.1})"
@@ -701,13 +895,14 @@ impl NativePlayer {
         }
     }
 
-    /// MPD → MediaSource 的产出体(阻塞 join;网络+解析在装载工作线程,不在 UI)。
+    /// MPD → MediaSource 的产出体(带超时与保活列表;网络+解析在装载工作线程,不在 UI)。
     fn build_source(
         &self,
         mpd: &str,
         video_base_url: &str,
         audio_base_url: Option<&str>,
-    ) -> Result<MediaSource, String> {
+    ) -> Result<(MediaSource, Vec<AgileBox>), String> {
+        let mut keep = Vec::with_capacity(2);
         // 1) 带 Referer 的 HttpClient(系统管线拉分段全走它)。
         let client = HttpClient::new().map_err(|e| format!("HttpClient 创建失败:{e}"))?;
         let headers = client
@@ -739,18 +934,29 @@ impl NativePlayer {
             .Seek(0)
             .map_err(|e| format!("MPD 流回卷失败:{e}"))?;
 
-        // 3) AdaptiveMediaSource(manifest URI = 视频 base_url,分段相对解析)。
+        // 3) AdaptiveMediaSource(manifest URI = 视频 base_url,分段相对解析;超时取消防止死等)。
         let manifest_uri = Uri::CreateUri(&HSTRING::from(video_base_url))
             .map_err(|e| format!("manifest Uri 构造失败:{e}"))?;
-        let creation =
+        let op =
             windows::Media::Streaming::Adaptive::AdaptiveMediaSource::CreateFromStreamWithDownloaderAsync(
                 &stream,
                 &manifest_uri,
                 &HSTRING::from(MPD_CONTENT_TYPE),
                 &client,
             )
-            .and_then(|op| op.join())
             .map_err(|e| format!("AdaptiveMediaSource 创建失败:{e}"))?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        op.when(move |res| {
+            let _ = tx.send(res);
+        })
+        .map_err(|e| format!("AdaptiveMediaSource 回调注册失败:{e}"))?;
+        let creation = match rx.recv_timeout(BUILD_TIMEOUT) {
+            Ok(res) => res.map_err(|e| format!("AdaptiveMediaSource 创建失败:{e}"))?,
+            Err(_) => {
+                let _ = op.Cancel();
+                return Err("AdaptiveMediaSource 构建超时".to_string());
+            }
+        };
         if creation
             .Status()
             .map_err(|e| format!("AMS status 读取失败:{e}"))?
@@ -780,18 +986,14 @@ impl NativePlayer {
                     let _ = result.SetResourceUri(&audio_uri);
                 }
             });
-            if let Ok(mut keep) = self._keep.lock() {
-                keep.push(AgileBox(Box::new(revoker)));
-            }
+            keep.push(AgileBox(Box::new(revoker)));
         }
 
         // 5) 产出 MediaSource(注入路径统一:UI 挂载节拍经 imperative 交给 MPE)。
         let media_source =
             MediaSource::CreateFromAdaptiveMediaSource(&ams).map_err(|e| format!("MediaSource 包装失败:{e}"))?;
-        if let Ok(mut keep) = self._keep.lock() {
-            keep.push(AgileBox(Box::new(ams)));
-        }
-        Ok(media_source)
+        keep.push(AgileBox(Box::new(ams)));
+        Ok((media_source, keep))
     }
 }
 
@@ -820,10 +1022,30 @@ mod tests {
         assert_eq!(l.pending_seq(), Some(1));
         assert_eq!(l.inject(1), Some((true, 0.0)));
         assert_eq!(l.pending_seq(), None, "注入后不应重复注入同世代");
-        assert!(!l.view().0, "注入完成不应仍在途");
-        assert_eq!(l.view().2, None);
+        let (loading, _, error, req_seq, injected_seq) = l.view();
+        assert!(!loading, "注入完成不应仍在途");
+        assert_eq!(error, None);
+        assert_eq!(req_seq, 1);
+        assert_eq!(injected_seq, Some(1));
     }
-
+    /// 装载世代暴露:view().3 必须与 begin() 返回值一致——UI 以
+    /// 「世代命中 && !loading」识别新会话构建完成并解除装载闸门
+    /// (loading 单独不可靠:快速建源时首个 UI 节拍前就可能翻回 false)。
+    #[test]
+    fn view_exposes_request_seq_for_load_gate() {
+        let ledger = ledger();
+        let mut l = ledger.lock().unwrap();
+        let seq = l.begin(true, 0.0);
+        assert_eq!(l.view().3, seq, "在途世代即当前世代");
+        assert!(l.view().0, "在途时 loading 必须为真");
+        let _ = l.finish(seq, None);
+        // 建源完成:世代不变、loading 翻 false——UI 闸门在此解除。
+        assert_eq!(l.view().3, seq);
+        assert!(!l.view().0);
+        let next = l.begin(false, 5.0);
+        assert_eq!(next, seq + 1, "下一次装载世代必须自增");
+        assert_eq!(l.view().3, next);
+    }
     /// 快速连点换画质:旧世代结果晚到必须丢弃,不能覆盖新请求,也不能清在途。
     #[test]
     fn stale_build_result_is_discarded_and_loading_kept() {
@@ -859,7 +1081,7 @@ mod tests {
             l.finish(seq, Some("MPD 解析失败".to_string())),
             Finish::Failed
         );
-        let (loading, _, error) = l.view();
+        let (loading, _, error, _, _) = l.view();
         assert!(!loading);
         assert_eq!(error.as_deref(), Some("MPD 解析失败"));
         assert_eq!(l.pending_seq(), None);
@@ -1041,5 +1263,106 @@ mod tests {
         let status = engine.status();
         assert!(!status.playing);
         assert_eq!(status.position_secs, 0.0);
+    }
+
+    /// 连续二次 detach(如快速进出全屏/双屏重建,第二次时 session 已 None)
+    /// 不得用 0.0 覆盖第一次记下的非零断点。
+    #[test]
+    fn double_detach_preserves_nonzero_resume_position() {
+        let engine = Arc::new(NativePlayer::new());
+        *engine.last_request.lock().unwrap() = Some(LoadRequest {
+            mpd: "<MPD/>".into(),
+            video_base_url: "https://invalid.invalid/v.mpd".into(),
+            audio_base_url: None,
+        });
+        *engine.resume.lock().unwrap() = Some((true, 42.5));
+        engine.want_play.store(true, Ordering::SeqCst);
+        engine.note_surface_detached();
+        assert_eq!(*engine.resume.lock().unwrap(), Some((true, 42.5)));
+    }
+
+    /// 1500ms 节流期后再次调用 remount_pending 能消费断点并清除 resume。
+    #[test]
+    fn remount_pending_consumes_resume_after_throttle_window() {
+        let engine = Arc::new(NativePlayer::new());
+        *engine.last_request.lock().unwrap() = Some(LoadRequest {
+            mpd: "<not-dash>".into(),
+            video_base_url: "https://invalid.invalid/v.mpd".into(),
+            audio_base_url: None,
+        });
+        *engine.resume.lock().unwrap() = Some((true, 12.0));
+        *engine.last_rebuild_at.lock().unwrap() = Some(std::time::Instant::now());
+        assert!(!engine.remount_pending(), "节流窗口内不得重装载");
+        assert!(engine.resume.lock().unwrap().is_some(), "节流期内断点应保留");
+        *engine.last_rebuild_at.lock().unwrap() =
+            Some(std::time::Instant::now() - REBUILD_MIN_INTERVAL - std::time::Duration::from_millis(50));
+        assert!(engine.remount_pending(), "冷却到期后必须消费断点重试");
+        assert!(engine.resume.lock().unwrap().is_none());
+    }
+
+    /// stop() 推进世代作废在途建源并清空断点/请求/待补 seek。
+    #[test]
+    fn stop_clears_resume_last_request_and_advances_ledger() {
+        let engine = Arc::new(NativePlayer::new());
+        let _ = engine.load("<not-dash>", "https://invalid.invalid/v.mpd", None, true, 5.0);
+        *engine.resume.lock().unwrap() = Some((true, 5.0));
+        *engine.pending_seek.lock().unwrap() = Some((1, 5.0));
+        let prev_seq = engine.status().request_seq;
+        engine.stop();
+        assert!(engine.resume.lock().unwrap().is_none());
+        assert!(engine.last_request.lock().unwrap().is_none());
+        assert!(engine.pending_seek.lock().unwrap().is_none());
+        assert!(!engine.want_play.load(Ordering::SeqCst));
+        let st = engine.status();
+        assert!(!st.loading);
+        assert!(st.request_seq > prev_seq);
+        assert_eq!(st.injected_seq, None);
+        engine.note_surface_detached();
+        assert!(engine.resume.lock().unwrap().is_none(), "停播后再卸载不得写回幽灵断点");
+    }
+
+    /// 全屏等显式布局切换清除重挂节流后，remount_pending 必须在冷却窗口内立即生效。
+    #[test]
+    fn allow_immediate_remount_bypasses_throttle_window() {
+        let engine = Arc::new(NativePlayer::new());
+        *engine.last_request.lock().unwrap() = Some(LoadRequest {
+            mpd: "<not-dash>".into(),
+            video_base_url: "https://invalid.invalid/v.mpd".into(),
+            audio_base_url: None,
+        });
+        *engine.resume.lock().unwrap() = Some((true, 21.0));
+        *engine.last_rebuild_at.lock().unwrap() = Some(std::time::Instant::now());
+        assert!(!engine.remount_pending(), "正常风暴期应受 1500ms 节流");
+
+        engine.allow_immediate_remount();
+        assert!(
+            engine.remount_pending(),
+            "allow_immediate_remount 后应立即放行续播"
+        );
+        assert!(engine.resume.lock().unwrap().is_none());
+    }
+
+    /// 建源在途时面板发生 detach：全新产出的 MediaSource 从未被旧元素绑定，
+    /// `finish` 必须允许新面板立即认领，而不是被 `awaiting_rebuild` 白白阻塞 1500ms。
+    #[test]
+    fn finish_clears_awaiting_rebuild_for_unclaimed_fresh_build() {
+        let ledger = ledger();
+        let mut l = ledger.lock().unwrap();
+        let seq = l.begin(true, 0.0);
+        // 面板在 build_source 仍在飞时卸载（此时 built_seq=None）
+        l.note_rebuild();
+        assert!(l.awaiting_rebuild);
+        assert_eq!(
+            l.finish(seq, None),
+            Finish::Ready {
+                autoplay: true,
+                start_secs: 0.0
+            }
+        );
+        assert!(
+            !l.awaiting_rebuild,
+            "刚完成且未绑定过任何 player 的全新 MediaSource 应可立即注入"
+        );
+        assert_eq!(l.pending_seq(), Some(seq));
     }
 }

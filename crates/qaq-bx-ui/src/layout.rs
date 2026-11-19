@@ -15,6 +15,8 @@ pub const COMPACT_CONTENT_BREAKPOINT: f64 = 600.0;
 /// 渲染 2 列即切入真 Mobile 形态的精确断点（桌面 36px 边距下 3 列下限 `56+72+236*3+24 = 860.0`）。
 pub const MOBILE_BREAKPOINT: f64 = 860.0;
 pub const EXPANDED_BREAKPOINT: f64 = 860.0;
+/// 竖屏模式（实验）客户区宽度上限：底栏出现边界 − 1 DIP，严格锁定在 Mobile 宽度带 `[390, 859]`。
+pub const PORTRAIT_MAX_WIDTH_DIPS: f64 = MOBILE_BREAKPOINT - 1.0;
 
 /// 默认桌面窗口尺寸。
 pub const DEFAULT_WINDOW_WIDTH: f64 = 1280.0;
@@ -190,17 +192,35 @@ impl Default for ViewportLayout {
 
 impl ViewportLayout {
     pub fn from_window_size(width: f64, height: f64) -> Self {
-        let win_w = if width.is_finite() && width > 0.0 {
-            width.max(MIN_WINDOW_WIDTH)
+        Self::for_window(width, height, false)
+    }
+
+    pub fn for_window(width: f64, height: f64, portrait_mode: bool) -> Self {
+        let default_w = if portrait_mode {
+            PORTRAIT_MAX_WIDTH_DIPS
         } else {
             DEFAULT_WINDOW_WIDTH
+        };
+        let raw_w = if width.is_finite() && width > 0.0 {
+            width.max(MIN_WINDOW_WIDTH)
+        } else {
+            default_w
+        };
+        let win_w = if portrait_mode {
+            raw_w.min(PORTRAIT_MAX_WIDTH_DIPS)
+        } else {
+            raw_w
         };
         let win_h = if height.is_finite() && height > 0.0 {
             height.max(MIN_WINDOW_HEIGHT)
         } else {
             DEFAULT_WINDOW_HEIGHT
         };
-        let chrome = ShellChromeMode::from_width(win_w);
+        let chrome = if portrait_mode {
+            ShellChromeMode::Mobile
+        } else {
+            ShellChromeMode::from_width(win_w)
+        };
         let tier = ContentLayoutTier::from_width(win_w);
         let side_pad = if chrome.is_mobile() {
             0.0
@@ -216,6 +236,15 @@ impl ViewportLayout {
             tier,
             cards,
         }
+    }
+
+    pub fn initial(portrait_mode: bool) -> Self {
+        let w = if portrait_mode {
+            PORTRAIT_MAX_WIDTH_DIPS
+        } else {
+            DEFAULT_WINDOW_WIDTH
+        };
+        Self::for_window(w, DEFAULT_WINDOW_HEIGHT, portrait_mode)
     }
 
     pub fn is_mobile(self) -> bool {
@@ -448,6 +477,33 @@ mod tests {
                     < m.card_width + m.gap,
                 "{width}: 行尾空白超过一张卡(定宽回归)"
             );
+        }
+    }
+
+    #[test]
+    fn portrait_mode_strictly_clamps_to_mobile_band_across_all_widths() {
+        let init = ViewportLayout::initial(true);
+        assert_eq!(init.window_width, PORTRAIT_MAX_WIDTH_DIPS);
+        assert_eq!(init.chrome, ShellChromeMode::Mobile);
+        assert_eq!(init.tier, ContentLayoutTier::Medium);
+        assert_eq!(init.cards.cols, 2);
+        assert!(init.cards.compact_card);
+        assert!(init.is_mobile());
+        assert!(init.is_single_column());
+        assert!(!init.shows_inline_title_search());
+
+        for width in [0.0, f64::NAN, 320.0, 390.0, 640.0, 859.0, 860.0, 1280.0, 1920.0, 3840.0] {
+            let l = ViewportLayout::for_window(width, 1080.0, true);
+            assert!(
+                l.window_width >= MIN_WINDOW_WIDTH && l.window_width <= PORTRAIT_MAX_WIDTH_DIPS,
+                "width={width}: portrait window_width 越界 {}",
+                l.window_width
+            );
+            assert_eq!(l.chrome, ShellChromeMode::Mobile, "width={width}: 必须恒为 Mobile");
+            assert_ne!(l.tier, ContentLayoutTier::Expanded, "width={width}: 严禁进入 Expanded");
+            assert_eq!(l.cards.cols, 2, "width={width}: 竖屏卡片列数必须恒为 2");
+            assert!(l.cards.compact_card, "width={width}: 竖屏必须恒为紧凑卡");
+            assert!(!l.shows_inline_title_search(), "width={width}: 竖屏严禁出现桌面内嵌搜索框");
         }
     }
 }

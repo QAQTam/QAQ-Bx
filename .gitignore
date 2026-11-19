@@ -6,6 +6,8 @@
 /data
 # QAQHarness 工作目录(解包 APK/CDP 研究素材/截图,含 secrets/)
 .qaqh/
+# codegraph 本地代码索引(工具产物)
+.codegraph/
 
 # AppX 打包产物与自签名私钥
 /package/

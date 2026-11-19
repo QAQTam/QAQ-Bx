@@ -270,6 +270,28 @@ pub fn settings_page(
             }
         }
     };
+    let on_prefer_official_cdn = {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |on: bool| {
+            if on != base.prefer_official_cdn {
+                let mut next = base.clone();
+                next.prefer_official_cdn = on;
+                cb.call(next);
+            }
+        }
+    };
+    let on_multi_thread_preload = {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |on: bool| {
+            if on != base.multi_thread_preload {
+                let mut next = base.clone();
+                next.multi_thread_preload = on;
+                cb.call(next);
+            }
+        }
+    };
 
     let card_padding = if layout.is_mobile() { 16.0 } else { 24.0 };
     let card = |content: StackPanel| {
@@ -317,6 +339,20 @@ pub fn settings_page(
                 .off_content("关")
                 .is_on(settings.hardware_decode)
                 .on_toggled(on_hardware),
+            ToggleSwitch::new()
+                .header("优先官方 CDN")
+                .automation_id("settings-prefer-official-cdn")
+                .on_content("开")
+                .off_content("关")
+                .is_on(settings.prefer_official_cdn)
+                .on_toggled(on_prefer_official_cdn),
+            ToggleSwitch::new()
+                .header("多线程并发预加载")
+                .automation_id("settings-multi-thread-preload")
+                .on_content("开")
+                .off_content("关")
+                .is_on(settings.multi_thread_preload)
+                .on_toggled(on_multi_thread_preload),
         )),
     )
     .grid_column(0);
@@ -465,7 +501,9 @@ pub fn settings_page(
     } else {
         Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
+            .rows([GridLength::Auto, GridLength::Auto])
             .column_spacing(20.0)
+            .row_spacing(20.0)
             .children((
                 playback_card,
                 danmaku_card.grid_column(1),

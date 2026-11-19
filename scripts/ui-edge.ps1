@@ -57,8 +57,8 @@ public static class UiEdgeNative {
 "@
 try { [void][UiEdgeNative]::SetProcessDpiAwarenessContext([IntPtr](-4)) } catch {}
 
-function Capture-WindowFrame {
-    param([IntPtr]$Hwnd, [string]$FileName, [string]$Mode = "print")
+function Grab-WindowBitmap {
+    param([IntPtr]$Hwnd, [string]$Mode = "print")
     $rect = New-Object UiEdgeNative+RECT
     [void][UiEdgeNative]::GetWindowRect($Hwnd, [ref]$rect)
     $w = [Math]::Max(1, $rect.Right - $rect.Left)
@@ -66,14 +66,13 @@ function Capture-WindowFrame {
     $bmp = New-Object System.Drawing.Bitmap($w, $h)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     if ($Mode -eq "screen") {
-        # 屏幕直捕(MPE/DComp 视频层 PrintWindow 拍不到;需窗口已 TOPMOST)。
+        # 屏幕直捕(需窗口已 TOPMOST)。
         $g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, (New-Object System.Drawing.Size($w, $h)))
     } else {
         try {
             $hdc = $g.GetHdc()
             try {
-                # PW_RENDERFULLCONTENT(2):WinUI3/DComp 窗口直捕,免 TOPMOST/前台竞争;
-                # 失败再退 flag 0。
+                # PW_RENDERFULLCONTENT(2):WinUI3/DComp 窗口直捕,免 TOPMOST/前台竞争;失败退 flag 0。
                 if (-not [UiEdgeNative]::PrintWindow($Hwnd, $hdc, 2)) {
                     [void][UiEdgeNative]::PrintWindow($Hwnd, $hdc, 0)
                 }
@@ -86,10 +85,56 @@ function Capture-WindowFrame {
         }
     }
     $g.Dispose()
+    return $bmp
+}
+
+function Capture-WindowFrame {
+    param([IntPtr]$Hwnd, [string]$FileName, [string]$Mode = "print")
+    $bmp = Grab-WindowBitmap -Hwnd $Hwnd -Mode $Mode
     $path = Join-Path $FramesDir $FileName
-    $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
-    $bmp.Dispose()
+    try {
+        $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+    } finally {
+        $bmp.Dispose()
+    }
     Write-Host "[shot] $path" -ForegroundColor DarkCyan
+}
+
+function Measure-ImageRegionStats {
+    param([string]$File, [double]$X0, [double]$Y0, [double]$X1, [double]$Y1)
+    $bmp = New-Object System.Drawing.Bitmap($File)
+    try {
+        $x0 = [Math]::Min([Math]::Max([int]($bmp.Width * $X0), 0), [Math]::Max(0, $bmp.Width - 1))
+        $y0 = [Math]::Min([Math]::Max([int]($bmp.Height * $Y0), 0), [Math]::Max(0, $bmp.Height - 1))
+        $x1 = [Math]::Min([Math]::Max([int]($bmp.Width * $X1), $x0 + 1), $bmp.Width)
+        $y1 = [Math]::Min([Math]::Max([int]($bmp.Height * $Y1), $y0 + 1), $bmp.Height)
+        $sum = 0.0
+        $sumSq = 0.0
+        $n = 0
+        for ($y = $y0; $y -lt $y1; $y += 12) {
+            for ($x = $x0; $x -lt $x1; $x += 12) {
+                $p = $bmp.GetPixel($x, $y)
+                $v = ($p.R + $p.G + $p.B) / 3.0
+                $sum += $v
+                $sumSq += ($v * $v)
+                $n++
+            }
+        }
+        $cnt = [Math]::Max(1, $n)
+        $mean = $sum / $cnt
+        $variance = [Math]::Max(0.0, ($sumSq / $cnt) - ($mean * $mean))
+        return @{
+            Mean   = [Math]::Round($mean, 1)
+            StdDev = [Math]::Round([Math]::Sqrt($variance), 1)
+        }
+    } finally {
+        $bmp.Dispose()
+    }
+}
+
+function Measure-ImageRegionLuma {
+    param([string]$File, [double]$X0, [double]$Y0, [double]$X1, [double]$Y1)
+    return (Measure-ImageRegionStats -File $File -X0 $X0 -Y0 $Y0 -X1 $X1 -Y1 $Y1).Mean
 }
 
 function Click-Fast {
@@ -510,8 +555,8 @@ try {
         $x0 = [int]($bmp.Width * $X0); $y0 = [int]($bmp.Height * $Y0)
         $x1 = [int]($bmp.Width * $X1); $y1 = [int]($bmp.Height * $Y1)
         $sum = 0.0; $n = 0
-        for ($y = $y0; $y -lt $y1; $y += 4) {
-            for ($x = $x0; $x -lt $x1; $x += 4) {
+        for ($y = $y0; $y -lt $y1; $y += 12) {
+            for ($x = $x0; $x -lt $x1; $x += 12) {
                 $p = $bmp.GetPixel($x, $y)
                 $sum += ($p.R + $p.G + $p.B) / 3.0; $n++
             }
@@ -562,7 +607,7 @@ try {
     [void][UiEdgeNative]::GetWindowRect($hwnd, [ref]$rect)
     $baseW = $rect.Right - $rect.Left; $baseH = $rect.Bottom - $rect.Top
     $baseX = $rect.Left; $baseY = $rect.Top
-    Capture-WindowFrame -Hwnd $hwnd -Mode screen -FileName "e12-0-native-playing.png"
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e12-0-native-playing.png"
 
     Write-Host "[E12] rapid resize loop..." -ForegroundColor Cyan
     for ($i = 1; $i -le 30; $i++) {
@@ -576,28 +621,21 @@ try {
     }
     [void][UiEdgeNative]::SetWindowPos($hwnd, [IntPtr](-1), 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0010)
     Start-Sleep -Milliseconds 800
-    Capture-WindowFrame -Hwnd $hwnd -Mode screen -FileName "e12-1-after-resize-800ms.png"
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e12-1-after-resize-800ms.png"
     Start-Sleep -Milliseconds 2500
-    Capture-WindowFrame -Hwnd $hwnd -Mode screen -FileName "e12-2-after-resize-3300ms.png"
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e12-2-after-resize-3300ms.png"
+    Start-Sleep -Milliseconds 3000
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e12-3-after-resize-6300ms.png"
 
-    function Test-RegionBlackNative {
-        param([string]$File, [double]$X0, [double]$Y0, [double]$X1, [double]$Y1)
-        $bmp = New-Object System.Drawing.Bitmap($File)
-        $x0 = [int]($bmp.Width * $X0); $y0 = [int]($bmp.Height * $Y0)
-        $x1 = [int]($bmp.Width * $X1); $y1 = [int]($bmp.Height * $Y1)
-        $sum = 0.0; $n = 0
-        for ($y = $y0; $y -lt $y1; $y += 4) {
-            for ($x = $x0; $x -lt $x1; $x += 4) {
-                $p = $bmp.GetPixel($x, $y)
-                $sum += ($p.R + $p.G + $p.B) / 3.0; $n++
-            }
-        }
-        $bmp.Dispose()
-        return [Math]::Round($sum / [Math]::Max(1, $n), 1)
+    $e12PostStats = @{ Mean = 0.0; StdDev = 0.0 }
+    foreach ($f in @("e12-0-native-playing.png","e12-1-after-resize-800ms.png","e12-2-after-resize-3300ms.png","e12-3-after-resize-6300ms.png")) {
+        $st = Measure-ImageRegionStats -File (Join-Path $FramesDir $f) -X0 0.10 -Y0 0.10 -X1 0.50 -Y1 0.45
+        if ($f -eq "e12-3-after-resize-6300ms.png") { $e12PostStats = $st }
+        Write-Host "[E12] $f video-region mean=$($st.Mean) stddev=$($st.StdDev)" -ForegroundColor $(if ($st.Mean -le 15 -or $st.StdDev -lt 6) { "Red" } else { "Green" })
     }
-    foreach ($f in @("e12-0-native-playing.png","e12-1-after-resize-800ms.png","e12-2-after-resize-3300ms.png")) {
-        $lum = Test-RegionBlackNative -File (Join-Path $FramesDir $f) -X0 0.10 -Y0 0.10 -X1 0.50 -Y1 0.45
-        Write-Host "[E12] $f video-region mean luminance = $lum" -ForegroundColor $(if ($lum -lt 12) { "Red" } else { "Green" })
+    if ($e12PostStats.Mean -le 15 -or $e12PostStats.StdDev -lt 6) {
+        Write-Host "[E12] FAIL: 快速缩放稳定后画面异常/纯色 (mean=$($e12PostStats.Mean) stddev=$($e12PostStats.StdDev))" -ForegroundColor Red
+        $global:E12Fail = $true
     }
 
     $proc.Refresh()
@@ -789,6 +827,7 @@ function Select-UiaEngineItem {
     Write-Host "[uia] 选中播放引擎项: '$($pick.Current.Name)'" -ForegroundColor DarkCyan
     $pick.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     return $true
+}
 
 # ---------- 场景 E14：拖框风暴 UI 线程量化（RESIZE-STORM 计数器 + CPU 峰值 + 亮度回归） ----------
 # 量化拖框期 UI 线程节拍：快速伸缩(30×55ms,复用 E11 节奏)+ 慢速 ±40px 往返(模拟人手拖框)。
@@ -860,8 +899,8 @@ try {
         $x0 = [int]($bmp.Width * $X0); $y0 = [int]($bmp.Height * $Y0)
         $x1 = [int]($bmp.Width * $X1); $y1 = [int]($bmp.Height * $Y1)
         $sum = 0.0; $n = 0
-        for ($y = $y0; $y -lt $y1; $y += 4) {
-            for ($x = $x0; $x -lt $x1; $x += 4) {
+        for ($y = $y0; $y -lt $y1; $y += 12) {
+            for ($x = $x0; $x -lt $x1; $x += 12) {
                 $p = $bmp.GetPixel($x, $y)
                 $sum += ($p.R + $p.G + $p.B) / 3.0; $n++
             }
@@ -920,6 +959,12 @@ function Get-WindowGeometry {
 
 function Find-PlayerFullscreenButton {
     param([System.Windows.Automation.AutomationElement]$Root)
+    $condId = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+        "player-enter-fullscreen"
+    )
+    $byId = $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condId)
+    if ($byId) { return $byId }
     $condBtn = New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
         [System.Windows.Automation.ControlType]::Button
@@ -928,6 +973,22 @@ function Find-PlayerFullscreenButton {
     for ($i = 0; $i -lt $btns.Count; $i++) {
         if ($btns[$i].Current.Name -eq "右下角小窗" -and ($i + 1) -lt $btns.Count) {
             return $btns[$i + 1]
+        }
+    }
+    return $null
+}
+
+function Find-DesktopPipButton {
+    param([System.Windows.Automation.AutomationElement]$Root)
+    $condBtn = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Button
+    )
+    $btns = $Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condBtn)
+    for ($i = 0; $i -lt $btns.Count; $i++) {
+        $n = $btns[$i].Current.Name
+        if ($n -eq "右下角小窗" -or $n -eq "小窗" -or $n -eq "还原主窗" -or $n -eq "主窗") {
+            return $btns[$i]
         }
     }
     return $null
@@ -961,107 +1022,165 @@ function Assert-FullscreenBounds {
     }
 }
 
-# ---------- 场景 E10：全屏播放（按钮进入 / 退出恢复 / HUD 自隐 / 快捷键与双击） ----------
+# ---------- 场景 E10：全屏播放（native + mpv 双引擎：按钮进入 / 像素验收 / 退出恢复 / HUD 自隐 / 快捷键与双击） ----------
 if (Should-RunScenario "E10") {
-Write-Host "[E10] 全屏播放与退出走查（点击按钮 + 恢复尺寸 + HUD 自动隐藏 + 快捷键/双击）" -ForegroundColor Cyan
-$env:QAQ_BX_VIDEO = "BV1GJ411x7h7"
-$proc = $null
-try {
-    $proc = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -PassThru
-    $hwnd = Wait-MainWindow $proc
-    $interactive = $false
-    for ($i = 0; $i -lt 5 -and -not $interactive; $i++) {
-        if ([UiEdgeNative]::GetForegroundWindow() -eq $hwnd) { $interactive = $true; break }
-        [UiEdgeNative]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
-        [UiEdgeNative]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
-        [void][UiEdgeNative]::SetForegroundWindow($hwnd)
-        Start-Sleep -Milliseconds 250
-    }
-    if (-not $interactive) {
-        Write-Host "[E10] 注意：桌面不可抢焦点（可能已锁屏），将使用 UIAutomation InvokePattern 完成全屏点击校验" -ForegroundColor Yellow
-    }
-    Start-Sleep -Milliseconds 4200 # 等待媒体解析与首帧呈现
-
-    $orig = Get-WindowGeometry -Hwnd $hwnd
-    Capture-WindowFrame -Hwnd $hwnd -FileName "e17-before-fullscreen.png"
-
-    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
-    $fsBtn = Find-PlayerFullscreenButton -Root $root
-    if (-not $fsBtn) { throw "E10 FAIL: 播放页未定位到全屏按钮" }
-
-    # 1. 点击播放页桌面播控条全屏按钮进入无边框全屏，并在 HUD 自隐前捕获 e18 与退出按钮
-    $fsBtn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-    Start-Sleep -Milliseconds 500
-    Assert-FullscreenBounds -Hwnd $hwnd -StepName "进入全屏"
-    $exitBtn = Find-HudExitButton -Root $root
-    if (-not $exitBtn) { throw "E10 FAIL: 进入全屏后顶部 HUD 未展示 [退出全屏] 按钮" }
-    Capture-WindowFrame -Hwnd $hwnd -FileName "e18-fullscreen-hud.png"
-
-    # 2. 退出全屏并校验窗口/客户区尺寸恢复（交互桌面测 Esc 键，锁屏桌面测 UIA 点击“退出全屏”）
-    if ($interactive) {
-        [UiEdgeNative]::keybd_event(0x1B, 0, 0, [UIntPtr]::Zero)
-        Start-Sleep -Milliseconds 40
-        [UiEdgeNative]::keybd_event(0x1B, 0, 2, [UIntPtr]::Zero)
-    } else {
-        $exitBtn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-    }
-    Start-Sleep -Milliseconds 800
-    $rest = Get-WindowGeometry -Hwnd $hwnd
-    if ([Math]::Abs($rest.W - $orig.W) -gt 24 -or [Math]::Abs($rest.H - $orig.H) -gt 24 -or [Math]::Abs($rest.CW - $orig.CW) -gt 24) {
-        throw "E10 FAIL: 退出全屏后窗口尺寸未恢复 (期望 outer=$($orig.W)x$($orig.H) client=$($orig.CW)x$($orig.CH), 实际 outer=$($rest.W)x$($rest.H) client=$($rest.CW)x$($rest.CH))"
-    }
-    Capture-WindowFrame -Hwnd $hwnd -FileName "e20-after-fullscreen-restore.png"
-
-    # 3. 再次进入全屏（交互桌面测双击画面；锁屏桌面测 UIA 点击），静置 >3.6s 验证 HUD 自动隐藏
-    if ($interactive) {
-        $dpi = [Math]::Max(96, [int][UiEdgeNative]::GetDpiForWindow($hwnd))
-        $scale = $dpi / 96.0
-        $videoX = $rest.X + [int](380.0 * $scale)
-        $videoY = $rest.Y + [int](260.0 * $scale)
-        Click-Fast -X $videoX -Y $videoY
-        Start-Sleep -Milliseconds 80
-        Click-Fast -X $videoX -Y $videoY
-    } else {
-        $fsBtn2 = Find-PlayerFullscreenButton -Root $root
-        if (-not $fsBtn2) { throw "E10 FAIL: 退出全屏恢复后播放页全屏按钮缺失" }
-        $fsBtn2.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-    }
-    Start-Sleep -Milliseconds 700
-    Assert-FullscreenBounds -Hwnd $hwnd -StepName "二次进入全屏"
-
-    Start-Sleep -Milliseconds 3600
-    $condBtn = New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-        [System.Windows.Automation.ControlType]::Button
-    )
-    $btnsHidden = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condBtn)
-    $visBtns = 0
-    foreach ($b in $btnsHidden) {
-        $r = $b.Current.BoundingRectangle
-        if (-not ([double]::IsInfinity($r.X) -or [double]::IsNaN($r.X))) { $visBtns++ }
-    }
-    if ($visBtns -ne 0) {
-        throw "E10 FAIL: 全屏静置后 HUD 未自动隐藏 (可见按钮数=$visBtns)"
-    }
-    Capture-WindowFrame -Hwnd $hwnd -FileName "e19-fullscreen-autohide.png"
-
-    # 4. 交互桌面下追加验证 F 键退出全屏恢复
-    if ($interactive) {
-        [UiEdgeNative]::keybd_event(0x46, 0, 0, [UIntPtr]::Zero)
-        Start-Sleep -Milliseconds 40
-        [UiEdgeNative]::keybd_event(0x46, 0, 2, [UIntPtr]::Zero)
-        Start-Sleep -Milliseconds 800
-        $rest2 = Get-WindowGeometry -Hwnd $hwnd
-        if ([Math]::Abs($rest2.W - $orig.W) -gt 24 -or [Math]::Abs($rest2.H - $orig.H) -gt 24) {
-            throw "E10 FAIL: F 键退出全屏后窗口尺寸未恢复 ($($rest2.W)x$($rest2.H) vs $($orig.W)x$($orig.H))"
+Write-Host "[E10] 全屏播放与退出走查（native + mpv 双引擎 + PrintWindow 像素验收）" -ForegroundColor Cyan
+foreach ($mode in @(
+    @{ Tag = "native"; EnvVal = "1"; WarmupMs = 5500; EnterWaitMs = 1900; RestoreWaitMs = 2200 },
+    @{ Tag = "mpv";    EnvVal = "0"; WarmupMs = 4200; EnterWaitMs = 700;  RestoreWaitMs = 1000 }
+)) {
+    $tag = $mode.Tag
+    Write-Host "[E10-$tag] 启动 QAQ_BX_NATIVE=$($mode.EnvVal)..." -ForegroundColor Cyan
+    $env:QAQ_BX_VIDEO = "BV1GJ411x7h7"
+    $env:QAQ_BX_NATIVE = $mode.EnvVal
+    $proc = $null
+    try {
+        $proc = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -PassThru
+        $hwnd = Wait-MainWindow $proc
+        $interactive = $false
+        for ($i = 0; $i -lt 5 -and -not $interactive; $i++) {
+            if ([UiEdgeNative]::GetForegroundWindow() -eq $hwnd) { $interactive = $true; break }
+            [UiEdgeNative]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+            [UiEdgeNative]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+            [void][UiEdgeNative]::SetForegroundWindow($hwnd)
+            Start-Sleep -Milliseconds 250
         }
-    }
+        if (-not $interactive) {
+            Write-Host "[E10-$tag] 注意：桌面不可抢焦点（可能已锁屏），将使用 UIAutomation InvokePattern 完成全屏点击校验" -ForegroundColor Yellow
+        }
+        Start-Sleep -Milliseconds $mode.WarmupMs # 等待媒体解析与首帧呈现
 
-    $proc.Refresh()
-    if ($proc.HasExited) { throw "全屏走查后进程意外退出 ($($proc.ExitCode))" }
-} finally {
-    Remove-Item Env:QAQ_BX_VIDEO -ErrorAction SilentlyContinue
-    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+        $orig = Get-WindowGeometry -Hwnd $hwnd
+        Capture-WindowFrame -Hwnd $hwnd -FileName "e17-before-fullscreen-$tag.png"
+        $beforeSt = Measure-ImageRegionStats -File (Join-Path $FramesDir "e17-before-fullscreen-$tag.png") -X0 0.10 -Y0 0.12 -X1 0.50 -Y1 0.46
+        Write-Host "[E10-$tag] before-fullscreen video mean=$($beforeSt.Mean) stddev=$($beforeSt.StdDev)" -ForegroundColor DarkCyan
+        if ($beforeSt.Mean -le 15 -or $beforeSt.StdDev -lt 6) {
+            throw "E10-$tag FAIL: 进入全屏前视频区域无有效画面 (mean=$($beforeSt.Mean) stddev=$($beforeSt.StdDev))"
+        }
+
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+        $fsBtn = Find-PlayerFullscreenButton -Root $root
+        if (-not $fsBtn) { throw "E10-$tag FAIL: 播放页未定位到全屏按钮" }
+
+        # 1. 点击播放页桌面播控条全屏按钮进入无边框全屏；先高速 Blit 到内存 Bitmap 并立刻点退出（仅 ~50ms，避开 3s HUD 自动隐藏），之后再 PNG 落盘并测亮
+        $fsBtn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+        Start-Sleep -Milliseconds $mode.EnterWaitMs
+        Assert-FullscreenBounds -Hwnd $hwnd -StepName "$tag 进入全屏"
+        $exitBtn = Find-HudExitButton -Root $root
+        if (-not $exitBtn) { throw "E10-$tag FAIL: 进入全屏后顶部 HUD 未展示 [退出全屏] 按钮" }
+        $fsBmp = Grab-WindowBitmap -Hwnd $hwnd
+
+        # 2. 退出全屏（紧跟内存抓帧触发，远离 3s HUD 隐藏与 PNG 编码延迟）
+        if ($interactive) {
+            [UiEdgeNative]::keybd_event(0x1B, 0, 0, [UIntPtr]::Zero)
+            Start-Sleep -Milliseconds 40
+            [UiEdgeNative]::keybd_event(0x1B, 0, 2, [UIntPtr]::Zero)
+        } else {
+            $exited = $false
+            try {
+                $exitBtn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+                $exited = $true
+            } catch {}
+            for ($attempt = 0; $attempt -lt 3 -and -not $exited; $attempt++) {
+                Start-Sleep -Milliseconds 60
+                $exitBtnNow = Find-HudExitButton -Root $root
+                if ($exitBtnNow) {
+                    try {
+                        $exitBtnNow.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+                        $exited = $true
+                        break
+                    } catch {}
+                }
+            }
+            if (-not $exited) {
+                $exitFallback = Find-HudExitButton -Root $root
+                if (-not $exitFallback -or -not (Invoke-UiaElement -Element $exitFallback -What "退出全屏")) {
+                    $fsBmp.Dispose()
+                    throw "E10-$tag FAIL: 无法触发 [退出全屏] 按钮"
+                }
+            }
+        }
+        $fsHudPath = Join-Path $FramesDir "e18-fullscreen-hud-$tag.png"
+        try {
+            $fsBmp.Save($fsHudPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        } finally {
+            $fsBmp.Dispose()
+        }
+        Write-Host "[shot] $fsHudPath" -ForegroundColor DarkCyan
+        $fsHudSt = Measure-ImageRegionStats -File $fsHudPath -X0 0.20 -Y0 0.20 -X1 0.80 -Y1 0.80
+        Write-Host "[E10-$tag] fullscreen HUD mean=$($fsHudSt.Mean) stddev=$($fsHudSt.StdDev)" -ForegroundColor $(if ($fsHudSt.Mean -le 15 -or $fsHudSt.StdDev -lt 6) { "Red" } else { "Green" })
+        if ($fsHudSt.Mean -le 15 -or $fsHudSt.StdDev -lt 6) {
+            throw "E10-$tag FAIL: 全屏状态中心区域无有效画面 (mean=$($fsHudSt.Mean) stddev=$($fsHudSt.StdDev))"
+        }
+        Start-Sleep -Milliseconds $mode.RestoreWaitMs
+        $rest = Get-WindowGeometry -Hwnd $hwnd
+        if ([Math]::Abs($rest.W - $orig.W) -gt 24 -or [Math]::Abs($rest.H - $orig.H) -gt 24 -or [Math]::Abs($rest.CW - $orig.CW) -gt 24) {
+            throw "E10-$tag FAIL: 退出全屏后窗口尺寸未恢复 (期望 outer=$($orig.W)x$($orig.H) client=$($orig.CW)x$($orig.CH), 实际 outer=$($rest.W)x$($rest.H) client=$($rest.CW)x$($rest.CH))"
+        }
+        Capture-WindowFrame -Hwnd $hwnd -FileName "e20-after-fullscreen-restore-$tag.png"
+        $restSt = Measure-ImageRegionStats -File (Join-Path $FramesDir "e20-after-fullscreen-restore-$tag.png") -X0 0.10 -Y0 0.12 -X1 0.50 -Y1 0.46
+        Write-Host "[E10-$tag] restored video mean=$($restSt.Mean) stddev=$($restSt.StdDev)" -ForegroundColor $(if ($restSt.Mean -le 15 -or $restSt.StdDev -lt 6) { "Red" } else { "Green" })
+        if ($restSt.Mean -le 15 -or $restSt.StdDev -lt 6) {
+            throw "E10-$tag FAIL: 退出全屏后视频画面未恢复/无有效画面 (mean=$($restSt.Mean) stddev=$($restSt.StdDev))"
+        }
+
+        # 3. 再次进入全屏，静置 >3.6s 验证 HUD 自动隐藏 + 全屏画面持续有像素
+        if ($interactive) {
+            $dpi = [Math]::Max(96, [int][UiEdgeNative]::GetDpiForWindow($hwnd))
+            $scale = $dpi / 96.0
+            $videoX = $rest.X + [int](380.0 * $scale)
+            $videoY = $rest.Y + [int](260.0 * $scale)
+            Click-Fast -X $videoX -Y $videoY
+            Start-Sleep -Milliseconds 80
+            Click-Fast -X $videoX -Y $videoY
+        } else {
+            $fsBtn2 = Find-PlayerFullscreenButton -Root $root
+            if (-not $fsBtn2) { throw "E10-$tag FAIL: 退出全屏恢复后播放页全屏按钮缺失" }
+            $fsBtn2.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+        }
+        Start-Sleep -Milliseconds 700
+        Assert-FullscreenBounds -Hwnd $hwnd -StepName "$tag 二次进入全屏"
+
+        Start-Sleep -Milliseconds 3600
+        $condBtn = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button
+        )
+        $btnsHidden = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condBtn)
+        $visBtns = 0
+        foreach ($b in $btnsHidden) {
+            $r = $b.Current.BoundingRectangle
+            if (-not ([double]::IsInfinity($r.X) -or [double]::IsNaN($r.X))) { $visBtns++ }
+        }
+        if ($visBtns -ne 0) {
+            throw "E10-$tag FAIL: 全屏静置后 HUD 未自动隐藏 (可见按钮数=$visBtns)"
+        }
+        Capture-WindowFrame -Hwnd $hwnd -FileName "e19-fullscreen-autohide-$tag.png"
+        $fsHideSt = Measure-ImageRegionStats -File (Join-Path $FramesDir "e19-fullscreen-autohide-$tag.png") -X0 0.20 -Y0 0.20 -X1 0.80 -Y1 0.80
+        Write-Host "[E10-$tag] fullscreen autohide mean=$($fsHideSt.Mean) stddev=$($fsHideSt.StdDev)" -ForegroundColor $(if ($fsHideSt.Mean -le 15 -or $fsHideSt.StdDev -lt 6) { "Red" } else { "Green" })
+        if ($fsHideSt.Mean -le 15 -or $fsHideSt.StdDev -lt 6) {
+            throw "E10-$tag FAIL: 全屏 HUD 隐藏后中心区域无有效画面 (mean=$($fsHideSt.Mean) stddev=$($fsHideSt.StdDev))"
+        }
+
+        # 4. 交互桌面下追加验证 F 键退出全屏恢复
+        if ($interactive) {
+            [UiEdgeNative]::keybd_event(0x46, 0, 0, [UIntPtr]::Zero)
+            Start-Sleep -Milliseconds 40
+            [UiEdgeNative]::keybd_event(0x46, 0, 2, [UIntPtr]::Zero)
+            Start-Sleep -Milliseconds 800
+            $rest2 = Get-WindowGeometry -Hwnd $hwnd
+            if ([Math]::Abs($rest2.W - $orig.W) -gt 24 -or [Math]::Abs($rest2.H - $orig.H) -gt 24) {
+                throw "E10-$tag FAIL: F 键退出全屏后窗口尺寸未恢复 ($($rest2.W)x$($rest2.H) vs $($orig.W)x$($orig.H))"
+            }
+        }
+
+        $proc.Refresh()
+        if ($proc.HasExited) { throw "E10-$tag FAIL: 全屏走查后进程意外退出 ($($proc.ExitCode))" }
+        Write-Host "[E10-$tag] PASS (before=$($beforeSt.Mean)/sd=$($beforeSt.StdDev) fs_hud=$($fsHudSt.Mean)/sd=$($fsHudSt.StdDev) rest=$($restSt.Mean)/sd=$($restSt.StdDev) fs_hide=$($fsHideSt.Mean)/sd=$($fsHideSt.StdDev))" -ForegroundColor Green
+    } finally {
+        Remove-Item Env:QAQ_BX_VIDEO, Env:QAQ_BX_NATIVE -ErrorAction SilentlyContinue
+        if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    }
 }
 }
 
@@ -1668,5 +1787,366 @@ try {
 } finally {
     if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
     Remove-Item Env:QAQ_BX_VIDEO -ErrorAction SilentlyContinue
+}
+}
+
+# ---------- 场景 E20：HalfPane 半窗预览 + Windows 原生视频引擎出画（Bug 2C） ----------
+if (Should-RunScenario "E20") {
+Write-Host "[E20] HalfPane 半窗预览下 Windows 原生视频引擎出画验证（QAQ_BX_NATIVE=1）" -ForegroundColor Cyan
+$global:E20Fail = $false
+$stderrLog = Join-Path $OutRoot "e20-stderr.log"
+$settingsPath = Join-Path $dataDir "settings.json"
+$settingsBak = "$settingsPath.e20-bak"
+$script:settingsSeeded = $false
+$proc = $null
+$stderrSink = $null
+$stderrTask = $null
+try {
+    if (Test-Path $settingsPath) { Copy-Item -Path $settingsPath -Destination $settingsBak -Force }
+    [System.IO.File]::WriteAllText(
+        $settingsPath,
+        '{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"HalfPane","danmaku_enabled":true,"autoplay":true,"hardware_decode":true,"volume":60,"webp_hint_shown":true,"player_engine":"Native","window":{"x":60,"y":60,"width":1296,"height":808,"maximized":false}}'
+    )
+    $script:settingsSeeded = $true
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.WorkingDirectory = (Split-Path $exe)
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables.Remove("QAQ_BX_VIDEO")
+    $psi.EnvironmentVariables["QAQ_BX_NATIVE"] = "1"
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stderrSink = $proc.StandardError
+    $stderrTask = $stderrSink.ReadToEndAsync()
+    $hwnd = Wait-MainWindow $proc
+    for ($i = 0; $i -lt 5; $i++) {
+        if ([UiEdgeNative]::GetForegroundWindow() -eq $hwnd) { break }
+        [UiEdgeNative]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+        [UiEdgeNative]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+        [void][UiEdgeNative]::SetForegroundWindow($hwnd)
+        Start-Sleep -Milliseconds 200
+    }
+    Start-Sleep -Milliseconds 3500 # 等推荐网格首行渲染
+
+    $rect = New-Object UiEdgeNative+RECT
+    [void][UiEdgeNative]::GetWindowRect($hwnd, [ref]$rect)
+    $winX = $rect.Left; $winY = $rect.Top
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    $condBtn = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Button
+    )
+    $buttons = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condBtn)
+    $cardBtn = $null
+    for ($i = 0; $i -lt $buttons.Count; $i++) {
+        $br = $buttons[$i].Current.BoundingRectangle
+        if (-not ([double]::IsInfinity($br.X) -or [double]::IsNaN($br.X)) -and
+            $br.Top -ge ($rect.Top + 180) -and $br.Width -ge 120 -and $br.Height -ge 100) {
+            $cardBtn = $buttons[$i]
+            break
+        }
+    }
+    if ($cardBtn) {
+        Write-Host "[E20] UIA 触发首页卡片按钮..." -ForegroundColor DarkCyan
+        $cardBtn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    } else {
+        Click-Fast -X ($winX + 260) -Y ($winY + 340)
+    }
+    Start-Sleep -Milliseconds 6500 # 半窗抽屉打开 + DASH 解析 + native 建源/attach/首帧
+
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e20-halfpane-native.png"
+    $hpSt = Measure-ImageRegionStats -File (Join-Path $FramesDir "e20-halfpane-native.png") -X0 0.68 -Y0 0.14 -X1 0.96 -Y1 0.38
+    Write-Host "[E20] half-pane native video mean=$($hpSt.Mean) stddev=$($hpSt.StdDev)" -ForegroundColor $(if ($hpSt.Mean -le 15 -or $hpSt.StdDev -lt 6) { "Red" } else { "Green" })
+    if ($hpSt.Mean -le 15 -or $hpSt.StdDev -lt 6) {
+        Write-Host "[E20] FAIL: HalfPane 原生视频区无有效画面 (mean=$($hpSt.Mean) stddev=$($hpSt.StdDev))" -ForegroundColor Red
+        $global:E20Fail = $true
+    }
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "E20 FAIL: 进程提前退出 ($($proc.ExitCode))" }
+} finally {
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    if ($script:settingsSeeded) {
+        if (Test-Path $settingsBak) { Copy-Item -Path $settingsBak -Destination $settingsPath -Force }
+        else { Remove-Item -Path $settingsPath -Force -ErrorAction SilentlyContinue }
+        Remove-Item -Path $settingsBak -Force -ErrorAction SilentlyContinue
+    }
+    try {
+        if ($stderrSink) { $stderrSink.Close() }
+        if ($stderrTask -and $stderrTask.Wait(3000)) {
+            $text = $stderrTask.Result
+            $text | Set-Content -Path $stderrLog -Encoding UTF8
+            Write-Host "[E20] stderr -> $stderrLog" -ForegroundColor DarkCyan
+            if ($text -match "native media failed|native build_source failed|native engine attach failed") {
+                Write-Host "[E20] FAIL: native 通路出现错误锚点" -ForegroundColor Red
+                $global:E20Fail = $true
+            } elseif ($text -notmatch "native load qn=" -or $text -notmatch "native attach" -or $text -notmatch "native media opened") {
+                Write-Host "[E20] FAIL: HalfPane 未完成 native 装载/attach/开画链路" -ForegroundColor Red
+                $global:E20Fail = $true
+            } elseif (-not $global:E20Fail) {
+                Write-Host "[E20] PASS: HalfPane 原生视频装载 + attach + 开画 + 像素验收通过" -ForegroundColor Green
+            }
+        } else {
+            Write-Host "[E20] FAIL: 未采到 stderr" -ForegroundColor Red
+            $global:E20Fail = $true
+        }
+    } catch {
+        Write-Host "[E20] FAIL: stderr 解析异常 $($_.Exception.Message)" -ForegroundColor Red
+        $global:E20Fail = $true
+    }
+}
+if ($global:E20Fail) { throw "E20 FAIL: HalfPane native 验证失败（详见 $stderrLog）" }
+}
+
+# ---------- 场景 E21：竖屏模式（实验）全屏进退彻底隔离与零闪回 Desktop 验证 ----------
+if (Should-RunScenario "E21") {
+Write-Host "[E21] 竖屏模式（实验）进出全屏严格隔离与零 Desktop 闪回验证" -ForegroundColor Cyan
+$settingsPath = Join-Path $dataDir "settings.json"
+$settingsBak = "$settingsPath.e21-bak"
+$script:settingsSeeded = $false
+$proc = $null
+try {
+    if (Test-Path $settingsPath) { Copy-Item -Path $settingsPath -Destination $settingsBak -Force }
+    [System.IO.File]::WriteAllText(
+        $settingsPath,
+        '{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"FullPlayer","danmaku_enabled":true,"autoplay":true,"hardware_decode":true,"volume":50,"webp_hint_shown":true,"player_engine":"Native","portrait_mode":true}'
+    )
+    $script:settingsSeeded = $true
+    $env:QAQ_BX_VIDEO = "BV1GJ411x7h7"
+
+    $proc = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -PassThru
+    $hwnd = Wait-MainWindow $proc
+    for ($i = 0; $i -lt 5; $i++) {
+        if ([UiEdgeNative]::GetForegroundWindow() -eq $hwnd) { break }
+        [UiEdgeNative]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+        [UiEdgeNative]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+        [void][UiEdgeNative]::SetForegroundWindow($hwnd)
+        Start-Sleep -Milliseconds 200
+    }
+    Start-Sleep -Milliseconds 5000
+
+    $g0 = Get-WindowGeometry -Hwnd $hwnd
+    $dpi = [Math]::Max(96, [int][UiEdgeNative]::GetDpiForWindow($hwnd))
+    $scale = $dpi / 96.0
+    $clientDips0 = [Math]::Round($g0.CW / $scale, 1)
+    Write-Host "[E21] launch portrait geometry: outer=$($g0.W)x$($g0.H) client=$($g0.CW)x$($g0.CH) (${clientDips0} DIP)" -ForegroundColor DarkCyan
+    if ($clientDips0 -ge 860.0) {
+        throw "E21 FAIL: 竖屏启动客户区宽度越过 860 DIP 边界 ($clientDips0 DIP)"
+    }
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e21-0-portrait-before-fs.png"
+
+    # 通过 UIAutomation InvokePattern 点击竖屏播放页全屏按钮进入全屏（不依赖前台焦点与屏幕坐标）
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    $desktopPip0 = Find-DesktopPipButton -Root $root
+    if ($desktopPip0) {
+        throw "E21 FAIL: 竖屏模式播放页出现了桌面端专属小窗按钮"
+    }
+    $qualityHeaderLabel = Find-UiaByName -Root $root -Name "画质"
+    if ($qualityHeaderLabel) {
+        throw "E21 FAIL: 竖屏模式视频页面仍然存在解释性文本 [画质]"
+    }
+    $qualityCombo = Find-UiaByAutomationId -Root $root -Id "player-quality-selector"
+    if (-not $qualityCombo) {
+        throw "E21 FAIL: 竖屏模式播放页未找到 [player-quality-selector] 清晰度按钮"
+    }
+    if ($qualityCombo.Current.Name -match "画质") {
+        throw "E21 FAIL: 竖屏模式清晰度 ComboBox Name 仍包含 [画质] ($($qualityCombo.Current.Name))"
+    }
+    # 自动化点击展开清晰度下拉并选第二项验证无 panic
+    try {
+        $expand = $qualityCombo.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+        $expand.Expand()
+        Start-Sleep -Milliseconds 450
+        $condItem = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::ListItem
+        )
+        $qItems = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condItem)
+        if ($qItems.Count -ge 2) {
+            Write-Host "[E21] quality selector expanded ($($qItems.Count) items), selecting item[1]=$($qItems[1].Current.Name)" -ForegroundColor DarkCyan
+            $qItems[1].GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+            Start-Sleep -Milliseconds 600
+        } else {
+            $expand.Collapse()
+        }
+    } catch {
+        throw "E21 FAIL: 竖屏清晰度选择器展开/点击异常: $($_.Exception.Message)"
+    }
+    $fsBtn = Find-PlayerFullscreenButton -Root $root
+    if (-not $fsBtn) { throw "E21 FAIL: 竖屏播放页未找到 [player-enter-fullscreen] 按钮" }
+    $fsBtn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Start-Sleep -Milliseconds 1200
+
+    $exitBtn = Find-HudExitButton -Root $root
+    Assert-FullscreenBounds -Hwnd $hwnd -StepName "E21 竖屏进入全屏"
+    if (-not $exitBtn) { throw "E21 FAIL: 进入全屏后未找到 HUD [退出全屏] 按钮" }
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e21-1-portrait-in-fs.png"
+
+    # 点击退出全屏，立刻高频轮询 UIA 与窗口宽度：绝不允许出现桌面端 [右下角小窗] 按钮，且恢复后宽度必须 <= 859 DIP
+    $exitBtn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    for ($tick = 0; $tick -lt 12; $tick++) {
+        $desktopPipBtn = Find-DesktopPipButton -Root $root
+        if ($desktopPipBtn) {
+            throw "E21 FAIL: 退出全屏过渡期(tick=$tick)闪回了桌面端双栏 UI ([右下角小窗] 控件出现)"
+        }
+        Start-Sleep -Milliseconds 45
+    }
+    Start-Sleep -Milliseconds 600
+    $g1 = Get-WindowGeometry -Hwnd $hwnd
+    $clientDips1 = [Math]::Round($g1.CW / $scale, 1)
+    Write-Host "[E21] after exit-fullscreen geometry: outer=$($g1.W)x$($g1.H) client=$($g1.CW)x$($g1.CH) (${clientDips1} DIP)" -ForegroundColor DarkCyan
+    if ($clientDips1 -ge 860.0) {
+        throw "E21 FAIL: 退出全屏后窗口宽度未保持在竖屏带 (< 860 DIP)，实际=${clientDips1} DIP"
+    }
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e21-2-portrait-after-fs.png"
+
+    # 验证退出全屏后 presenter 宽度上限硬钳制仍在：尝试用 SetWindowPos 强行拉宽至 1400px，客户区仍须 < 860 DIP
+    [void][UiEdgeNative]::SetWindowPos($hwnd, [IntPtr]::Zero, $g1.X, $g1.Y, 1400, $g1.H, [UiEdgeNative]::SWP_NOZORDER)
+    Start-Sleep -Milliseconds 350
+    $g2 = Get-WindowGeometry -Hwnd $hwnd
+    $clientDips2 = [Math]::Round($g2.CW / $scale, 1)
+    Write-Host "[E21] after forced 1400px resize attempt: outer=$($g2.W)x$($g2.H) client=$($g2.CW)x$($g2.CH) (${clientDips2} DIP)" -ForegroundColor DarkCyan
+    if ($clientDips2 -ge 860.0) {
+        throw "E21 FAIL: 退出全屏后 presenter 最大宽度硬钳制丢失，窗口被拉宽至 ${clientDips2} DIP"
+    }
+
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "E21 FAIL: 进程意外退出 ($($proc.ExitCode))" }
+    Write-Host "[E21] PASS: 竖屏模式进退全屏零 Desktop 闪回 + 几何与 presenter 硬钳制保持完好" -ForegroundColor Green
+} finally {
+    Remove-Item Env:QAQ_BX_VIDEO -ErrorAction SilentlyContinue
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    if ($script:settingsSeeded) {
+        if (Test-Path $settingsBak) { Copy-Item -Path $settingsBak -Destination $settingsPath -Force }
+        else { Remove-Item -Path $settingsPath -Force -ErrorAction SilentlyContinue }
+        Remove-Item -Path $settingsBak -Force -ErrorAction SilentlyContinue
+    }
+}
+}
+
+# ---------- 场景 E22：多 CDN 择优 + 本地并发预加载代理 + Native 加载指示自动化点击验收 ----------
+if (Should-RunScenario "E22") {
+Write-Host "[E22] 设置页 CDN/预加载开关 UIA 点击 + Native 走本地流代理实播/切清晰度验证" -ForegroundColor Cyan
+$stderrLog = Join-Path $OutRoot "e22-stderr.log"
+$settingsPath = Join-Path $dataDir "settings.json"
+$settingsBak = "$settingsPath.e22-bak"
+$script:settingsSeeded = $false
+$proc = $null
+$stderrSink = $null
+$stderrTask = $null
+try {
+    if (Test-Path $settingsPath) { Copy-Item -Path $settingsPath -Destination $settingsBak -Force }
+    [System.IO.File]::WriteAllText(
+        $settingsPath,
+        '{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"FullPlayer","danmaku_enabled":true,"autoplay":true,"hardware_decode":true,"volume":50,"webp_hint_shown":true,"player_engine":"Native","window":{"x":60,"y":60,"width":1296,"height":808,"maximized":false}}'
+    )
+    $script:settingsSeeded = $true
+
+    # 阶段 A：设置页自动化点击开关（优先官方 CDN / 多线程并发预加载），确认无解释性文本、可连续拨动不崩溃
+    $env:QAQ_BX_ROUTE = "settings"
+    $proc = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -PassThru
+    $hwnd = Wait-MainWindow $proc
+    Start-Sleep -Milliseconds 1500
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+
+    $cdnToggle = Find-UiaByAutomationId -Root $root -Id "settings-prefer-official-cdn"
+    $preloadToggle = Find-UiaByAutomationId -Root $root -Id "settings-multi-thread-preload"
+    if (-not $cdnToggle) { throw "E22 FAIL: 设置页未找到 [settings-prefer-official-cdn] 开关" }
+    if (-not $preloadToggle) { throw "E22 FAIL: 设置页未找到 [settings-multi-thread-preload] 开关" }
+
+    foreach ($t in @($cdnToggle, $preloadToggle)) {
+        $pat = $t.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
+        if ($pat.Current.ToggleState -ne [System.Windows.Automation.ToggleState]::On) {
+            throw "E22 FAIL: 新设置开关默认值应为 On ($($t.Current.AutomationId))"
+        }
+        $pat.Toggle()
+        Start-Sleep -Milliseconds 150
+        if ($pat.Current.ToggleState -ne [System.Windows.Automation.ToggleState]::Off) {
+            throw "E22 FAIL: UIA 点击后开关未翻为 Off ($($t.Current.AutomationId))"
+        }
+        $pat.Toggle()
+        Start-Sleep -Milliseconds 150
+        if ($pat.Current.ToggleState -ne [System.Windows.Automation.ToggleState]::On) {
+            throw "E22 FAIL: UIA 再次点击后开关未翻回 On ($($t.Current.AutomationId))"
+        }
+    }
+    # 等待 300ms SETTINGS_SAVE_DEBOUNCE 落盘完成后再退出，确保阶段 B 读到恢复后的 On 状态
+    Start-Sleep -Milliseconds 650
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e22-0-settings-toggles.png"
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    $proc = $null
+
+    # 阶段 B：默认 Native 引擎直开播放页，走本地 StreamProxy 代理实播 + UIA 切画质 + 画面像素检验
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.WorkingDirectory = (Split-Path $exe)
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables["QAQ_BX_VIDEO"] = "BV1GJ411x7h7"
+    $psi.EnvironmentVariables.Remove("QAQ_BX_ROUTE") | Out-Null
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stderrSink = $proc.StandardError
+    $stderrTask = $stderrSink.ReadToEndAsync()
+    $hwnd = Wait-MainWindow $proc
+    Start-Sleep -Seconds 7
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e22-1-native-proxy-playing.png"
+    $stats = Measure-ImageRegionStats -File (Join-Path $FramesDir "e22-1-native-proxy-playing.png") -X0 0.08 -Y0 0.14 -X1 0.62 -Y1 0.56
+    Write-Host "[E22] video region mean=$($stats.Mean) stddev=$($stats.StdDev)" -ForegroundColor DarkCyan
+    if ($stats.Mean -le 15 -or $stats.StdDev -lt 6) {
+        throw "E22 FAIL: Native 走代理播放未出有效视频画面 (mean=$($stats.Mean) stddev=$($stats.StdDev))"
+    }
+
+    # UIA 点击画质选择器切换画质，验证换流链路及加载指示不崩溃
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    $qualityCombo = Find-UiaByAutomationId -Root $root -Id "player-quality-selector"
+    if ($qualityCombo) {
+        $expand = $qualityCombo.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+        $expand.Expand()
+        Start-Sleep -Milliseconds 450
+        $condItem = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::ListItem
+        )
+        $qItems = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condItem)
+        if ($qItems.Count -ge 2) {
+            Write-Host "[E22] switching quality via UIA -> $($qItems[1].Current.Name)" -ForegroundColor DarkCyan
+            $qItems[1].GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+            Start-Sleep -Seconds 5
+        } else {
+            $expand.Collapse()
+        }
+    }
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e22-2-after-quality-switch.png"
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "E22 FAIL: 进程意外退出 ($($proc.ExitCode))" }
+} finally {
+    Remove-Item Env:QAQ_BX_ROUTE -ErrorAction SilentlyContinue
+    Remove-Item Env:QAQ_BX_VIDEO -ErrorAction SilentlyContinue
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    if ($script:settingsSeeded) {
+        if (Test-Path $settingsBak) { Copy-Item -Path $settingsBak -Destination $settingsPath -Force }
+        else { Remove-Item -Path $settingsPath -Force -ErrorAction SilentlyContinue }
+        Remove-Item -Path $settingsBak -Force -ErrorAction SilentlyContinue
+    }
+    try {
+        if ($stderrSink) { $stderrSink.Close() }
+        if ($stderrTask -and $stderrTask.Wait(5000)) {
+            $text = $stderrTask.Result
+            $text | Set-Content -Path $stderrLog -Encoding UTF8
+            Write-Host "[E22] stderr -> $stderrLog" -ForegroundColor DarkCyan
+            if ($text -notmatch "\[stream-proxy\] listening on http://127\.0\.0\.1:") {
+                throw "E22 FAIL: 未看到 stream-proxy 监听日志"
+            }
+            if ($text -notmatch "stream-proxy route .*prefer_upos=true") {
+                throw "E22 FAIL: 未看到 stream-proxy 走 prefer_upos=true 路由"
+            }
+            if ($text -notmatch "native media opened") {
+                throw "E22 FAIL: Native 引擎经代理播放未触发 media opened"
+            }
+        }
+    } catch {
+        throw
+    }
+    Write-Host "[E22] PASS: 设置开关 UIA 点击 + 多 CDN/本地并发代理实播 + 切清晰度全链通过" -ForegroundColor Green
 }
 }

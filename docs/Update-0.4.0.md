@@ -66,6 +66,67 @@ composition 液态玻璃:效果采样 XAML 背景内容做 blur(saturation(backd
 (WS_MAXIMIZEBOX CLEAR)、右缘贴合最大化(工作区全高)+ 还原;全屏播放正交保留。
 设计文档 `docs/dev-notes/portrait-mode.md`(双轴隔离模型)。真机验证证据见提交 `c290054`。
 
+| 项 | 现象 / 隐患 | 根因 | 修复 | 验证 |
+|---|---|---|---|---|
+| P-1 竖屏退出全屏闪回 Desktop 导致卡顿 | 竖屏模式下进入全屏再退出时,界面先闪现桌面双栏+侧栏 UI 再跳回竖屏底栏,伴随明显卡顿 | ① 全屏期间系统派发 `WindowResized(1920, 1080)` 污染了 `self.viewport_layout`(切为 `Desktop/Expanded` 8 列并在后台重建 8 列虚拟源);② `exit_fullscreen` 同步置 `is_fullscreen = false` 而 `SetPresenterByKind(Default)` 异步执行,退出首帧 `view()` 按 `1920×1080` 渲染了整棵 Desktop `NavigationView` 视觉树,下一帧窗口缩回 `859×800` 又全量销毁重建为 Mobile 视觉树 | ① `ViewportLayout::for_window(w, h, portrait_mode)` 布局层硬钳制:`portrait_mode` 开启时有效宽度恒锁 `[390, 859]`、`chrome` 恒 `Mobile`、`cols` 恒 2;② 全屏期间冻结底层 `viewport_layout`,新增 `fullscreen_window_width` 专供全屏 HUD 紧凑断点;③ `AppShell::create` 按 `ViewportLayout::initial(portrait_mode)` 初始化首帧 2 列骨架;④ `winrt_ext::enforce_portrait_window_policy` 在退出全屏回 `Default` presenter 及运行时开启开关时重申 `IOverlappedPresenter3` 最大宽度硬钳制并主动收缩超宽窗口 | 单测 `portrait_mode_strictly_clamps_to_mobile_band_across_all_widths`;`selftest fullscreen` 阶段 6;真机 `ui-edge.ps1 -Scenario E21` PASS(进退全屏 0 Desktop 闪回,强拉 1400px 仍锁 859 DIP) |
+| P-2 竖屏视频页去除“画质”解释性文本 | 竖屏/紧凑播控条清晰度下拉框上方出现“画质”二字，与 `1080P 高清` 按钮文本语义重复，且撑高单行播控条导致按钮纵向错位 | `quality_selector` 对 `compact = true`（竖屏/单列/紧凑 HUD）无条件设置 `.header("画质")` | `crates/qaq-bx-ui/src/pages/player.rs`：`quality_selector` 仅在 `!compact` 时保留 `.header("画质")`，并设 `.automation_id("player-quality-selector")`；抽出 `single_column_transport` 纯函数承接竖屏单行播控 | 单测 `quality_selector_requires_two_tiers_and_maps_selection` 与 `portrait_single_column_transport_omits_quality_header`（`qaq-bx-ui` 90 passed, workspace 202 passed）；`just selftest all` 全绿（`fullscreen` 阶段 6 含竖屏 `SelectQuality`）；真机 `ui-edge.ps1 -Scenario E21` PASS（UIA 断言无“画质”节点、展开选择 `360P 流畅` 成功，`e21-0/1/2` 截图视觉对齐正常） |
+
+## V. 视频全屏黑屏与「有声无画」根因修复(2026-11-19)✅
+
+> **前后端归因结论**：两类故障均为 **100% 前端 / 媒体引擎桥接与选流层问题**，非 B 站后端 API 问题（playurl、DASH 分轨、MPD 生成、Referer/UA 请求、`AdaptiveMediaSource` 建源与音轨解码均正常完成）。
+
+| 编号 | 现象与归属 | 根因锁定 | 修复落点 |
+|---|---|---|---|
+| V-1A | Windows 原生引擎全屏必现黑屏 | WinUI 3 全屏层 `FullscreenPlayer` 直接铺满无非零圆角裁剪容器时，`MediaPlayerPresenter` 的 `HWCompMediaNode` 在全屏窗口中被 DComp 合成树遮挡/丢弃（而 `PlayerPage`/`HalfPanePreview` 因包裹 `.corner_radius(8.0)` 的 `Border` 建立了圆角裁剪子树，始终正常出画；实测去掉圆角亮度由 120.6 跌至 7.1，加 `.corner_radius(1.0)` 全屏 1920×1080 恢复至 130.5） | `crates/qaq-bx-ui/src/pages/fullscreen.rs` 全屏 surface 外层包裹 `Border::new().corner_radius(1.0)` |
+| V-1B | 原生引擎进退全屏/缩放重建丢画或卡死 | ① `remount_pending()` 在 1500ms 节流期返回 `false` 后，`NativeSurface::try_attach()` 未在后续 250ms 节拍重试；② 显式进退全屏与快速缩放共用 1500ms 节流导致快速进退全屏卡顿；③ `note_surface_detached()` 未暂停旧 `MediaPlayer` 且二次 detach 会用 `0.0` 覆盖有效续播进度；④ `attach_player` 在 `MediaOpened` 前 seek/Play 可能被吞；⑤ reactor `ImperativeRequest::complete_unavailable()` 漏处理 `SetMediaSourceGetPlayer` | `crates/qaq-bx-video/src/native.rs`（`allow_immediate_remount`、`MediaOpened` 内补 seek + `Play()`、双 detach 进度保护、`stop()`）、`crates/qaq-bx-ui/src/widgets/native_surface.rs`、fork `reactor/src/reference.rs` |
+| V-1C | mpv 全屏偶发黑屏 | `VideoEngine::detach_panel()` 与 `DanmakuStage::detach_panel()` 未同步清零 `attached` 且无挂载代次（`attach_gen`），旧面板迟到的 `SetSwapChain` completion 会把未挂载的新面板误标为 `attached = true` 停止重试；同时面板瞬态 `IntegrationError::Unavailable` 未放回待挂载指针 | `crates/qaq-bx-video/src/engine.rs` & `stage.rs`（共用 `SurfaceMountSlot` 单调代次槽）、`crates/qaq-bx-ui/src/widgets/video_surface.rs` & `danmaku_surface.rs` |
+| V-2A | 原生解码失败回退 mpv 后「有声无画」 | `fallback_native_to_mpv` 在 `switch_to_mpv_now` 之后写入 `self.player_notice = Some(...)`，而 `PlayerPage`/`FullscreenPlayer`/`HalfPanePreview` 一旦发现 `notice.is_some()` 会直接用错误文本替换 `VideoSurface`，导致 mpv 后台放音但视频面被卸载 | `crates/qaq-bx-ui/src/shell.rs::fallback_native_to_mpv`（mpv 接管成功时保持 `player_notice = None`） |
+| V-2B | 双引擎串音与状态泄漏 | 原生与 mpv 切换/回退/换视频时未互斥调用 `player.stop()` / `engine.stop()`；`native_load_choice` 同步报错时未回退 mpv；`media_load_pending` 仅靠 `!status.loading` / `!status.has_media()` 易提前放行旧会话快照 | `crates/qaq-bx-ui/src/shell.rs`（`mpv_load_streams`、`native_load_gate_settled`、`mpv_load_gate_settled`） |
+| V-2C | 首页半屏抽屉（HalfPane）原生引擎「有声无画」 | `HalfPaneInput` 与 `HalfPanePreview` 仅接入 mpv `VideoSurface`，未传入 `native` 与 `stage`，在默认原生引擎下只渲染空置的 mpv 面板而原生引擎后台出声 | `crates/qaq-bx-ui/src/pages/player.rs`（抽出共用 `player_surface_view`）、`crates/qaq-bx-ui/src/shell.rs::half_pane_layer` |
+| V-2D | 编码桶回退选流失败与无备选音轨杀画面 | `select_stream_excluding` 在 `max_qn == 0`（不限清晰度）时因 `v.id > max_qn` 恒真返回 `None`；所有视频桶均失败时未 `engine.stop()`；`apply_audio_fallback` 无备选音轨时设 `player_notice` 卸载正常视频面 | `crates/qaq-bx-core/src/player.rs::select_stream_excluding`、`crates/qaq-bx-ui/src/shell.rs` |
+| V-2E | 原生引擎视频轨静默解码缺失（0×0）不回退 | Windows `MediaPlayer` 在缺失 HEVC/AV1 扩展时可能不触发 `MediaFailed`，仅解出音频且 `NaturalVideoWidth/Height == 0` | `crates/qaq-bx-video/src/native.rs` 上报固有宽高，`crates/qaq-bx-ui/src/shell.rs::missing_native_video_track` 活跃播放满 3s 自动回退 mpv |
+| V-2F | DASH `segment_base` 蛇形键兼容与 mpv 残留音轨 | B 站部分稿件仅下发 snake_case `segment_base`（或与 `SegmentBase` 同对象双键共存）导致 MPD 缺 `<SegmentBase>`；`MpvPlayer::loadfile` 在 `audio_url == None` 时未清空上一条 `audio-files` | `crates/qaq-bx-core/src/player.rs::resolved_segment_base`、`crates/qaq-bx-core/src/mpd.rs`、`crates/qaq-bx-video/src/player.rs` |
+
+### V 项验收实测(2026-11-19)
+
+- `windows-reactor`: `cargo test --manifest-path D:\Projects\qaq-winui-reactor\Cargo.toml -p windows-reactor` 全绿（351 unit + 3 + 75 doc tests，0 失败）。
+- `d:\QAQ-Bx`: `cargo test --workspace` 全绿（`qaq-bx-core` 66 + `feed_fixtures` 6 / `qaq-bx-plugin-login` 7 / `qaq-bx-ui` 88 / `qaq-bx-video` 33，合计 **200 passed, 0 failed, 7 ignored**）。
+- `just selftest all`: 14 项集成自测全部 `[PASS]`（`boot`, `nav`, `comments`, `rapid-switch`, `stress`, `search`, `codec`, `popular`, `live`, `unplayable`, `half-pane`, `mobile`, `fullscreen`, `engine`），0 panic。
+- 真机自动化点击与 `PrintWindow(..., 2)` 像素亮度/方差验收（`scripts/ui-edge.ps1 -Scenario E10,E11,E12,E20`）：
+  - **E10-native（Windows 原生全屏进退与自隐）**：`PASS`（全屏前 `mean=106.1/sd=74.8` → 全屏 HUD `mean=68.4/sd=33.9` → 退出恢复 `mean=126.2/sd=69.9` → 二次全屏 HUD 自隐 `mean=131.8/sd=36.5`）。
+  - **E10-mpv（mpv 全屏进退与自隐）**：`PASS`（全屏前 `mean=109.7/sd=73.0` → 全屏 HUD `mean=67.9/sd=34.4` → 退出恢复 `mean=102.9/sd=60.5` → 二次全屏 HUD 自隐 `mean=140.2/sd=37.1`）。
+  - **E11（mpv 30 次快速伸缩）**：`PASS`（800ms `luma=137.1` / 3300ms `luma=132.5` / 6300ms `luma=128.0`）。
+  - **E12（Windows 原生 30 次快速伸缩恢复）**：`PASS`（起播 `mean=122.3/sd=71.8` → 3300ms `mean=106.1/sd=74.4` → 6300ms `mean=64.7/sd=36.7`，stderr 装载/attach/开画/透明层全绿）。
+  - **E20（HalfPane 半窗预览 Windows 原生引擎出画）**：`PASS`（UIA 点击首页卡片打开半窗，`mean=35.6/sd=30.7`，stderr `native load` + `native attach` + `native media opened` 全绿）。
+
+## L. 播放加载动画修复 × 多 CDN 择优 × 有界并发 Range 代理(2026-11-19)✅
+
+针对「起播/缓冲卡加载中但无加载动画」及默认命中 `mcdn`/PCDN 易卡顿问题，完成全链治理与双引擎加固（严格适配 4c8T / 8G 约束）：
+
+| 项 | 现象 / 根因 | 修复落点 |
+|---|---|---|
+| L-1 Native 加载动画早熄与卡死无兜底 | ① `NativeStatus.loading` 仅覆盖 MPD 建源，attach 后 `media_load_pending` 立即解除，`shell.rs` 按 `!status.loading && !status.playing` 在 `Opening`/`Buffering` 阶段立刻清掉 `video_loading` 并把按钮变 `▷`；② `missing_native_video_track` 依赖 `playing \|\| position > 0`，导致 `0s` 卡死不回退 mpv；③ 切画质/分 P/回退未置 `video_loading = true` | `qaq-bx-video/src/native.rs`（`NativeStatus` 暴露 `opening`/`buffering`/`paused`/`wants_play`/`media_opened`/`buffering_progress`）；`qaq-bx-ui/src/shell.rs`（`native_should_show_loading`、`native_load_stalled` 12s 超时回退 mpv、`SelectQuality`/`SelectPage`/回退全补 `video_loading = true`） |
+| L-2 Native 建源无超时、重挂竞态与 `_keep` 累积 | `CreateFromStreamWithDownloaderAsync(...).join()` 无超时取消；建源期间 detach 留下的 `awaiting_rebuild` 误阻新构建成品认领；`_keep` 在每次装载只增不减 | `qaq-bx-video/src/native.rs`（12s `BUILD_TIMEOUT` + `op.Cancel()`、`LoadLedger::finish` 对未绑定新成品清 `awaiting_rebuild`、`PendingSource.keep` 转移至 `active_keep` 并在 `stop()` 清理） |
+| L-3 mpv 缓冲感知、吞错与请求头逗号截断 | `observe_status` 漏订 `paused-for-cache`；`EndFile` 丢弃 `reason`/`error`；`http-header-fields` 按逗号拼接切断含逗号的 `BROWSER_UA` | `qaq-bx-video/src/{player.rs, engine.rs}`（独立设 `user-agent`/`referrer`、`network-timeout=10`、`stream-lavf-o` 重连、订阅 `paused-for-cache` + `FileLoaded`/`PlaybackRestart`、`EndFile` 错误上报；`shell.rs::mpv_should_show_loading`） |
+| L-4 多 CDN 择优与防重复节点降级 | B 站 `playurl` 默认将 `*.mcdn.bilivideo.cn` / PCDN 放 `base_url`，`upos-*` 官方节点放 `backup_url`/`backupUrl`，原代码仅取 `base_url` | `qaq-bx-core/src/{cdn.rs, player.rs}`（识别 `mcdn`/PCDN、`OfficialUpos` 优先排序、同 host 多签名后置、`CdnHealthTracker` 冷却机制、兼容 `baseUrl`/`backupUrl` 双键名） |
+| L-5 本地有界并发 HTTP Range 代理 | 单连接循序拉片易受单节点限速/403 中断 | `qaq-bx-core/src/stream_proxy.rs`（`127.0.0.1:0` 环回 Range 代理：512KiB 分块 + single-flight + 最多 6 块超前并发预取 + 每轨上限 20 块/10MiB 淘汰 + 403/5xx/超时透明切换 `backup_url`，同时兼容 Native 与 mpv） |
+| L-6 设置开关与设置页多行网格修复 | 暴露 `prefer_official_cdn` / `multi_thread_preload`（默认开，无解释性文本）；同时修复设置页双栏 `Grid` 缺 `RowDefinitions` 导致 `window_card` 压在 `playback_card` 上的历史叠层 bug | `qaq-bx-core/src/settings.rs`、`qaq-bx-ui/src/pages/settings.rs`、`qaq-bx-ui/src/shell.rs` |
+
+### L 项验收实测(2026-11-19)
+
+- `cargo test --workspace` 全绿：**214 passed, 0 failed, 7 ignored**（`qaq-bx-core` 72 + `feed_fixtures` 6 / `qaq-bx-plugin-login` 7 / `qaq-bx-ui` 93 / `qaq-bx-video` 36）。
+- `just selftest all` 全绿：**15 项 `[PASS]`**（含新增 `loading-state` 场景：起播置位加载动画 → 落定熄灭 → `SelectQuality` 再次亮起与落定 → 设置切换 0 panic）。
+- 真机自动化验收（`scripts/ui-edge.ps1 -Scenario E12,E20,E21,E22`）：
+  - **E12 / E20 / E21**：全部 `PASS`（Native 经 `StreamProxy` 起播、`HalfPane` 半窗出画 `mean=26.1/sd=43.2`、竖屏全屏切换 + `360P 流畅` 换流零闪回）。
+  - **E22（新）**：UIA 自动点击 `settings-prefer-official-cdn` / `settings-multi-thread-preload` 开关往返 + 默认 Native 走 `[stream-proxy]` (`prefer_upos=true`) 实播 `mean=106.6/sd=74.2` + UIA 切清晰度 `360P 流畅` 成功 + `nat=1920x1080` → `640x360` 绿灯，0 崩溃。
+- 说明：当前会话环境为锁屏/非交互桌面，依赖 `CopyFromScreen` / 鼠标坐标的既有场景 `E17` 报 `The handle is invalid`，`E10` 在非交互退避等待 HUD 时超出 3s 自动隐藏窗口；`Fullscreen` 核心功能已由 `selftest fullscreen` 与 `E21` UIA 路径实测通过。
+
+## C. 评论发布器竖堆三行布局回归修复(2026-11-19)✅
+
+| 项 | 现象 | 根因 | 修复 | 验证 |
+|---|---|---|---|---|
+| C-1 评论区 composer 竖堆 | 播放页评论区头像独占一行居中、输入框独占一行拉满、「发布」钮掉到第三行左侧,本应单行三列 `[头像 \| 输入框 \| 发布]` | v0.2.0「U1 评论发布接线」(提交 `18c755e`)为支持条件性行内提示把 composer 子元素改成动态 `Vec<View>`,容器从 `Grid [Auto, Star(1), Auto]` 顺手换成垂直 `StackPanel`,却保留子元素的 `Grid.Column` 附加属性——该属性映射 WinUI `Grid.Column`(fork `native/generated.rs` → `Grid::ColumnProperty`),**只有 Grid 布局会读**,StackPanel 静默忽略 → 三子元素各排一行;notice 的 `.grid_column(1)` 同失效 | `crates/qaq-bx-ui/src/pages/player.rs`:抽出 `comment_composer` 纯函数,容器恢复 `Grid` 三列 `[Auto, Star(1), Auto]` + 两行 `[Auto, Auto]`(`Vec<View>` 本就实现 `IntoViews`,Grid 可直接收动态子元素,换容器本不必要);notice 补 `.grid_row(1)` 落第 2 行输入框列,无 notice 时第 2 行 Auto 收零高 | 新增单测 `composer_is_three_column_grid_with_notice_on_second_row`(根节点必须 Grid、禁 StackPanel、TextBox/Button 段落各钉 Grid.Column 1/2、notice 钉 Grid.Row=1+Column=1、登录/未登录双态文案与置灰);`qaq-bx-ui` 94 passed 0 failed;`just selftest comments` PASS(真实评论首页 + 排序双桶 + Back,0 panic) |
+
 ## 版本
 
 - workspace 版本 0.2.0 → **0.4.0**(`Cargo.toml [workspace.package]`,成员

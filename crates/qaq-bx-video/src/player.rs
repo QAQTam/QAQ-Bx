@@ -34,7 +34,7 @@ pub enum MpvEvent {
     Seek,
     Idle,
     PropertyChange { name: String, value: PropertyValue },
-    EndFile { reason: i32 },
+    EndFile { reason: i32, error: i32 },
     Shutdown,
     Other(u32),
 }
@@ -84,7 +84,13 @@ impl MpvPlayer {
             ("demuxer-max-bytes", "8MiB"),
             ("demuxer-max-back-bytes", "4MiB"),
             ("demuxer-readahead-secs", "15"),
+            ("network-timeout", "10"),
         ])?;
+        // 断流重连为 ffmpeg lavf 可选增强项；若运行库版本忽略则静默兜底。
+        let _ = player.set_options(&[(
+            "stream-lavf-o",
+            "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=3",
+        )]);
         Ok(player)
     }
 
@@ -113,14 +119,24 @@ impl MpvPlayer {
     ) -> Result<(), BiliVideoError> {
         if let Some(audio) = audio_url {
             self.set_options(&[("audio-files", audio)])?;
+        } else {
+            self.set_options(&[("audio-files", "")])?;
         }
         if !headers.is_empty() {
-            let joined = headers
-                .iter()
-                .map(|(k, v)| format!("{k}: {v}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            self.set_options(&[("http-header-fields", &joined)])?;
+            let mut extra_fields = Vec::new();
+            for (k, v) in headers {
+                if k.eq_ignore_ascii_case("user-agent") {
+                    self.set_options(&[("user-agent", v)])?;
+                } else if k.eq_ignore_ascii_case("referer") || k.eq_ignore_ascii_case("referrer") {
+                    self.set_options(&[("referrer", v)])?;
+                } else {
+                    extra_fields.push(format!("{k}: {v}"));
+                }
+            }
+            if !extra_fields.is_empty() {
+                let joined = extra_fields.join(",");
+                self.set_options(&[("http-header-fields", &joined)])?;
+            }
         }
         let args = vec![
             CString::new("loadfile")?,
@@ -178,14 +194,15 @@ impl MpvPlayer {
                     MPV_EVENT_SEEK => MpvEvent::Seek,
                     MPV_EVENT_IDLE => MpvEvent::Idle,
                     MPV_EVENT_END_FILE => {
-                        // mpv_event_end_file { reply_userdata, reason, ... }:reason
+                        // mpv_event_end_file { reply_userdata, reason, error, ... }:reason
                         // 在 u64 之后(offset 8),不能直接按 i32 读首字段。
-                        let reason = if data.is_null() {
-                            0
+                        let (reason, error) = if data.is_null() {
+                            (0, 0)
                         } else {
-                            unsafe { (*(data as *const crate::ffi::mpv_event_end_file)).reason }
+                            let ev = unsafe { &*(data as *const crate::ffi::mpv_event_end_file) };
+                            (ev.reason, ev.error)
                         };
-                        MpvEvent::EndFile { reason }
+                        MpvEvent::EndFile { reason, error }
                     }
                     MPV_EVENT_SHUTDOWN => MpvEvent::Shutdown,
                     other => MpvEvent::Other(other),

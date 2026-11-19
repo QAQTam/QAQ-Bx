@@ -74,7 +74,7 @@ fn video_representation_xml(video: &VideoStream) -> String {
         video.width,
         video.start_with_sap,
         "<BaseURL></BaseURL>",
-        segment_base_xml(video.segment_base.as_ref()),
+        segment_base_xml(video.resolved_segment_base().as_ref()),
         ""
     )
 }
@@ -91,7 +91,7 @@ fn audio_representation_xml(audio: &AudioStream) -> String {
         }),
         audio.id,
         "<BaseURL></BaseURL>",
-        segment_base_xml(audio.segment_base.as_ref()),
+        segment_base_xml(audio.resolved_segment_base().as_ref()),
         ""
     )
 }
