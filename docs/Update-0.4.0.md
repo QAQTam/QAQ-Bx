@@ -236,4 +236,5 @@ Content-Range 的短 206」由整块接受改为收敛该块尾(等价旧上层�
 - `cargo test --workspace`:**255 passed, 0 failed**(core 93+fix 6+login 7+ui 113+video 36;ignored 8 内含 2 新实网冒烟)。
 - `just selftest all`:**17/17 PASS**。
 - 实网冒烟:`cargo test -p qaq-bx-core -- --ignored history_smoke fav_smoke` **2/2 PASS**(登录态真实网络,只读)。
+- ⚠️ **登录态 selftest 环境挂起(待查,另开任务)**:`QAQ_BX_DATA_DIR=data ./qaq-bx-ui.exe --selftest user-lists` 在「启动探测(自动 Cookie 续期+bili_ticket 预热)」阶段卡死(ui-trace.log 停在 `app start` 后零 route 事件;无凭据环境同场景 PASS)——疑似 selftest `sync()` 与 boot 后台续期流程互等,与列表页数据链无关(core 实网冒烟 0.39s 全过)。真机(打包/正常启动)登录态体验待用户实机复核。
 - 遗留:历史续播(progress → 播放器 start_secs 贯通)、稍后再看/历史删除写路径、历史内搜索(history/search 已抓样)、收藏的夹(collected/list 已抓样)、多 P 定点(cid 已在行数据中,待播放器入口参数)——均记录为后续。
