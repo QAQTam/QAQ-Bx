@@ -304,11 +304,16 @@ impl ViewportLayout {
         self.tier == ContentLayoutTier::Medium
     }
 
-    /// 窗口拖拽防抖：列数变化、卡态切换或单卡宽变化 ≥ 2 DIP 时才重建 `VirtualSource`。
+    /// 结构性重建判定(#4):仅列数 / 卡态变化。卡宽已不进行 key,宽度收口走
+    /// `metrics_refresh_needed` 的轻量原地刷新(同 key 复用容器,diff 改属性)。
     pub fn should_rebuild_grid(self, prev: CardMetrics) -> bool {
-        self.cards.cols != prev.cols
-            || self.cards.compact_card != prev.compact_card
-            || (self.cards.card_width - prev.card_width).abs() >= 2.0
+        self.cards.cols != prev.cols || self.cards.compact_card != prev.compact_card
+    }
+
+    /// 卡宽收口变化 ≥ 2 DIP:去抖后需把新度量(行高/封面高/骨架条宽)下发一次
+    /// 到稳定 key 的行上;列宽本身拖拽期间已由 Grid star 列连续跟随,无需等待。
+    pub fn metrics_refresh_needed(self, prev: CardMetrics) -> bool {
+        (self.cards.card_width - prev.card_width).abs() >= 2.0
     }
 }
 
@@ -417,7 +422,14 @@ mod tests {
         assert!(!tiny.should_rebuild_grid(base.cards));
 
         let wider = ViewportLayout::from_window_size(396.0, 760.0);
-        assert!(wider.should_rebuild_grid(base.cards));
+        // #4:纯卡宽变化不再触发结构性重建,只需 metrics 收口轻量刷新一次。
+        assert!(!wider.should_rebuild_grid(base.cards));
+        assert!(wider.metrics_refresh_needed(base.cards));
+        let nudge = ViewportLayout::from_window_size(391.0, 760.0);
+        assert!(!nudge.metrics_refresh_needed(base.cards));
+        let cols_change = ViewportLayout::from_window_size(880.0, 760.0);
+        assert_ne!(cols_change.cards.cols, base.cards.cols);
+        assert!(cols_change.should_rebuild_grid(base.cards));
 
         assert!(!can_navigate_back(base, true, 0, false));
         assert!(can_navigate_back(base, true, 0, true));

@@ -41,6 +41,16 @@ impl HomeSlot {
     }
 }
 
+/// #4:行 key revision 只编码结构因子(`stream_gen` / `cols` / 卡态),**卡宽不再
+/// 参与**。F5 连续卡宽曲线下收口卡宽几乎必变,旧式含宽 key 会让全部已实现行
+/// 一次性拆挂;去宽后同批行 key 稳定,`VirtualSource` 复用容器,新度量经
+/// `input_changed` 原地改属性(diff 不重挂)。
+pub fn home_row_revision(stream_gen: u64, cards: CardMetrics) -> u64 {
+    let cols = cards.cols.max(1) as u64;
+    let compact_bit = u64::from(cards.compact_card);
+    (stream_gen << 16) | (cols << 12) | (compact_bit << 11)
+}
+
 /// 构建推荐流按行虚拟化数据源（仅在槽位/度量/封面实质变更时重建，避免滚动事件触发整页行刷新）。
 pub fn home_virtual_source(
     slots: &[HomeSlot],
@@ -119,6 +129,7 @@ pub fn video_grid(items: &[VideoItem], metrics: CardMetrics, on_open: &Callback<
                             slot,
                             metrics,
                             is_focused: false,
+                            grid_col: None,
                             on_open: on_open.clone(),
                             on_hover_preresolve: None,
                             unplayable_badge: None,
@@ -194,6 +205,7 @@ impl Component for FeedRow {
                     slot: slot.clone(),
                     metrics: input.metrics,
                     is_focused: input.focused_col == Some(col_idx),
+                    grid_col: Some(col_idx as i32),
                     on_open: input.on_open.clone(),
                     on_hover_preresolve: Some(input.on_hover_preresolve.clone()),
                     unplayable_badge: slot
@@ -202,9 +214,12 @@ impl Component for FeedRow {
                 }),
             )
         });
-        StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(input.metrics.gap)
+        // #4:N 等分 star 列,卡片 Stretch——拖拽期间列宽由 XAML 布局连续跟随,
+        // 零 Rust 开销;行高/封面高仍是 settled 后单一下发的度量属性。
+        let cols = input.metrics.cols.max(1);
+        Grid::new()
+            .columns((0..cols).map(|_| GridLength::Star(1.0)))
+            .column_spacing(input.metrics.gap)
             .height(input.metrics.card_height)
             .margin(Thickness::new(0.0, 0.0, 0.0, input.metrics.gap))
             .keyed_children(cells)
@@ -217,6 +232,9 @@ pub struct VideoCardInput {
     pub slot: HomeSlot,
     pub metrics: CardMetrics,
     pub is_focused: bool,
+    /// Some(n) = 位于行 `Grid` 第 n 列:根元素带 `Grid.Column` 附加属性且**不定宽**
+    /// (宽度交给 star 列连续跟随,#4);None = 静态网格,保留显式 `card_width`。
+    pub grid_col: Option<i32>,
     pub on_open: Callback<String>,
     pub on_hover_preresolve: Option<Callback<String>>,
     /// 非空 = 该稿已被预解析判定为不可播（充电/付费未解锁），卡面打标。
@@ -396,7 +414,7 @@ impl Component for VideoCard {
     fn view(&self, input: &Self::Input, context: &mut ViewContext<Self>) -> View {
         let metrics = input.metrics;
         let content: View = match &input.slot {
-            HomeSlot::Skeleton { .. } => skeleton_card_view(metrics),
+            HomeSlot::Skeleton { .. } => skeleton_card_view(metrics, input.grid_col.is_some()),
             HomeSlot::Video { item, .. } => {
                 populated_card_view(
                     item,
@@ -408,16 +426,21 @@ impl Component for VideoCard {
             }
         };
 
+        // #4:行 Grid 内的卡不定宽(Grid.Column 附加属性 + Stretch 随列宽);
+        // 静态网格保留显式宽度。
+        let placed = |b: Border| match input.grid_col {
+            Some(col) => b.grid_column(col),
+            None => b.width(metrics.card_width),
+        };
+
         if metrics.compact_card {
-            return Border::new()
-                .width(metrics.card_width)
+            return placed(Border::new())
                 .height(metrics.card_height)
                 .content(content)
                 .into();
         }
 
-        let mut animated_box = Border::new()
-            .width(metrics.card_width)
+        let mut animated_box = placed(Border::new())
             .height(metrics.card_height)
             .content(content);
 
@@ -428,8 +451,7 @@ impl Component for VideoCard {
         // 外层固定命中盒（不缩放）：防止收缩阶段鼠标落在边缘外侧引发 Enter/Exit 抖动。
         let on_enter = context.callback(|_: PointerEventInfo| Message::PointerEntered);
         let on_exit = context.callback(|_: PointerEventInfo| Message::PointerExited);
-        Border::new()
-            .width(metrics.card_width)
+        placed(Border::new())
             .height(metrics.card_height)
             .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
             .on_pointer_entered(on_enter)
@@ -439,7 +461,7 @@ impl Component for VideoCard {
     }
 }
 
-fn skeleton_card_view(metrics: CardMetrics) -> View {
+fn skeleton_card_view(metrics: CardMetrics, stretch: bool) -> View {
     let pad = if metrics.compact_card { 8.0 } else { 12.0 };
     let bar = |width: f64, opacity: f64, top: f64| {
         Border::new()
@@ -452,8 +474,13 @@ fn skeleton_card_view(metrics: CardMetrics) -> View {
     };
     let line1_w = (metrics.card_width * 0.72).round().max(90.0);
     let line2_w = (metrics.card_width * 0.46).round().max(60.0);
-    Border::new()
-        .width(metrics.card_width)
+    let root = Border::new();
+    let root = if stretch {
+        root
+    } else {
+        root.width(metrics.card_width)
+    };
+    root
         .height(metrics.card_height)
         .corner_radius(8.0)
         .background(ThemeBrush::CardBackground)
@@ -727,5 +754,27 @@ mod tests {
         hm.on_exit();
         assert_eq!(hm.scale_transition(), Some((1.0, RESET_DURATION)));
         assert!(hm.on_preresolve(seq).is_none());
+    }
+
+    /// #4 判定单测:卡宽变化不得进入行 revision(同批行 key 稳定 → 收口走原地
+    /// diff 不重挂);仅 stream_gen / cols / 卡态变化才使 key 翻转。
+    #[test]
+    fn row_revision_ignores_card_width_but_tracks_structure() {
+        let base = crate::layout::ViewportLayout::from_window_size(390.0, 760.0).cards;
+        let wider = crate::layout::ViewportLayout::from_window_size(396.0, 760.0).cards;
+        assert_ne!(base.card_width, wider.card_width, "样本须确有卡宽差");
+        assert_eq!(
+            home_row_revision(1, base),
+            home_row_revision(1, wider),
+            "纯卡宽变化行 revision 必须不变"
+        );
+
+        let desktop = crate::layout::ViewportLayout::from_window_size(1280.0, 800.0).cards;
+        assert_ne!(
+            home_row_revision(1, base),
+            home_row_revision(1, desktop),
+            "cols/卡态变化必须翻转 revision"
+        );
+        assert_ne!(home_row_revision(1, base), home_row_revision(2, base));
     }
 }

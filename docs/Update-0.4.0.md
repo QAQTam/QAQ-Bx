@@ -156,3 +156,16 @@ Content-Range 的短 206」由整块接受改为收敛该块尾(等价旧上层�
 - workspace 版本 0.2.0 → **0.4.0**(`Cargo.toml [workspace.package]`,成员
   `version.workspace` 继承;Cargo.lock 同步)。打包(`just dev`/`release-sign`)
   的版本号自此取 0.4.0.x。
+
+## R. 首页网格拖拽整片重挂修复(refs #4,P0,2026-11-19)✅(真机体感待录)
+
+| 项 | 内容 | 落点 / 证据 |
+|---|---|---|
+| R-1 行 key 去卡宽 | `row_revision` 原编码卡宽低 11 位,F5 连续卡宽曲线下收口卡宽几乎必变 → 全部已实现行 key 翻转 → ItemsRepeater 一次性拆挂 ~60 卡 × ~10 元素(「松手卡一下」主因)。改 `home_row_revision(stream_gen, cards)` 仅编码结构因子;宽度收口同 key 复用行容器,经 `FeedRowInput.metrics`→`input_changed` 原地 diff | `widgets/video_card.rs`(helper)、`shell.rs`(`current_row_revision`/初值共用 helper);单测 `row_revision_ignores_card_width_but_tracks_structure` |
+| R-2 卡片自适应宽度 | 行容器 `StackPanel`→`Grid` N 等分 star 列 + `column_spacing`,卡片经 `VideoCardInput.grid_col` 把 `Grid.Column` 附加在既有外层 Border(零新增元素)且不再定宽——拖拽 150ms 去抖窗内列宽由 XAML 连续跟随;静态页(热门/搜索)保留显式宽 | `widgets/video_card.rs` `FeedRow::view`/`VideoCard::view`/`skeleton_card_view` |
+| R-3 重建判定收窄 | `should_rebuild_grid` 只认 cols/compact;新增 `metrics_refresh_needed`(卡宽 ≥2 DIP)走同一去抖的轻量刷新;settled 仅结构性变化才清活动行/锚点/驱逐游标(`pending_grid_structural`),竖屏切换路径同型改造 | `layout.rs`(单测 `grid_rebuild_debounce_and_back_navigation_predicates` 更新:宽度差 → 非结构、需轻量刷新)、`shell.rs` resize/portrait 两处调用点 |
+
+### R 项验收实测(2026-11-19)
+
+- `cargo test --workspace`:**223 passed, 0 failed**;`just selftest all`:**15/15 PASS**(含 mobile/half-pane/popular/search,覆盖虚拟化与静态两条网格通路;0 panic)。
+- E14 前后对照**不构成本项证据**:E14 直开播放页路由不经过首页行网格,风暴计数器被网络解码波动主导(pre 两样本 max_gap {167,197}ms vs post {97,178}ms,同噪声水平)。本项收益为结构性(收口 remount→diff),定量需真机首页拖框体感或将 E14 改为首页路由探针;新增 `scripts/home-storm-probe.ps1`(首页路由风暴采样,修复后 30×55ms 伸缩仅消费 3 条消息)。

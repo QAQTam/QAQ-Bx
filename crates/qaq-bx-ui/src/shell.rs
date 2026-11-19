@@ -805,6 +805,9 @@ pub struct AppShell {
     global_key_handler: RoutedCallback<KeyEventInfo>,
     /// P1 拖拽期间挂起的网格重建(去抖 150ms,静止后一次)。
     pending_grid_rebuild: bool,
+    /// 挂起期间是否发生过结构性变化(cols/卡态):settled 时仅结构变化才清
+    /// 活动行/锚点(#4 后纯宽度收口复用同批行容器,游标依旧有效)。
+    pending_grid_structural: bool,
     grid_rebuild_timer: Option<ComponentTimer>,
     /// 视口布局（壳层形态 / 内容密度 / 卡片度量单源）。
     viewport_layout: ViewportLayout,
@@ -1948,11 +1951,7 @@ impl AppShell {
     }
 
     fn current_row_revision(&self) -> u64 {
-        let cards = self.viewport_layout.cards;
-        let cols = cards.cols.max(1) as u64;
-        let compact_bit = u64::from(cards.compact_card);
-        let width_bits = (cards.card_width.round().max(0.0) as u64) & 0x7FF;
-        (self.home_state.stream_gen << 16) | (cols << 12) | (compact_bit << 11) | width_bits
+        video_card::home_row_revision(self.home_state.stream_gen, self.viewport_layout.cards)
     }
 
     fn rebuild_home_source(&mut self) {
@@ -4388,10 +4387,7 @@ impl Component for AppShell {
                 active,
             });
         let initial_cols = initial_layout.cards.cols;
-        let initial_rev = (feed_gen << 16)
-            | ((initial_cols as u64) << 12)
-            | ((u64::from(initial_layout.cards.compact_card)) << 11)
-            | ((initial_layout.cards.card_width.round() as u64) & 0x7FF);
+        let initial_rev = video_card::home_row_revision(feed_gen, initial_layout.cards);
         let home_source = video_card::home_virtual_source(
             &home_slots,
             initial_layout.cards,
@@ -4619,6 +4615,7 @@ impl Component for AppShell {
             key_route_ctx,
             global_key_handler,
             pending_grid_rebuild: false,
+            pending_grid_structural: false,
             grid_rebuild_timer: None,
             viewport_layout: initial_layout,
             whisper_detail_open: false,
@@ -5808,11 +5805,14 @@ impl Component for AppShell {
                         crate::trace::note("route->player (移动布局半屏收起)");
                     }
                 }
-                if next_layout.should_rebuild_grid(prev_cards) {
-                    // 轻量字段即时更新(探针/分页目标依赖);重量级 VirtualSource
-                    // 重建去抖 150ms(P1:拖拽期间每 2 DIP 一重建是卡顿主因)。
+                let structural = next_layout.should_rebuild_grid(prev_cards);
+                if structural || next_layout.metrics_refresh_needed(prev_cards) {
+                    // 轻量字段即时更新(探针/分页目标依赖);VirtualSource 重建
+                    // 去抖 150ms。#4 后行 key 不含卡宽:纯宽度收口是同 key 原地
+                    // diff(改行高/封面高属性),仅结构变化才拆挂重建。
                     self.home_state.grid_cols = next_layout.cards.cols;
                     self.pending_grid_rebuild = true;
+                    self.pending_grid_structural |= structural;
                     self.grid_rebuild_timer =
                         Some(context.set_local_timeout(GRID_REBUILD_DEBOUNCE, || {
                             Message::WindowResizeSettled
@@ -5832,9 +5832,12 @@ impl Component for AppShell {
                 self.grid_rebuild_timer = None;
                 if self.pending_grid_rebuild {
                     self.pending_grid_rebuild = false;
-                    self.home_active_rows.clear();
-                    self.home_anchor_row = 0;
-                    self.home_last_evict_row = 0;
+                    if std::mem::take(&mut self.pending_grid_structural) {
+                        // 结构性重建:行重组,游标作废;纯宽度收口保留游标。
+                        self.home_active_rows.clear();
+                        self.home_anchor_row = 0;
+                        self.home_last_evict_row = 0;
+                    }
                     self.rebuild_home_source();
                 }
             }
@@ -6193,13 +6196,17 @@ impl Component for AppShell {
                         self.home_viewport_w = next_layout.content_width();
                         self.home_viewport_h = next_layout.content_height();
                         self.home_half_pane = false;
-                        if next_layout.should_rebuild_grid(prev_cards) {
+                        let structural = next_layout.should_rebuild_grid(prev_cards);
+                        if structural || next_layout.metrics_refresh_needed(prev_cards) {
                             self.home_state.grid_cols = next_layout.cards.cols;
                             self.pending_grid_rebuild = false;
+                            self.pending_grid_structural = false;
                             self.grid_rebuild_timer = None;
-                            self.home_active_rows.clear();
-                            self.home_anchor_row = 0;
-                            self.home_last_evict_row = 0;
+                            if structural {
+                                self.home_active_rows.clear();
+                                self.home_anchor_row = 0;
+                                self.home_last_evict_row = 0;
+                            }
                             self.rebuild_home_source();
                         }
                     } else if self.portrait_docked {

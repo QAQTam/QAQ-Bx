@@ -46,3 +46,13 @@ E14 拖拽脚本前后对比:settled 后首帧耗时、风暴期 UI 线程最大
 - 时序:进入 300ms 预取简介 → 1s 弹出 → 离开宽限 200ms;手柄/键盘焦点停留 1s 同样触发。
 - 动画:Composition `Vector3KeyFrameAnimation` Scale 1.0→1.15(中心点居中)+ Opacity。
 - 复用 `video_card.rs` 现有 HoverState(on_enter/on_expand/on_preresolve),改为卡片只上报、Shell 驱动单例。
+
+## 实施状态(2026-11-19,refs #4)
+
+- 🔴 两项 P0 已实施:
+  - `video_card::home_row_revision(stream_gen, cards)` 只编码结构因子,卡宽不再进行 key;`should_rebuild_grid` 收窄为 cols/compact,纯宽度收口走新增 `metrics_refresh_needed`(≥2 DIP)的轻量原地刷新;reactor `reconcile_virtual_items` 对同 `key_revision`+同 key 集合复用行容器,`FeedRow/VideoCard` 经 input diff 原地改属性。
+  - `FeedRow` 行容器 `StackPanel`→`Grid` N 等分 star 列 + `column_spacing`;`VideoCardInput.grid_col: Option<i32>`,行内卡不带显式宽(`Grid.Column` 附加在既有外层 Border,零新增元素),静态页(热门/搜索)保留显式宽不受影响;行高/封面高仍按行统一下发。
+  - settled 仅在结构性变化时清活动行/游标(`pending_grid_structural`),纯宽度收口保留滚动游标语义。
+- 验证:`cargo test --workspace` 223 passed(新增 revision 稳定性/重建判定单测);`just selftest all` 15/15 PASS(mobile/half-pane/popular/search 覆盖两条网格通路)。
+- ⚠ E14 口径说明:E14 直开播放页路由,不经过首页行网格,风暴计数器(max_gap/消费数)被网络解码波动主导——修复前后两样本 pre {167,197} vs post {97,178}ms,无法据此判定收益;「松手卡一下」的消除属结构性(remount→diff),待真机首页拖框体感与后续把 E14 改为首页路由探针再定量。`scripts/home-storm-probe.ps1` 为首页路由补充探针(修复后 30×55ms 风暴仅消费 3 条)。
+- 未做:终局 fork `UniformGridLayout`(列数交给原生)仍为可选项。
