@@ -28,13 +28,17 @@
 //! 独立 composition 子树):播放页真机截图验证,结论记
 //! docs/dev-notes/liquid-glass-research.md。
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use windows_core::{IUnknown, Interface as _};
 use windows_numerics::Vector2;
 use windows_reactor::{
-    ColorScheme, Component, ComponentContext, CompositionHostEvent, ElementRef, ElementObservation,
-    Grid, View, ViewContext,
+    ColorScheme, Component, ComponentContext, ComponentTimer, CompositionHostEvent, ElementRef,
+    ElementObservation, Grid, View, ViewContext,
 };
 
 include!(concat!(env!("OUT_DIR"), "/winrt_bindings.rs"));
@@ -99,6 +103,67 @@ fn glass_metrics(width: f64, height: f64) -> Option<(f32, f32)> {
     Some((width as f32, height as f32))
 }
 
+/// #6 玻璃风暴降级参数:拖框期(脉冲间隔 ≤300ms 且连续 ≥3)把 composition
+/// blur 效果层置零尺寸(零面积无 backdrop 重采样,只留 tint 霜面);
+/// 静止 ≥400ms 恢复。常量与 shell 的 resize 去抖(150ms)独立——玻璃只关心
+/// 「还有没有下一拍」,不走 shell 消息链,保持组件自治。
+const GLASS_STORM_GAP_MS: u64 = 300;
+const GLASS_STORM_MIN_BURST: u32 = 3;
+const GLASS_STORM_SETTLE: Duration = Duration::from_millis(400);
+
+/// 风暴状态机(u64 毫秒时钟,可脱离真实时间单测)。
+#[derive(Debug)]
+struct StormTracker {
+    base: Instant,
+    last_ms: Option<u64>,
+    run: u32,
+    storm: bool,
+}
+
+impl StormTracker {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            last_ms: None,
+            run: 0,
+            storm: false,
+        }
+    }
+
+    fn now_ms(&self, now: Instant) -> u64 {
+        now.duration_since(self.base).as_millis() as u64
+    }
+
+    /// 一次 Metrics 脉冲;返回 true = 本次进入风暴(需要降级)。
+    fn pulse(&mut self, now: Instant) -> bool {
+        let t = self.now_ms(now);
+        match self.last_ms {
+            Some(last) if t.saturating_sub(last) <= GLASS_STORM_GAP_MS => self.run += 1,
+            _ => self.run = 1,
+        }
+        self.last_ms = Some(t);
+        if !self.storm && self.run >= GLASS_STORM_MIN_BURST {
+            self.storm = true;
+            return true;
+        }
+        false
+    }
+
+    /// 去抖到期检查;返回 true = 风暴结束(需要恢复效果层)。
+    fn settled(&mut self, now: Instant) -> bool {
+        if !self.storm {
+            return false;
+        }
+        let t = self.now_ms(now);
+        if self.last_ms.is_none_or(|last| t.saturating_sub(last) >= 400) {
+            self.storm = false;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// 组件入参:宿主网格内容(chrome.rs 传空 Grid——Tab 行是玻璃宿主的
 /// 兄弟节点后绘制,不能放进本网格,否则被玻璃 child visual 盖住;
 /// structural PartialEq 一致则组件不重挂,玻璃宿主元素保持绑定)。
@@ -111,6 +176,10 @@ pub struct GlassBarInput {
 #[derive(Clone, Copy)]
 pub enum GlassMessage {
     Scheme(ColorScheme),
+    /// #6:composition host Metrics 转投的组件消息(尺寸 + 风暴计时入口)。
+    Pulse { width: f64, height: f64 },
+    /// #6:风暴去抖到期;静默 ≥400ms 才真正恢复效果层。
+    StormSettled,
 }
 
 /// 底栏玻璃宿主组件:根网格绑 `ElementRef<Grid>`,观察 composition host
@@ -118,6 +187,8 @@ pub enum GlassMessage {
 pub struct GlassBar {
     element: ElementRef<Grid>,
     state: Rc<RefCell<GlassState>>,
+    /// #6 风暴恢复去抖表(每一拍 Pulse 重挂)。
+    storm_timer: Option<ComponentTimer>,
 }
 
 /// Ready 可能先于布局到达(零尺寸):compositor 先存,Metrics 有效尺寸补建。
@@ -126,6 +197,8 @@ struct GlassState {
     compositor: Option<Compositor>,
     runtime: Option<GlassRuntime>,
     scheme: Option<ColorScheme>,
+    /// #6 风暴状态机(首拍惰性创建)。
+    storm: Option<StormTracker>,
 }
 
 struct GlassRuntime {
@@ -134,6 +207,11 @@ struct GlassRuntime {
     children: Vec<Visual>,
     /// tint 霜面笔刷句柄(主题变化时 SetColor 原地更新,不重建视觉)。
     tint: CompositionColorBrush,
+    /// #6 模糊效果层在 `children` 中的下标(效果图构建失败则 None);
+    /// 风暴期该 Sprite SetSize(0,0) 停止 backdrop 每帧重采样。
+    effect: Option<usize>,
+    /// 当前生效尺寸(风暴恢复用)。
+    size: (f32, f32),
 }
 
 impl Component for GlassBar {
@@ -144,10 +222,11 @@ impl Component for GlassBar {
         Self {
             element: ElementRef::new(),
             state: Rc::new(RefCell::new(GlassState::default())),
+            storm_timer: None,
         }
     }
 
-    fn update(&mut self, message: Self::Message, _context: &ComponentContext<Self>) {
+    fn update(&mut self, message: Self::Message, context: &ComponentContext<Self>) {
         match message {
             GlassMessage::Scheme(scheme) => {
                 self.state.borrow_mut().scheme = Some(scheme);
@@ -162,15 +241,56 @@ impl Component for GlassBar {
                     eprintln!("[glass] tint adapted to {scheme:?}");
                 }
             }
+            GlassMessage::Pulse { width, height } => {
+                let Some((w, h)) = glass_metrics(width, height) else {
+                    return;
+                };
+                let storm_now = {
+                    let mut state = self.state.borrow_mut();
+                    let tracker = state.storm.get_or_insert_with(StormTracker::new);
+                    let entered = tracker.pulse(Instant::now());
+                    if entered {
+                        eprintln!("[glass] resize storm → tint-only degrade");
+                    }
+                    tracker.storm
+                };
+                self.apply_size(w, h, storm_now);
+                self.storm_timer =
+                    Some(context.set_local_timeout(GLASS_STORM_SETTLE, || GlassMessage::StormSettled));
+            }
+            GlassMessage::StormSettled => {
+                let (exited, size) = {
+                    let mut state = self.state.borrow_mut();
+                    let exited = state
+                        .storm
+                        .as_mut()
+                        .is_some_and(|tracker| tracker.settled(Instant::now()));
+                    (exited, state.runtime.as_ref().map(|r| r.size))
+                };
+                if exited {
+                    if let Some((w, h)) = size {
+                        eprintln!("[glass] storm settled → blur restored");
+                        self.apply_size(w, h, false);
+                    }
+                }
+            }
         }
     }
 
     fn view(&self, input: &Self::Input, context: &mut ViewContext<Self>) -> View {
         let element = self.element.clone();
         let state = Rc::clone(&self.state);
+        // #6:Metrics 转投组件消息(update 域),风暴计时与恢复都走消息序列,
+        // 观察回调线程不再直接改视觉。
+        let on_pulse = context.callback(|(width, height)| GlassMessage::Pulse { width, height });
         context.use_effect_guard("glass-host", (), move || {
             eprintln!("[glass] observe registered");
-            GlassObserver { element, state }.observe()
+            GlassObserver {
+                element,
+                state,
+                on_pulse,
+            }
+            .observe()
         });
         // 主题观察:订阅即回报当前方案,之后仅变化派发(reactor
         // on_color_scheme 契约,与 shell 的 on_window_size 同一范式)。
@@ -183,10 +303,35 @@ impl Component for GlassBar {
     }
 }
 
+impl GlassBar {
+    /// #6 尺寸同步:几何/容器/子层跟随;`storm=true` 时效果层置零尺寸
+    /// (backdrop 停止重采样,tint 霜面层照常显示)。
+    fn apply_size(&self, w: f32, h: f32, storm: bool) {
+        let mut state = self.state.borrow_mut();
+        let Some(runtime) = state.runtime.as_mut() else {
+            return;
+        };
+        runtime.size = (w, h);
+        let v2 = Vector2 { x: w, y: h };
+        let zero = Vector2 { x: 0.0, y: 0.0 };
+        let _ = runtime.geometry.SetSize(v2);
+        for (idx, child) in runtime.children.iter().enumerate() {
+            if let Ok(sized) = child.cast::<IVisual>() {
+                let hidden = storm && runtime.effect == Some(idx);
+                let _ = sized.SetSize(if hidden { zero } else { v2 });
+            }
+        }
+        if let Ok(visual) = runtime.container.cast::<IVisual>() {
+            let _ = visual.SetSize(v2);
+        }
+    }
+}
+
 /// 观察回调的借用拆分(回调持 Rc,不持组件引用)。
 struct GlassObserver {
     element: ElementRef<Grid>,
     state: Rc<RefCell<GlassState>>,
+    on_pulse: windows_reactor::Callback<(f64, f64)>,
 }
 
 impl GlassObserver {
@@ -194,6 +339,7 @@ impl GlassObserver {
         let observer = GlassObserver {
             element: self.element.clone(),
             state: Rc::clone(&self.state),
+            on_pulse: self.on_pulse.clone(),
         };
         self.element.observe_composition_host(move |event| match event {
             CompositionHostEvent::Ready {
@@ -240,20 +386,11 @@ impl GlassObserver {
             self.build(&compositor, w, h);
             return;
         }
-        let state = self.state.borrow();
-        let Some(runtime) = state.runtime.as_ref() else {
+        if self.state.borrow().runtime.is_none() {
             return;
-        };
-        let v2 = Vector2 { x: w, y: h };
-        let _ = runtime.geometry.SetSize(v2);
-        for child in &runtime.children {
-            if let Ok(sized) = child.cast::<IVisual>() {
-                let _ = sized.SetSize(v2);
-            }
         }
-        if let Ok(visual) = runtime.container.cast::<IVisual>() {
-            let _ = visual.SetSize(v2);
-        }
+        // #6:已有资产 → 转投 Pulse,由 update 域做风暴判定 + 尺寸同步。
+        self.on_pulse.call((width, height));
     }
 
     /// 建玻璃资产并垫到宿主之下。任一步失败只记日志(下一拍 Metrics /
@@ -293,6 +430,7 @@ impl GlassObserver {
         };
 
         let mut children: Vec<Visual> = Vec::new();
+        let mut effect_idx: Option<usize> = None;
         // 层 1:效果刷(模糊背板);失败时回退 tint-only 单层。
         match self.build_effect_brush(compositor) {
             Ok(effect_brush) => {
@@ -300,6 +438,7 @@ impl GlassObserver {
                     self.filled_sprite(compositor, &effect_brush, w, h, &clip)
                 {
                     let _ = children_coll.InsertAtBottom(&visual);
+                    effect_idx = Some(children.len());
                     children.push(visual);
                 }
             }
@@ -342,12 +481,31 @@ impl GlassObserver {
         });
         if accepted {
             eprintln!("[glass] child visual request enqueued");
+            let storm_now = self
+                .state
+                .borrow()
+                .storm
+                .as_ref()
+                .is_some_and(|tracker| tracker.storm);
             self.state.borrow_mut().runtime = Some(GlassRuntime {
                 geometry,
                 container,
                 children,
                 tint,
+                effect: effect_idx,
+                size: (w, h),
             });
+            // 风暴中途补建:效果层直接以零尺寸入场。
+            if storm_now {
+                let state = self.state.borrow();
+                if let Some(runtime) = state.runtime.as_ref()
+                    && let Some(idx) = runtime.effect
+                    && let Some(visual) = runtime.children.get(idx)
+                    && let Ok(sized) = visual.cast::<IVisual>()
+                {
+                    let _ = sized.SetSize(Vector2 { x: 0.0, y: 0.0 });
+                }
+            }
         } else {
             eprintln!("[glass] set child visual request not accepted (宿主未实例化)");
         }
@@ -511,5 +669,35 @@ mod tests {
         let dark = tint_color(ColorScheme::Dark);
         assert_eq!(dark.a, DARK_TINT_ALPHA);
         assert!(dark.r < 0x40, "深色霜面必须近黑以衬托白图标");
+    }
+
+    /// #6 玻璃风暴状态机:慢速稀疏 Metrics 不降级;连续拖框第 3 拍进入风暴;
+    /// 风暴期内继续有拍不结束;静默 ≥400ms 才结束一次。
+    #[test]
+    fn glass_storm_tracker_enters_on_burst_and_exits_on_quiet() {
+        let t0 = Instant::now();
+        let ms = |d: u64| t0 + Duration::from_millis(d);
+
+        // 稀疏脉冲(间隔 >300ms):永不进风暴。
+        let mut tr = StormTracker::new();
+        assert!(!tr.pulse(ms(0)));
+        assert!(!tr.pulse(ms(500)));
+        assert!(!tr.pulse(ms(1000)));
+        assert!(!tr.storm);
+
+        // 拖框连拍 55ms:第 3 拍进入,后续拍保持。
+        let mut tr = StormTracker::new();
+        assert!(!tr.pulse(ms(0)));
+        assert!(!tr.pulse(ms(55)));
+        assert!(tr.pulse(ms(110)), "第 3 连拍应进入风暴");
+        assert!(tr.storm);
+        assert!(!tr.pulse(ms(165)), "风暴内保持,不重复触发进入");
+
+        // 风暴未静默:去抖早到不误恢复。
+        assert!(!tr.settled(ms(400)), "距上拍 235ms <400ms 不应结束");
+        // 静默足够久:结束一次,再查不复触发。
+        assert!(tr.settled(ms(600)));
+        assert!(!tr.storm);
+        assert!(!tr.settled(ms(1200)), "非风暴态 settled 恒 false");
     }
 }

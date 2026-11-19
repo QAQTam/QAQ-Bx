@@ -13,9 +13,9 @@
 | 🔴 P0 | **行 key 含卡宽**:`row_revision` 编码 `card_width` 低 11 位,行 key = `(rev<<24)^row_idx`。F5 连续卡宽曲线下几乎每次拖拽收口卡宽都变 → 所有已实现行 key 全变 → ItemsRepeater 拆掉并重建全部可见+预热行(约 60 卡 × ~10 元素)一次性压在 UI 线程,即"松手卡一下" | shell.rs `current_row_revision` L1950;video_card.rs L70 | key 只编码 `stream_gen/cols/compact`;卡宽经 `FeedRowInput.metrics` 走 `input_changed` 原地改属性(diff 而非重挂) |
 | 🔴 P0 | **卡片显式定宽**:`Border.width(card_width)`,拖拽 150ms 内网格不跟手(溢出/留白),只能等 Rust 侧重建 | video_card.rs L412-457 | 行改 Grid N 个 star 列、卡片 Stretch,宽度交给 XAML 布局连续跟随,零 Rust 开销;封面高按行宽统一下发(单属性)。终局:fork 暴露 `UniformGridLayout`(MinItemWidth + ItemsStretch=Fill),列数也交给原生,只有分页逻辑需要 cols |
 | 🟠 P1 | **AppShell 整树重渲染**:每条 `WindowResized` 都改 `viewport_layout`,7.9k 行根组件 view 全量 diff,拖拽期间每帧一次 | shell.rs L5764-5818 | ✅ 已实施(refs #5):尺寸泵走 fork 新增 silent dispatch(`send_silent`,只 update 不排渲染);档内像素变化不再重跑根 view,结构签名(`resize_render_signature`)翻转才显式 `ShellInvalidateLayout`,静止 150ms 由 settled 统一收敛;全屏 HUD 宽度改按需读取。E14 播放页风暴 `max_gap_ms` 233/167/197 → 96/103 |
-| 🟠 P1 | **滚动驱逐整源重建**:`sync_offscreen_covers` 任一封面置空 → `rebuild_home_source` → 全部 slots `chunk.to_vec()` 深拷贝(String 字段)O(N) | shell.rs L2044;video_card.rs L57-60 | slots 改 `Rc<VideoItem>`;按行局部更新而非整源重建 |
-| 🟡 P2 | 移动玻璃:拖拽中 composition blur(σ9)每帧随 SetSize 重采样,弱核显吃力 | widgets/glass.rs | 风暴期切 tint-only,settled 恢复 blur |
-| 🟡 P2 | 封面下载双拷贝:`bytes.to_vec()` 再转 `Arc<[u8]>` | auth.rs L338 | `Arc::<[u8]>::from(&bytes[..])` 一次拷贝 |
+| 🟠 P1 | **滚动驱逐整源重建**:`sync_offscreen_covers` 任一封面置空 → `rebuild_home_source` → 全部 slots `chunk.to_vec()` 深拷贝(String 字段)O(N) | shell.rs L2044;video_card.rs L57-60 | ✅ 已实施(refs #6):`HomeSlot::Video.item` 改 `Rc<VideoItem>`,驱逐/回填 `Rc::make_mut` copy-on-write 仅触及单条;`chunk.to_vec()` 只 bump 引用计数,行 diff `Rc::ptr_eq` O(1) 短路。单测 `cover_eviction_only_copies_touched_items_and_keeps_row_diff_pointer_equal` |
+| 🟡 P2 | 移动玻璃:拖拽中 composition blur(σ9)每帧随 SetSize 重采样,弱核显吃力 | widgets/glass.rs | ✅ 已实施(refs #6):Metrics 转投 `GlassMessage::Pulse`,`StormTracker`(≤300ms 连拍 ≥3)进风暴 → 效果层 `SetSize(0,0)`(绑定无 IsVisible,零面积即无 backdrop 重采样),tint 霜面照常;静默 ≥400ms 恢复。单测 `glass_storm_tracker_enters_on_burst_and_exits_on_quiet` |
+| 🟡 P2 | 封面下载双拷贝:`bytes.to_vec()` 再转 `Arc<[u8]>` | auth.rs L338 | ✅ 已实施(refs #6):`Arc::<[u8]>::from(&bytes[..])` 单次拷贝 |
 
 ## 已有的好设计(保留)
 

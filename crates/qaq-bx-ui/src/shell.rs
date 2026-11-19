@@ -2052,14 +2052,15 @@ impl AppShell {
                     && let Some(url) = &item.pic_url
                 {
                     if let Some(cached) = self.image_cache.get(url) {
-                        item.cover = Some(cached);
+                        // #6:copy-on-write,仅变更条目发生一次真实拷贝。
+                        Rc::make_mut(item).cover = Some(cached);
                         changed = true;
                     } else {
                         refetch.push((item.bvid.clone(), url.clone()));
                     }
                 }
             } else if item.cover.is_some() {
-                item.cover = None;
+                Rc::make_mut(item).cover = None;
                 changed = true;
             }
         }
@@ -3012,7 +3013,7 @@ impl AppShell {
 
     fn focused_home_video(&self) -> Option<&VideoItem> {
         let mut videos = self.home_slots.iter().filter_map(|slot| match slot {
-            HomeSlot::Video { item, .. } => Some(item),
+            HomeSlot::Video { item, .. } => Some(&**item),
             HomeSlot::Skeleton { .. } => None,
         });
         let count = self
@@ -5958,6 +5959,9 @@ impl Component for AppShell {
 
                     let bvid = item.bvid.clone();
                     self.home_index.insert(bvid.clone(), item.clone());
+                    // #6:槽位共享 Rc<VideoItem>,行分块复制只碰引用计数;
+                    // 封面驱逐/回填 copy-on-write 仅触及的条目发生真实拷贝。
+                    let item = Rc::new(item);
 
                     if cursor < self.home_slots.len() {
                         let slot_key = self.home_slots[cursor].slot_key().to_string();
@@ -6051,7 +6055,7 @@ impl Component for AppShell {
                         && let Some(HomeSlot::Video { item, .. }) = self.home_slots.get_mut(idx)
                         && item.cover.is_none()
                     {
-                        item.cover = Some(image.clone());
+                        Rc::make_mut(item).cover = Some(image.clone());
                         changed = true;
                         applied = true;
                     }

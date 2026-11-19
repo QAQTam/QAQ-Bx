@@ -335,7 +335,10 @@ impl Auth {
             .bytes()
             .await
             .ok()?;
-        Some(EncodedImage::new(bytes.to_vec()))
+        // #6:Bytes → Arc<[u8]> 单次拷贝(旧 `to_vec()` 再转 Arc 为两次全量拷贝)。
+        Some(EncodedImage::new(std::sync::Arc::<[u8]>::from(
+            &bytes[..],
+        )))
     }
 }
 

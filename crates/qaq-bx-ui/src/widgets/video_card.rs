@@ -20,10 +20,35 @@ const CONTRACT_SCALE: f64 = 0.96;
 const EXPAND_SCALE: f64 = 1.045;
 
 /// 推荐流网格槽位（先占骨架框架，后续按槽位键原地替换为真实视频卡）。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum HomeSlot {
     Skeleton { slot_key: String },
-    Video { slot_key: String, item: VideoItem },
+    /// #6:条目以 `Rc` 共享——滚动驱逐/封面回填只 copy-on-write 变更涉及的
+    /// 单条,`rebuild_home_source` 的行分块(`chunk.to_vec()`)从此只复制
+    /// 引用计数,不再深拷贝全部 String 字段;未变行按 `Rc::ptr_eq` O(1) 判等。
+    Video {
+        slot_key: String,
+        item: Rc<VideoItem>,
+    },
+}
+
+impl PartialEq for HomeSlot {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Skeleton { slot_key: a }, Self::Skeleton { slot_key: b }) => a == b,
+            (
+                Self::Video {
+                    slot_key: a,
+                    item: x,
+                },
+                Self::Video {
+                    slot_key: b,
+                    item: y,
+                },
+            ) => a == b && (Rc::ptr_eq(x, y) || x == y),
+            _ => false,
+        }
+    }
 }
 
 impl HomeSlot {
@@ -121,7 +146,7 @@ pub fn video_grid(items: &[VideoItem], metrics: CardMetrics, on_open: &Callback<
                 .map(|item| {
                     let slot = HomeSlot::Video {
                         slot_key: format!("static:{}", item.bvid),
-                        item: item.clone(),
+                        item: Rc::new(item.clone()),
                     };
                     KeyedView::new(
                         slot.slot_key().to_string(),
@@ -776,5 +801,75 @@ mod tests {
             "cols/卡态变化必须翻转 revision"
         );
         assert_ne!(home_row_revision(1, base), home_row_revision(2, base));
+    }
+
+    /// #6 验收:滚动驱逐/回填的局部性——`Rc::make_mut` copy-on-write 只触及
+    /// 变更条目,其余槽位保持同一 `Rc` 指针;行 diff 经 `Rc::ptr_eq` O(1) 判等,
+    /// `rebuild_home_source` 的 `chunk.to_vec()` 仅复制引用计数(不再深拷 String)。
+    #[test]
+    fn cover_eviction_only_copies_touched_items_and_keeps_row_diff_pointer_equal() {
+        let make = |i: u64| {
+            HomeSlot::Video {
+                slot_key: format!("slot-{i}"),
+                item: Rc::new(VideoItem {
+                    bvid: format!("BV{i:010}"),
+                    aid: i,
+                    cid: i,
+                    title: "标题".repeat(16),
+                    author: "UP".repeat(8),
+                    author_mid: 1,
+                    author_face_url: None,
+                    duration_secs: 60,
+                    play_count: 1,
+                    danmaku_count: 1,
+                    like_count: None,
+                    coin_count: None,
+                    favorite_count: None,
+                    share_count: None,
+                    cover: None,
+                    pic_url: Some("https://pic".into()),
+                }),
+            }
+        };
+        let slots: Vec<HomeSlot> = (0..64).map(make).collect();
+
+        // 行分块克隆:全部指针共享(判等 O(1)),无 String 深拷。
+        let rows: Vec<HomeSlot> = slots[0..8].to_vec();
+        for (a, b) in rows.iter().zip(&slots[0..8]) {
+            assert_eq!(a, b);
+            if let (
+                HomeSlot::Video { item: x, .. },
+                HomeSlot::Video { item: y, .. },
+            ) = (a, b)
+            {
+                assert!(Rc::ptr_eq(x, y), "to_vec 只 bump 引用计数");
+            } else {
+                panic!("期望 Video 槽");
+            }
+        }
+
+        // 驱逐 idx=3 的封面(copy-on-write):仅该槽指针分裂,其余仍共享。
+        let mut slots2 = slots.clone();
+        let keep_ptr_2 = match &slots2[2] {
+            HomeSlot::Video { item, .. } => Rc::clone(item),
+            _ => unreachable!(),
+        };
+        if let HomeSlot::Video { item, .. } = &mut slots2[3] {
+            Rc::make_mut(item).cover = None; // 模拟驱逐写(同值也触发 COW)
+        }
+        match &slots2[2] {
+            HomeSlot::Video { item, .. } => assert!(Rc::ptr_eq(item, &keep_ptr_2)),
+            _ => unreachable!(),
+        }
+        match (&slots[3], &slots2[3]) {
+            (
+                HomeSlot::Video { item: a, .. },
+                HomeSlot::Video { item: b, .. },
+            ) => {
+                assert!(!Rc::ptr_eq(a, b), "变更槽位应发生拷贝");
+                assert_eq!(a, b, "同内容仍判等(避免无谓重绘)");
+            }
+            _ => unreachable!(),
+        }
     }
 }

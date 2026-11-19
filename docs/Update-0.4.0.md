@@ -186,3 +186,16 @@ Content-Range 的短 206」由整块接受改为收敛该块尾(等价旧上层�
 
 - `cargo test --workspace`:**224 passed, 0 failed, 7 ignored**;`just selftest all` 15/15 PASS;fork `cargo test -p windows-reactor` 352+3+75 全绿。
 - E14 风暴 `max_gap_ms`(UI 线程最大节拍间隔):修复前样本 {233(文档基线), 167, 197} → 修复后 {96, 103},**约砍半**;消费/产出比与 CPU 占比变化在噪声范围内(播放页 CPU 由解码主导)。
+
+## T. UI 小项三连(refs #6,P1/P2×2,2026-11-20)✅
+
+| 项 | 内容 | 落点 / 证据 |
+|---|---|---|
+| T-1 滚动驱逐局部化 | `HomeSlot::Video.item: VideoItem → Rc<VideoItem>`;驱逐/封面回填改 `Rc::make_mut` copy-on-write,仅触及单条发生真实拷贝;`rebuild_home_source` 的 `chunk.to_vec()` 从此只 bump 引用计数;`HomeSlot` 手写 `PartialEq`(`Rc::ptr_eq` O(1) 短路 + 深比兜底),未变行在 reactor `apply_input` 判等即停,不重挂不重绘 | `widgets/video_card.rs`、`shell.rs`(sync_offscreen_covers/FlushCovers/HomeLoaded);单测 `cover_eviction_only_copies_touched_items_and_keeps_row_diff_pointer_equal` |
+| T-2 玻璃风暴降级 | composition host Metrics 转投 `GlassMessage::Pulse` 进组件消息域;`StormTracker` 判定(脉冲间隔 ≤300ms 且连续 ≥3)进风暴 → 模糊效果层 `SetSize(0,0)`(生成的绑定无 `IsVisible`,零面积即零 backdrop 重采样),tint 霜面层照常显示;每拍重挂 400ms 去抖,静默到期恢复;风暴中途补建亦以零尺寸入场。参数与 shell 去抖解耦,组件自治 | `widgets/glass.rs`;单测 `glass_storm_tracker_enters_on_burst_and_exits_on_quiet`(稀疏不降级/第 3 拍进入/风暴内保持/未静默不误恢复) |
+| T-3 封面双拷贝 | `auth.rs` 头像/封面下载 `bytes.to_vec()` 再转 `Arc<[u8]>` → `Arc::<[u8]>::from(&bytes[..])` 单次拷贝 | `crates/qaq-bx-ui/src/auth.rs` |
+
+### T 项验收实测(2026-11-20)
+
+- `cargo test --workspace`:**226 passed, 0 failed, 7 ignored**(UI 96→98);`just selftest all` **15/15 PASS**(mobile/half-pane 走玻璃与驱逐路径,0 panic;stress 4.1s 无回归)。
+- 长列表滚动帧耗时未单独定量(需真机 + E14 类脚本对首页路由采样);结构性证据:驱逐路径深拷贝次数从 O(全部槽位×String 字段) 降为 O(触及条数)。
