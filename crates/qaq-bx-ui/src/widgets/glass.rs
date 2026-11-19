@@ -49,6 +49,14 @@ pub mod capsule {
     pub const GLASS_RADIUS: f64 = OUTER_RADIUS - 2.0;
     /// 悬浮留白(左右 / 底部,DIP):脱边悬浮的视觉锚。
     pub const FLOAT_MARGIN: f64 = 10.0;
+    /// 悬浮内容(「更多」浮层 / 手柄提示胶囊)底边距:完全清出胶囊带
+    /// (底部悬浮留白 + 胶囊高)再留一个悬浮留白做呼吸间距。
+    ///
+    /// z 序实测(见本模块头注):`SetElementChildVisual` 的玻璃 child
+    /// visual 盖在文档序靠前的 XAML 内容之上——底栏胶囊浮在跨行内容
+    /// (row1+row2)之上,任何底锚定悬浮内容只要与胶囊带几何重叠,重叠
+    /// 区就被玻璃遮住。悬浮内容必须整体抬出胶囊带。
+    pub const FLOATING_CONTENT_BOTTOM_MARGIN: f64 = HEIGHT + FLOAT_MARGIN * 2.0;
 }
 
 /// 浅色主题 tint 霜面(白,α≈0.30,backdrop 采样保持可见)。
@@ -469,6 +477,25 @@ mod tests {
         assert!(capsule::GLASS_RADIUS < capsule::OUTER_RADIUS);
         assert_eq!(capsule::OUTER_RADIUS, 32.0);
         assert!(capsule::FLOAT_MARGIN > 0.0);
+    }
+
+    /// 悬浮内容底边距必须完全清出胶囊带:胶囊带占底部
+    /// `FLOAT_MARGIN + HEIGHT`,悬浮内容底边距不足即与玻璃几何重叠,
+    /// 重叠区被 composition child visual 遮住(「更多」浮层遮挡回归)。
+    #[test]
+    fn floating_content_bottom_margin_clears_capsule_band() {
+        let band = capsule::FLOAT_MARGIN + capsule::HEIGHT;
+        assert!(
+            capsule::FLOATING_CONTENT_BOTTOM_MARGIN > band,
+            "悬浮内容底边距 {} 必须大于胶囊带高 {}",
+            capsule::FLOATING_CONTENT_BOTTOM_MARGIN,
+            band
+        );
+        assert_eq!(
+            capsule::FLOATING_CONTENT_BOTTOM_MARGIN,
+            capsule::HEIGHT + capsule::FLOAT_MARGIN * 2.0,
+            "呼吸间距恰为一个悬浮留白(胶囊带上方再空出 10 DIP)"
+        );
     }
 
     /// tint 霜面必须半透明(backdrop 采样可见)且随主题自适应。

@@ -22,6 +22,12 @@ composition 液态玻璃:效果采样 XAML 背景内容做 blur(saturation(backd
 | G4 **z 序修复** | 实测 `SetElementChildVisual` 的 child visual 盖在宿主 XAML 内容**之上**——玻璃与 Tab 行同网格混排时 Tab 行整体被毛玻璃化(只透出模糊鬼影,首版误判为 tint 对比度问题)。Tab 行改为玻璃宿主的兄弟节点后绘制(XAML 文档序在后 = z 序在上) | `chrome.rs::compact_bottom_bar`(玻璃宿主空内容 + `tab_row` 兄弟);修复前/后对照截图见验收 |
 | G5 主题自适应 tint | `GlassBar` 经 reactor `on_color_scheme` 订阅(订阅即回报初值,变化仅派发);`CompositionColorBrush.SetColor` 原地切换,不重建视觉。浅色白霜 a=0x4D / 深色近黑 a=0x66(暗玻璃衬托白图标) | `glass.rs::tint_color`(单测 `tint_color_adapts_to_scheme`);`GlassMessage::Scheme` |
 | G6 对比度 | 未选 Tab 图标/文字 opacity 0.72 → 0.85 | `chrome.rs` `tab_btn` |
+| G7 浮层遮挡回归修复 | 竖屏(移动形态)下点「更多」:浮层底锚定在跨行内容(row1+row2)内、底边距 10 DIP,下半截落在玻璃胶囊带(底悬浮 10 + 胶囊高 64)内,被 composition 玻璃 child visual 盖住(同 G4 z 序机制,XAML 文档序在前者被玻璃盖住)。修复:新增 `capsule::FLOATING_CONTENT_BOTTOM_MARGIN`(= HEIGHT + FLOAT_MARGIN×2),「更多」浮层与手柄提示胶囊(compact)底边距统一抬出胶囊带并留一个悬浮留白呼吸间距;单测 `floating_content_bottom_margin_clears_capsule_band` / `compact_more_popup_bottom_margin_clears_glass_capsule_band` 钉住常量不漂移 | `widgets/glass.rs::capsule`;`widgets/chrome.rs::compact_more_popup`;`gamepad.rs::gamepad_hint_bar(compact)` |
+
+### G-fix 验收实测(2026-11-19)
+
+- 自动化点击(390×760 / 845×1000 / 420×680 真机):点击底栏「更多」Tab → 浮层完整浮在玻璃胶囊上方,6 项全部可见可点,无玻璃遮挡;再点击 Tab 收起正常。
+- `cargo test --workspace` 全绿;selftest boot / stress(4.8s)/ mobile / e8 PASS。
 
 ### 验收实测(2026-11-19,96 DPI 真机)
 

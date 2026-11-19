@@ -423,7 +423,16 @@ pub fn compact_more_popup(
 
     Border::new()
         .width(248.0)
-        .margin(Thickness::new(0.0, 0.0, 12.0, 10.0))
+        // 底边距必须整体清出玻璃胶囊带(glass::capsule::FLOATING_CONTENT_
+        // BOTTOM_MARGIN):底栏玻璃是 composition child visual,盖在文档序
+        // 靠前的 XAML 内容之上,浮层与胶囊带几何重叠的下半截会被玻璃
+        // 遮住(竖屏「更多」浮层回归,v0.4.0)。
+        .margin(Thickness::new(
+            0.0,
+            0.0,
+            12.0,
+            crate::widgets::glass::capsule::FLOATING_CONTENT_BOTTOM_MARGIN,
+        ))
         .padding(Thickness::xy(8.0, 8.0))
         .corner_radius(12.0)
         .background(ThemeBrush::SolidBackground)
@@ -479,5 +488,22 @@ mod tests {
         assert_eq!(title_search_box_width(860.0), 240.0);
         assert_eq!(title_search_box_width(700.0), 200.0);
         assert_eq!(title_search_box_width(1280.0), 360.0);
+    }
+
+    /// 竖屏回归:「更多」浮层底边距必须整体清出玻璃胶囊带。底栏玻璃是
+    /// composition child visual,盖在文档序靠前的 XAML 内容之上
+    /// (widgets/glass.rs z 序实测);浮层与胶囊带几何重叠的下半截会被
+    /// 玻璃遮住。`compact_more_popup` 的底边距引用
+    /// `glass::capsule::FLOATING_CONTENT_BOTTOM_MARGIN`,此处钉住两端
+    /// 不漂移。
+    #[test]
+    fn compact_more_popup_bottom_margin_clears_glass_capsule_band() {
+        let capsule = crate::widgets::glass::capsule::FLOATING_CONTENT_BOTTOM_MARGIN;
+        let band = crate::widgets::glass::capsule::FLOAT_MARGIN
+            + crate::widgets::glass::capsule::HEIGHT;
+        assert!(
+            capsule > band,
+            "「更多」浮层底边距 {capsule} 必须清出胶囊带 {band},否则下半截被玻璃遮住"
+        );
     }
 }
