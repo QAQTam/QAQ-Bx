@@ -368,3 +368,42 @@ dump 栈 + 源码泄漏 + **生产应用确定性复现**;「托管语言最小�
 
 遗留清理:repro 进程 15416/15948 未确认杀除(提权 UAC 在 PTY 会话中不可见);
 `MainWindowTitle` 存在说明其循环未死,普通 kill 应可达,重启自然消失,无副作用。
+
+## 10. Claude 对审记录与独立裁决(2026-11-19,PR #12760 → f28ed362)
+
+流程:第一次公开 PR 按双模型对审规范走。审阅包 `D:/QAQ-Work/PR-12760-review-pack.md`
+发给 Claude,其结论「不要按 5 行版合,升级 revoker 版」。本轮对其 B0/B1/B2 逐条
+独立复核(全部证据来自 ui-full@57f76978 实读 + WinAppSDK 2.6.5 运行时探针,
+不引用 Claude 原文作结论):
+
+| 论断 | 裁决 | 依据 |
+|---|---|---|
+| B0 icon 换 icon 覆盖 token 泄漏 | **成立** | TitleBar.cpp L314-317 覆盖前无 revoke;探针实测同 WindowId 两次 `GetForWindowId` 返回**同一 COM 对象**(per-window 单例)→ 两条订阅必在同一存活 source 上,析构只能撤最后一条 |
+| B1 id 变化置空 source 不撤订 | **机制成立;其给出的触发链被驳** | L936-943(现 L947-963)原文如此;但 Claude 的触发链「脱树→XamlRoot 变 null」已被 §4.6 探针反驳(脱树后 `XamlRoot()` 仍返回 Ok 非空)。真实触发是 id 真变化的场景(island 迁移/TabTearOut 类;dxaml WindowChrome_Partial.cpp 亦有 close 期置空 titleBar 的注释佐证时序复杂) |
+| B2 UpdateDragRegion 使 source 无图标也初始化 + else-if 死代码 | **两点都成立** | L679 `UpdateDragRegion()` 无条件 `GetInputNonClientPointerSource()`;getter 返回成员**引用**(L948-958)⇒ L318 `else if (m_inputNonClientPointerSource)` 与 L314 `if` 同对象互斥,永假。⇒ 我 PR 正文「guarded no-op」句为**事实错误**,必须修 |
+| 升级 revoker 的前提 | **不成立(实测)** | `InputNonClientPointerSource` **不支持 `IWeakReferenceSource`**:运行时 QI 返回 `E_NOINTERFACE (0x80004002)`(对照组 Button QI=0x00000000 证探针有效)。cppwinrt `weak_ref::from_com_ref` 对 `try_as<IWeakReferenceSource>()` 空结果**直接解引用**(base.h 自带注释:AV),即 revoker 在订阅时崩溃,比 Claude 预期的「抛异常」更糟 |
+| remove(未订阅 token) 安全性 | **实测安全** | vtbl 直调 `IInputNonClientPointerSource2::remove_WindowRectChanged`(slot 13,IID DD2B10C4-7DE6-5C1D-B438-06DDC994058F):token{0} 与伪 token 均返回 **S_OK no-op**;C++ 侧 `consume_noexcept_remove_overload` 本就丢弃 HRESULT ⇒ 析构中 revoke 无抛点(B2/B3/B5 疑问族全关) |
+
+**裁决**:不升 revoker(物理不可行),但 Claude 找到的 B0/B1 泄漏分支真实存在,
+故 PR 不维持 5 行版,升级「**token 全路径覆盖版**」(commit `f28ed362`,同分支 push,
+#12760 自动更新;全部复用类内既有 idiom,不依赖弱引用):
+1. 析构 revoke(原有;guard 收紧为 `token!=0 && source`,顺序仍在 `TryGetAppWindow()` 之前,B4 无虞);
+2. `UpdateIcon()` 订阅前先撤旧 token(修 B0;不可达的 else-if 分支意图被此处取代,原死代码移除并注明);
+3. `GetAppWindowId()` 失效分支在置空 source 缓存**前**撤订(修 B1——此刻成员还持有旧 source 强引用,可撤);撤空后 token 恒 0,与析构块/订阅块互不重复撤销。
+`m_inputActivationChangedToken` 同型 B0(OnApplyTemplate 重复执行覆盖)按对审共识
+**只在 PR 正文提及、不扩范围**。
+
+PR 动作全记录:正文重写(`D:/QAQ-Work/pr-body.md`,删除两处事实错误与
+"no longer possible" 全称否定,新增 revoker-不可行与 removal-safety 两节,把
+探针数据写成对「为什么不用 auto_revoke」的先发制人回复);升级说明评论
+https://github.com/microsoft/microsoft-ui-xaml/pull/12760#issuecomment-7003725252;
+新 head CI:Area Reviewers=success,CLA 有效,三条主 run 回到 action_required
+(首贡献者新 commit 需 maintainer 再批,非仓库拒绝)。
+
+探针工程:`D:/QAQ-Work/titlebar-rectleak-repro`(新增 `--mode wrprobe`,
+App.xaml.cs 内 WrProbe():对照组/实验组/身份/remove 四项,结果写 run.log;
+`dotnet build -c Release` 即跑,自动退出)。
+
+方法论教训(入宪常量):① PR 文案禁止无证据的全称否定;② 模型对审的
+「可行方案」必须查前提(Claude 自己标注了前提却没查,我们查了,方向反了);
+③ 运行时问题优先花 30 分钟写探针而不是 3 小时考古闭源实现的静态旁证。
