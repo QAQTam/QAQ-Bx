@@ -18,6 +18,7 @@ use crate::pages::account::NotifyTab;
 use crate::pages::player::CommentSort;
 use crate::router::Route;
 use crate::shell::{AppShell, Message, ResolveProfileKey, ShellInput, ShellProbe};
+use crate::widgets::peek::{CardRect, HoverReport};
 use qaq_bx_core::settings::{AppSettings, PlayerEngine};
 
 /// 可解析真实媒体的测试稿件（open_video 走最小模型 + video_meta 解析管线，不依赖任何种子数据）。
@@ -863,6 +864,82 @@ fn loading_state(s: &mut Scenario) -> Result<(), String> {
     Ok(())
 }
 
+/// 场景 16 #7:悬停预览卡状态机集成 —— 进入 1s 弹出、点「播放」进播放页、
+/// 宽限内移入 PeekCard 不收起、快速掠过 10 张卡全程不弹出(全部走真实定时器)。
+fn peek(s: &mut Scenario) -> Result<(), String> {
+    s.sync()?;
+    assert!(!s.probe.borrow().peek_open, "初始不得有预览卡");
+
+    let hover = |bvid: &str, entering: bool| {
+        Message::CardHover(HoverReport {
+            bvid: bvid.to_string(),
+            entering,
+            rect: entering.then_some(CardRect {
+                x: 240.0,
+                y: 300.0,
+                w: 220.0,
+                h: 160.0,
+            }),
+        })
+    };
+
+    // ① 悬停 1s 后弹出;简介预取与封面数据来自真实首页流。
+    s.wait_for(Duration::from_secs(30), |p| p.route_tag == "home" && p.home_videos > 0)
+        .map_err(|err| format!("首页流未到货:{err}"))?;
+    let bvid = s
+        .probe
+        .borrow()
+        .home_first_bvid
+        .clone()
+        .ok_or("首页首卡 bvid 缺失")?;
+    s.send(hover(&bvid, true))?;
+    s.sync()?;
+    assert!(!s.probe.borrow().peek_open, "刚进入(<1s)不得立即弹出");
+    s.wait_for(Duration::from_secs(4), |p| p.peek_open)
+        .map_err(|err| format!("悬停 1s 后未弹出:{err}"))?;
+    assert_eq!(
+        s.probe.borrow().peek_bvid.as_deref(),
+        Some(bvid.as_str()),
+        "弹出内容必须是被悬停的稿件"
+    );
+
+    // ② 指针移入 PeekCard(撤销宽限)→ 离开 PeekCard 重新起宽限 → 到期收起。
+    s.send(Message::PeekPointerEntered)?;
+    s.sync()?;
+    assert!(s.probe.borrow().peek_open, "移入预览卡不得收起");
+    s.send(Message::PeekPointerExited)?;
+    s.sync()?;
+    assert!(s.probe.borrow().peek_open, "刚离开预览卡仍在 200ms 宽限内");
+    std::thread::sleep(Duration::from_millis(450));
+    s.sync()?;
+    assert!(!s.probe.borrow().peek_open, "宽限到期必须收起");
+
+    // ③ 快速掠过 10 张卡:任何一张都不满 1s,全程不得弹出。
+    for i in 0..10u32 {
+        let sweep = format!("BV1SWEEP{i}");
+        s.send(hover(&sweep, true))?;
+        s.sync()?;
+        s.send(hover(&sweep, false))?;
+        s.sync()?;
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+    s.sync()?;
+    assert!(!s.probe.borrow().peek_open, "快速掠过后不得残留弹出");
+
+    // ④ 点「播放」进播放页(等价 UIA Invoke 的 UI 路径)。
+    s.send(hover(&bvid, true))?;
+    s.wait_for(Duration::from_secs(4), |p| p.peek_open)
+        .map_err(|err| format!("二次悬停未弹出:{err}"))?;
+    s.send(Message::PeekPlay(bvid.clone()))?;
+    s.sync()?;
+    assert!(!s.probe.borrow().peek_open, "点播放后预览必须立即收起");
+    s.wait_for(Duration::from_secs(60), |p| {
+        p.route_tag == "player" && p.now_playing_bvid.as_deref() == Some(bvid.as_str())
+    })
+    .map_err(|err| format!("预览播放未进播放页:{err}"))?;
+    Ok(())
+}
+
 const SCENARIOS: &[(&str, &str, fn(&mut Scenario) -> Result<(), String>)] = &[
     ("boot", "FullPlayer", boot),
     ("nav", "FullPlayer", nav),
@@ -879,6 +956,7 @@ const SCENARIOS: &[(&str, &str, fn(&mut Scenario) -> Result<(), String>)] = &[
     ("fullscreen", "FullPlayer", fullscreen),
     ("engine", "FullPlayer", engine),
     ("loading-state", "FullPlayer", loading_state),
+    ("peek", "FullPlayer", peek),
 ];
 
 /// 解析 `--selftest [scenario]`;非 selftest 调用返回 `None` 走正常启动。

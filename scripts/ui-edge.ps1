@@ -171,6 +171,16 @@ function Scroll-Fast {
     }
 }
 
+function Move-Cursor {
+    # SetCursorPos 只挪指针不产生 WM_MOUSEMOVE,hover/PointerEntered 需真实输入消息:
+    # 走 mouse_event MOVE|ABSOLUTE(坐标归一化到主屏 0..65535)。
+    param([int]$X, [int]$Y)
+    $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $nx = [int](($X * 65535) / [Math]::Max(1, $bounds.Width - 1))
+    $ny = [int](($Y * 65535) / [Math]::Max(1, $bounds.Height - 1))
+    [void][UiEdgeNative]::mouse_event(0x0001 -bor 0x8000, $nx, $ny, 0, [UIntPtr]::Zero)
+}
+
 if (-not $SkipBuild) {
     Write-Host "[build] cargo build -p qaq-bx-ui" -ForegroundColor Cyan
     Push-Location $RepoRoot
@@ -2148,5 +2158,118 @@ try {
         throw
     }
     Write-Host "[E22] PASS: 设置开关 UIA 点击 + 多 CDN/本地并发代理实播 + 切清晰度全链通过" -ForegroundColor Green
+}
+}
+
+# ---------- 场景 E23：#7 卡片悬停 1s 弹出预览卡（真实鼠标 hover + UIA 点「播放」） ----------
+if (Should-RunScenario "E23") {
+Write-Host "[E23] 悬停预览卡：SetCursorPos hover -> peek-card 弹出 -> UIA Invoke 播放 -> 快速掠过 10 点不弹出" -ForegroundColor Cyan
+$stderrLog = Join-Path $OutRoot "e23-stderr.log"
+$settingsPath = Join-Path $dataDir "settings.json"
+$settingsBak = "$settingsPath.e23-bak"
+$script:settingsSeeded = $false
+$proc = $null
+$stderrSink = $null
+$stderrTask = $null
+try {
+    if (-not (Test-Path $dataDir)) { New-Item -ItemType Directory -Force -Path $dataDir | Out-Null }
+    if (Test-Path $settingsPath) { Copy-Item -Path $settingsPath -Destination $settingsBak -Force }
+    [System.IO.File]::WriteAllText(
+        $settingsPath,
+        '{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"FullPlayer","autoplay":true,"hardware_decode":true,"volume":30,"player_engine":"Mpv","hover_preview":true,"window":{"x":60,"y":60,"width":1296,"height":808,"maximized":false}}'
+    )
+    $script:settingsSeeded = $true
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.WorkingDirectory = (Split-Path $exe)
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables["QAQ_BX_TRACE_HOME"] = "1"
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stderrSink = $proc.StandardError
+    $stderrTask = $stderrSink.ReadToEndAsync()
+    $hwnd = Wait-MainWindow $proc
+    [void][UiEdgeNative]::SetWindowPos($hwnd, [IntPtr]::Zero, 60, 60, 1296, 808, [UiEdgeNative]::SWP_NOZORDER)
+
+    # 等首页流到货并经 UIA 找到真实卡片(宽>150 的 Button 即为视频卡命中盒)。
+    $cards = @()
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 1000
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button
+        )
+        $cards = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond) |
+            Where-Object { $_.Current.BoundingRectangle.Width -gt 150 -and $_.Current.BoundingRectangle.Height -gt 120 })
+        if ($cards.Count -ge 10) { break }
+    }
+    if ($cards.Count -lt 10) { throw "E23 FAIL: 首页可悬停视频卡不足 10 张($($cards.Count))" }
+    $cards = $cards | Sort-Object { $_.Current.BoundingRectangle.Top }, { $_.Current.BoundingRectangle.Left }
+
+    # ① 快速掠过 ≤10 张卡中心(每点 ~70ms):任何一张不满 1s,全程不得弹出。
+    $sweepCount = [Math]::Min(10, $cards.Count)
+    for ($k = 0; $k -lt $sweepCount; $k++) {
+        $sr = $cards[$k].Current.BoundingRectangle
+        Move-Cursor ([int]($sr.Left + $sr.Width / 2)) ([int]($sr.Top + $sr.Height / 2))
+        Start-Sleep -Milliseconds 70
+    }
+    # 先把光标撤到窗口外缘空白带再等待:停留在末卡上会让它补足 1s,弹出属预期。
+    Move-Cursor 8 8
+    Start-Sleep -Milliseconds 1400
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    if (Find-UiaByAutomationId -Root $root -Id "peek-card") { throw "E23 FAIL: 快速掠过仍弹出预览卡" }
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "E23 FAIL: 掠过后进程退出 ($($proc.ExitCode))" }
+    Write-Host "[E23] 快速掠过 $sweepCount 卡无弹出" -ForegroundColor DarkCyan
+
+    # ② 悬停首卡中心 1.4s -> peek-card 弹出(0.5s 时先断言未提前弹出)。
+    $r0 = $cards[0].Current.BoundingRectangle
+    $c0x = [int]($r0.Left + $r0.Width / 2)
+    $c0y = [int]($r0.Top + $r0.Height / 2)
+    # PointerEntered 只对真实移动消息生效:移入后做 1-2px 微动保持 hover 活跃。
+    Move-Cursor $c0x $c0y
+    Start-Sleep -Milliseconds 60
+    Move-Cursor ($c0x + 2) $c0y
+    Start-Sleep -Milliseconds 500
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    $peek = Find-UiaByAutomationId -Root $root -Id "peek-card"
+    if ($peek) { throw "E23 FAIL: 悬停 0.5s(<1s)预览卡不应出现" }
+    Start-Sleep -Milliseconds 900
+    Move-Cursor ($c0x + 3) ($c0y + 1)
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    $peek = Find-UiaByAutomationId -Root $root -Id "peek-card"
+    if (-not $peek) { throw "E23 FAIL: 悬停 1.4s 后预览卡未弹出" }
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e23-1-peek-open.png"
+    Write-Host "[E23] peek-card 已弹出" -ForegroundColor DarkCyan
+
+    # ③ UIA Invoke 预览卡内「播放」-> 进入播放页(画质选择器出现,预览收起)。
+    $playBtn = Find-UiaByName -Root $peek -Name "播放"
+    if (-not $playBtn) { throw "E23 FAIL: 预览卡内未找到「播放」按钮" }
+    [void](Invoke-UiaElement -Element $playBtn -What "预览卡播放")
+    $inPlayer = $false
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 500
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+        if (Find-UiaByAutomationId -Root $root -Id "player-quality-selector") { $inPlayer = $true; break }
+    }
+    if (-not $inPlayer) { throw "E23 FAIL: 预览「播放」后未进入播放页" }
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    if (Find-UiaByAutomationId -Root $root -Id "peek-card") { throw "E23 FAIL: 进入播放页后预览卡未收起" }
+    Write-Host "[E23] 预览播放 -> 播放页 已验证" -ForegroundColor DarkCyan
+    Write-Host "[E23] PASS: 悬停 1s 弹出 + UIA 播放进页 + 快速掠过不弹出无 panic" -ForegroundColor Green
+} finally {
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    if ($script:settingsSeeded) {
+        if (Test-Path $settingsBak) { Copy-Item -Path $settingsBak -Destination $settingsPath -Force }
+        else { Remove-Item -Path $settingsPath -Force -ErrorAction SilentlyContinue }
+        Remove-Item -Path $settingsBak -Force -ErrorAction SilentlyContinue
+    }
+    if ($stderrTask -and $stderrTask.Wait(5000)) {
+        $text = $stderrTask.Result
+        $text | Set-Content -Path $stderrLog -Encoding UTF8
+        Write-Host "[E23] stderr -> $stderrLog" -ForegroundColor DarkCyan
+    }
 }
 }

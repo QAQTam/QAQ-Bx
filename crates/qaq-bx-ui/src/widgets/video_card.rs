@@ -12,6 +12,7 @@ use windows_reactor::*;
 use crate::data::VideoItem;
 use crate::layout::CardMetrics;
 use crate::theme;
+use crate::widgets::peek::{CardRect, HoverReport};
 
 const CONTRACT_DURATION: Duration = Duration::from_millis(70);
 const EXPAND_DURATION: Duration = Duration::from_millis(150);
@@ -84,6 +85,7 @@ pub fn home_virtual_source(
     focused_idx: Option<usize>,
     on_open: &Callback<String>,
     on_hover_preresolve: &Callback<String>,
+    on_hover_report: &Callback<HoverReport>,
     on_row_active: &Callback<(u64, usize, bool)>,
     unplayable: &HashMap<String, String>,
 ) -> VirtualSource {
@@ -97,6 +99,7 @@ pub fn home_virtual_source(
     let row_count = rows.len();
     let on_open = on_open.clone();
     let on_hover = on_hover_preresolve.clone();
+    let on_hover_report = on_hover_report.clone();
     let on_row = on_row_active.clone();
     let unplayable = Rc::new(unplayable.clone());
     VirtualSource::new(
@@ -118,6 +121,7 @@ pub fn home_virtual_source(
                 focused_col,
                 on_open: on_open.clone(),
                 on_hover_preresolve: on_hover.clone(),
+                on_hover_report: on_hover_report.clone(),
                 on_row_active: on_row.clone(),
                 unplayable: Rc::clone(&unplayable),
             })
@@ -157,6 +161,7 @@ pub fn video_grid(items: &[VideoItem], metrics: CardMetrics, on_open: &Callback<
                             grid_col: None,
                             on_open: on_open.clone(),
                             on_hover_preresolve: None,
+                            on_hover_report: None,
                             unplayable_badge: None,
                         }),
                     )
@@ -192,6 +197,8 @@ pub struct FeedRowInput {
     pub focused_col: Option<usize>,
     pub on_open: Callback<String>,
     pub on_hover_preresolve: Callback<String>,
+    /// #7:卡片只上报进入/离开(含窗口坐标锚点),预览计时与单例 PeekCard 归 Shell。
+    pub on_hover_report: Callback<HoverReport>,
     pub on_row_active: Callback<(u64, usize, bool)>,
     /// bvid → 不可播原因（充电/付费未解锁；命中即卡面打标）。
     pub unplayable: Rc<HashMap<String, String>>,
@@ -233,6 +240,7 @@ impl Component for FeedRow {
                     grid_col: Some(col_idx as i32),
                     on_open: input.on_open.clone(),
                     on_hover_preresolve: Some(input.on_hover_preresolve.clone()),
+                    on_hover_report: Some(input.on_hover_report.clone()),
                     unplayable_badge: slot
                         .bvid()
                         .and_then(|bvid| input.unplayable.get(bvid).cloned()),
@@ -262,6 +270,8 @@ pub struct VideoCardInput {
     pub grid_col: Option<i32>,
     pub on_open: Callback<String>,
     pub on_hover_preresolve: Option<Callback<String>>,
+    /// #7:桌面态虚拟化网格专用——悬停进入/离开上报 Shell(静态页传 None)。
+    pub on_hover_report: Option<Callback<HoverReport>>,
     /// 非空 = 该稿已被预解析判定为不可播（充电/付费未解锁），卡面打标。
     pub unplayable_badge: Option<String>,
 }
@@ -358,10 +368,12 @@ impl HoverMachine {
 
 #[derive(Clone, PartialEq)]
 pub enum Message {
-    PointerEntered,
+    PointerEntered(PointerEventInfo),
     PointerExited,
     ExpandTick(u64),
     PreresolveTick(u64),
+    /// #7:焦点进入/离开(手柄/键盘导航)——同样只上报,由 Shell 单例计时。
+    HoverFocus(bool),
 }
 
 pub struct VideoCard {
@@ -401,7 +413,9 @@ impl Component for VideoCard {
             return;
         }
         match message {
-            Message::PointerEntered => {
+            Message::PointerEntered(info) => {
+                let rect = card_rect(&info, context.input().metrics);
+                report_hover(context, true, Some(rect));
                 if let Some(seq) = self.hover.on_enter() {
                     self.timer =
                         Some(context.set_local_timeout(CONTRACT_DURATION, move || {
@@ -430,8 +444,13 @@ impl Component for VideoCard {
                 }
             }
             Message::PointerExited => {
+                report_hover(context, false, None);
                 self.hover.on_exit();
                 self.timer = None;
+            }
+            Message::HoverFocus(entering) => {
+                // 焦点路径无 pointer 坐标:rect 交 Shell 在弹出时经焦点元素解析。
+                report_hover(context, entering, None);
             }
         }
     }
@@ -474,15 +493,43 @@ impl Component for VideoCard {
         }
 
         // 外层固定命中盒（不缩放）：防止收缩阶段鼠标落在边缘外侧引发 Enter/Exit 抖动。
-        let on_enter = context.callback(|_: PointerEventInfo| Message::PointerEntered);
+        let on_enter = context.callback(Message::PointerEntered);
         let on_exit = context.callback(|_: PointerEventInfo| Message::PointerExited);
+        let on_focus_in = context.callback(|_: FocusEventInfo| Message::HoverFocus(true));
+        let on_focus_out = context.callback(|_: FocusEventInfo| Message::HoverFocus(false));
         placed(Border::new())
             .height(metrics.card_height)
             .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
             .on_pointer_entered(on_enter)
             .on_pointer_exited(on_exit)
+            .on_got_focus(on_focus_in)
+            .on_lost_focus(on_focus_out)
             .content(animated_box)
             .into()
+    }
+}
+
+/// #7 悬停上报:仅在桌面虚拟化路径(有 bvid 且 Shell 挂了回调)生效。
+fn report_hover(context: &ComponentContext<VideoCard>, entering: bool, rect: Option<CardRect>) {
+    let input = context.input();
+    let (Some(cb), Some(bvid)) = (&input.on_hover_report, input.slot.bvid()) else {
+        return;
+    };
+    cb.call(HoverReport {
+        bvid: bvid.to_string(),
+        entering,
+        rect,
+    });
+}
+
+/// pointer 进入点换算命中盒的窗口坐标矩形:左上角 = 窗口坐标 - 局部坐标(精确);
+/// 尺寸取布局下发度量(star 列宽与布局计算同源,偏差 ≤1 DIP,仅影响居中)。
+fn card_rect(info: &PointerEventInfo, metrics: CardMetrics) -> CardRect {
+    CardRect {
+        x: info.window_x - info.x,
+        y: info.window_y - info.y,
+        w: metrics.card_width,
+        h: metrics.card_height,
     }
 }
 

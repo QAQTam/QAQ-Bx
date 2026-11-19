@@ -47,6 +47,9 @@ fn main() {
             "Microsoft.UI.Xaml.Media.VisualTreeHelper.GetParent",
             "Microsoft.UI.Xaml.Input.FocusManager.GetFocusedElement",
             "Microsoft.UI.Xaml.UIElement.XamlRoot",
+            // #7 焦点悬停预览:焦点元素→根可视的矩形变换(TransformToVisual 家族)。
+            "Microsoft.UI.Xaml.UIElement.TransformToVisual",
+            "Microsoft.UI.Xaml.Media.GeneralTransform.TransformBounds",
             "Microsoft.UI.Xaml.DependencyObject",
             // xamlroot-probe(诊断构建,--probe-xamlroot):可视树遍历 + 标题栏属性驱动
             "Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChildrenCount",

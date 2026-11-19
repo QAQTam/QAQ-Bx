@@ -62,6 +62,37 @@ pub fn scroll_focused_viewer_by(delta_y: f64) -> bool {
     false
 }
 
+/// #7 焦点触发预览卡的锚点:当前焦点元素在根可视(=窗口客户区,DIP)中的矩形。
+/// 键盘 Tab / 手柄停留这类无 pointer 坐标的弹出路径使用;任一环节失败返回
+/// `None`,调用方放弃本次弹出(不做兜底坐标,防止预览卡悬在错误位置)。
+/// 尺寸由布局度量传入(本地矩形经 `TransformBounds` 换算,免依赖 `Bounds` 属性)。
+pub fn focused_element_rect(width: f64, height: f64) -> Option<(f64, f64, f64, f64)> {
+    let focused = FocusManager::GetFocusedElement().ok()?;
+    let element = focused.cast::<UIElement>().ok()?;
+    let transform = element.TransformToVisual(None).ok()?;
+    let rect = transform
+        .TransformBounds(Rect {
+            x: 0.0,
+            y: 0.0,
+            width: width as f32,
+            height: height as f32,
+        })
+        .ok()?;
+    let (rx, ry, rw, rh) = (
+        f64::from(rect.x),
+        f64::from(rect.y),
+        f64::from(rect.width),
+        f64::from(rect.height),
+    );
+    if !(rx.is_finite() && ry.is_finite() && rw.is_finite() && rh.is_finite())
+        || rw <= 0.0
+        || rh <= 0.0
+    {
+        return None;
+    }
+    Some((rx, ry, rw, rh))
+}
+
 /// 切换指定 WinUI 窗口的全屏/常规呈现模式（需在 UI 线程调用）。
 pub fn set_window_fullscreen(hwnd_raw: *mut core::ffi::c_void, fullscreen: bool) -> bool {
     if hwnd_raw.is_null() {

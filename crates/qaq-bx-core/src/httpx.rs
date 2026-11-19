@@ -112,6 +112,47 @@ pub(crate) async fn post_form_with_ticket<T: DeserializeOwned>(
     referer: &str,
     form: &[(String, String)],
 ) -> Result<T> {
+    let env: Envelope<T> = post_form_env(http, creds, ticket, url, referer, form).await?;
+    match (env.code, env.data) {
+        (0, Some(data)) => Ok(data),
+        (0, None) => Err(BiliError::InvalidData("响应缺 data".into())),
+        (code, _) => Err(BiliError::Api {
+            code,
+            message: env.message,
+        }),
+    }
+}
+
+/// #7 稍后再看等「成功只认 code」的写接口:data 可为空/缺省,不做解包。
+pub(crate) async fn post_form_expect_ok(
+    http: &reqwest::Client,
+    creds: &Arc<dyn CredentialProvider>,
+    ticket: Option<&TicketManager>,
+    url: &str,
+    referer: &str,
+    form: &[(String, String)],
+) -> Result<()> {
+    let env: Envelope<serde_json::Value> =
+        post_form_env(http, creds, ticket, url, referer, form).await?;
+    if env.code == 0 {
+        Ok(())
+    } else {
+        Err(BiliError::Api {
+            code: env.code,
+            message: env.message,
+        })
+    }
+}
+
+/// 表单 POST 的公共发送段(凭据/cookie/头/超时与错误映射统一)。
+async fn post_form_env<T: DeserializeOwned>(
+    http: &reqwest::Client,
+    creds: &Arc<dyn CredentialProvider>,
+    ticket: Option<&TicketManager>,
+    url: &str,
+    referer: &str,
+    form: &[(String, String)],
+) -> Result<Envelope<T>> {
     // csrf 需要 Cookie 登录态:先取凭据(未登录在此失败,不发请求)。
     let credentials = creds.get().await?;
     let cookie = match build_cookie_header(creds, ticket).await {
@@ -133,15 +174,7 @@ pub(crate) async fn post_form_with_ticket<T: DeserializeOwned>(
         .send()
         .await?
         .error_for_status()?;
-    let env: Envelope<T> = resp.json().await?;
-    match (env.code, env.data) {
-        (0, Some(data)) => Ok(data),
-        (0, None) => Err(BiliError::InvalidData("响应缺 data".into())),
-        (code, _) => Err(BiliError::Api {
-            code,
-            message: env.message,
-        }),
-    }
+    Ok(resp.json().await?)
 }
 
 fn origin_of(url: &str) -> Option<&str> {

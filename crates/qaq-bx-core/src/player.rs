@@ -25,6 +25,7 @@ use crate::wbi::WbiSigner;
 
 const VIEW_URL: &str = "https://api.bilibili.com/x/web-interface/view";
 const PLAYURL_URL: &str = "https://api.bilibili.com/x/player/wbi/playurl";
+const TOVIEW_ADD_URL: &str = "https://api.bilibili.com/x/v2/history/toview/add";
 
 // ---------- view ----------
 
@@ -529,6 +530,14 @@ pub fn select_audio_excluding(dash: &Dash, failed_url: &str) -> Option<AudioStre
         .cloned()
 }
 
+/// #7 稍后再看表单参数(纯函数;单测锁字段面)。
+fn watch_later_params(bvid: &str, csrf: &str) -> Vec<(String, String)> {
+    vec![
+        ("bvid".into(), bvid.to_string()),
+        ("csrf".into(), csrf.to_string()),
+    ]
+}
+
 // ---------- 客户端 ----------
 
 /// 播放地址客户端（WBI 签名 + 登录态决定档位上限）。
@@ -567,6 +576,25 @@ impl PlayerClient {
             &self.creds,
             self.ticket.as_deref(),
             &format!("{VIEW_URL}?bvid={bvid}"),
+        )
+        .await
+    }
+
+    /// #7 预览卡「稍后再看」:加入列表(登录态必需;csrf=bili_jct)。
+    /// 成功仅认 code==0(data 可空/缺省,与 reply/add 不同)。
+    pub async fn add_watch_later(&self, bvid: &str) -> Result<()> {
+        if bvid.trim().is_empty() {
+            return Err(crate::error::BiliError::InvalidData("缺少稿件 bvid".into()));
+        }
+        let csrf = self.creds.get().await?.bili_jct;
+        let form = watch_later_params(bvid.trim(), &csrf);
+        crate::httpx::post_form_expect_ok(
+            &self.http,
+            &self.creds,
+            self.ticket.as_deref(),
+            TOVIEW_ADD_URL,
+            "https://www.bilibili.com/",
+            &form,
         )
         .await
     }
@@ -1209,5 +1237,14 @@ mod tests {
         );
         assert!(!s.extra.contains_key("segment_base"));
         assert_eq!(s.resolved_segment_base(), s.segment_base_snake);
+    }
+
+    /// #7 稍后再看表单面:仅 bvid+csrf 两键,csrf 透传(未登录在取凭据层已拦截)。
+    #[test]
+    fn watch_later_params_pins_form_surface() {
+        let form = watch_later_params("BV1xx411c7mD", "tok3n");
+        assert_eq!(form.len(), 2);
+        assert_eq!(form[0], ("bvid".to_string(), "BV1xx411c7mD".to_string()));
+        assert_eq!(form[1], ("csrf".to_string(), "tok3n".to_string()));
     }
 }

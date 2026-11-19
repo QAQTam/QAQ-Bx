@@ -292,6 +292,28 @@ pub fn settings_page(
             }
         }
     };
+    let on_hover_preview = {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |on: bool| {
+            if on != base.hover_preview {
+                let mut next = base.clone();
+                next.hover_preview = on;
+                cb.call(next);
+            }
+        }
+    };
+    let on_reduce_animations = {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |on: bool| {
+            if on != base.reduce_animations {
+                let mut next = base.clone();
+                next.reduce_animations = on;
+                cb.call(next);
+            }
+        }
+    };
 
     let card_padding = if layout.is_mobile() { 16.0 } else { 24.0 };
     let card = |content: StackPanel| {
@@ -486,6 +508,20 @@ pub fn settings_page(
                 .off_content("关")
                 .is_on(settings.portrait_mode)
                 .on_toggled(on_portrait),
+            ToggleSwitch::new()
+                .header("悬停预览卡")
+                .automation_id("settings-hover-preview")
+                .on_content("开")
+                .off_content("关")
+                .is_on(settings.hover_preview)
+                .on_toggled(on_hover_preview),
+            ToggleSwitch::new()
+                .header("减少动画")
+                .automation_id("settings-reduce-animations")
+                .on_content("开")
+                .off_content("关")
+                .is_on(settings.reduce_animations)
+                .on_toggled(on_reduce_animations),
             TextBlock::new()
                 .text("窗口宽度锁定在手机布局档位（底部导航栏保留），最大化按钮变为「贴边到屏幕右缘」，再点还原。立即生效，重启后保持。")
                 .font_size(12.0)

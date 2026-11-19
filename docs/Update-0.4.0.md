@@ -199,3 +199,22 @@ Content-Range 的短 206」由整块接受改为收敛该块尾(等价旧上层�
 
 - `cargo test --workspace`:**226 passed, 0 failed, 7 ignored**(UI 96→98);`just selftest all` **15/15 PASS**(mobile/half-pane 走玻璃与驱逐路径,0 panic;stress 4.1s 无回归)。
 - 长列表滚动帧耗时未单独定量(需真机 + E14 类脚本对首页路由采样);结构性证据:驱逐路径深拷贝次数从 O(全部槽位×String 字段) 降为 O(触及条数)。
+
+## U. 卡片悬停 1s 展开预览卡(refs #7,feature,2026-11-20)✅(真机滚动掉帧与 DPI 缩放体感待录)
+
+| 项 | 内容 | 落点 / 证据 |
+|---|---|---|
+| U-1 卡片只上报,Shell 驱动单例 | `VideoCard` 悬停/焦点事件不再各自计时展开:`PointerEntered` 携带 `PointerEventInfo`,由 `card_rect`(origin = window_x-x / window_y-y 精确,尺寸取布局度量)换算窗口坐标锚点后经 `Callback<HoverReport>` 上报;`on_got_focus/on_lost_focus` 同样上报(rect 缺省,弹出时解析)。预解析微动画链路(#卡片 700ms 蓄力)保持不变 | `widgets/video_card.rs`、`widgets/peek.rs::HoverReport` |
+| U-2 全局单例 PeekCard + 覆盖层 | 根布局 `Grid` 末子元素新增全屏覆盖 `Canvas`(无背景,空白区不拦截命中;z 序在液态玻璃宿主 child visual 之后,v0.4 G4/G7 教训),内挂**全局唯一** PeekCard(`automation_id="peek-card"`):封面/标题 2 行/简介 3 行/播放·弹幕·UP 主/「播放」「稍后再看」「✕」。不用 Popup/Flyout/TeachingTip;不原地展开(避免 ItemsRepeater 重排,#4) | `shell.rs::peek_overlay_layer`、`widgets/peek.rs::peek_card_view` |
+| U-3 计时状态机 | `PeekMachine`(纯逻辑):进入 300ms 预取简介(`video_meta.desc`,缓存去重)→ 停留 1s 弹出 → 离开宽限 200ms;宽限内回卡/移入 PeekCard 撤销收起;快速掠过(Pending 期离开)只撤定时器绝不弹出;全部 tick 带悬停代次,旧代次作废。路由切换/换一选/整源重建/行回收/resize settled/浮层弹出统一 `peek_hide_now()` 作废 | `widgets/peek.rs`;单测 `hover_pop_and_grace_lifecycle`、`fast_sweep_never_pops`、`moving_into_peek_card_keeps_it_open`、`switching_card_resets_to_pending`、`cancel_reports_visibility_and_voids_ticks`、`focus_pop_without_rect_stays_unmounted` |
+| U-4 边缘翻转定位 | `peek_placement` 纯函数:优先卡片上方水平居中(视觉中线=卡片中线);视觉盒(布局盒×1.15 中心缩放四周外扩)越顶翻卡片下方;水平/垂直钳进窗口安全边距 12DIP。坐标口径:pointer 事件窗口相对 DIP 与根 Canvas 同为客户区空间,DPI 无需换算(事件坐标已是 DIP) | `widgets/peek.rs`;单测 `placement_flips_at_top_and_clamps_at_side_edges`(居上/翻下/左右钳位/矮窗钳位五断言) |
+| U-5 Composition 进场动画 | 两帧进场:挂载帧发布 Scale 1.0/Opacity 0 + `scale_transition/opacity_transition`(reactor DSL,底层 `Visual.SetScaleTransition/SetOpacityTransition` 隐式过渡,GPU 合成线程,UI 线程零成本),16ms 翻牌帧改 Scale 1.15/Opacity 1 触发过渡;宽限收起帧淡出。未用 Storyboard、不动 Width/Height | `widgets/peek.rs::peek_render`;单测 `peek_render_frames_and_reduced_mode` |
+| U-6 手柄/键盘焦点停留触发 | 卡片 Button 焦点进入/离开上报 → 同款 1s 计时;弹出 tick 时无 pointer 锚点则经 `FocusManager.GetFocusedElement → UIElement.TransformToVisual(root).TransformBounds` 解析焦点卡片矩形(build.rs 新增 2 条 bindgen filter;解析失败放弃弹出,不猜坐标) | `winrt_ext::focused_element_rect`、`shell.rs::handle_peek_pop` |
+| U-7 降级与开关 | 设置页新开关「悬停预览卡」(可关闭功能,默认开)与「减少动画」(默认关):`hover_preview=false` 完全不弹;`reduce_animations=true` 跳过两帧过渡直接终态显示;✕ 或播放消费后 dismissed 静默位控制(点卡/重开设置解除)。已知偏差:系统 `UISettings.AnimationsEnabled` **不在 fork curated winmd**,无法读取,由「减少动画」设置项替代;ThemeShadow 无 reactor 暴露面,以描边+不透明卡面替代 | `crates/qaq-bx-core/src/settings.rs`(2 新字段,旧配置默认补齐)、`pages/settings.rs` |
+| U-8 稍后再看 | 预览卡按钮接 `x/v2/history/toview/add` 写接口:`post_form_expect_ok`(成功只认 code==0,data 可缺省)+ `PlayerClient::add_watch_later`;未登录不发请求行内提示,结果回执仅当预览仍为该稿件时展示 | `crates/qaq-bx-core/src/httpx.rs`、`player.rs`;单测 `watch_later_params_pins_form_surface`;**实网写路径未真验(无登录令牌),待真机登录后确认** |
+
+### U 项验收实测(2026-11-20)
+
+- `cargo test --workspace`:**236 passed, 0 failed, 7 ignored**(新增 peek 8 项、settings 1 项、core watch_later 表单 1 项);`just selftest all` **16/16 PASS**(新场景 `peek`:真实首页流 → 悬停 1s 弹出 → 移入 PeekCard 不收起 → 宽限收起 → 掠过 10 卡全程不弹 → 点「播放」进播放页,全走真实定时器)。
+- 自动化点击(E23,`scripts/ui-edge.ps1 -Scenario E23`):真实 `mouse_event(MOVE|ABSOLUTE)` 悬停(SetCursorPos 不产生 WM_MOUSEMOVE,不触发 PointerEntered——踩坑修正)+ UIA 断言 `peek-card` 0.5s 不出现/1.4s 出现 → Invoke「播放」→ `player-quality-selector` 出现且预览收起 → 快速掠过 10 卡中心无弹出无 panic。**修复内容溢出(PEEK_HEIGHT 420→440,按钮行曾越出边框)与封面取旧副本(改读槽位 Rc 现值)后的复验因测试环境桌面会话中断未跑完,留真机确认。**
+- 真机验收格:4c8G 弹出期滚动无掉帧未录;300ms 简介预取命中真实 `view` API(selftest `peek` 场景走真实网络,PASS)。

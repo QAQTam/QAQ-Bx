@@ -56,6 +56,7 @@ use crate::runtime::{block_on, cover_semaphore};
 use crate::smtc::{NativeSmtc, SmtcCommand, SmtcController};
 use crate::widgets::chrome;
 use crate::widgets::video_card::{self, HomeSlot};
+use crate::widgets::peek::{self, CardRect, HoverReport, PeekExitAction};
 
 /// 封面下载完成回填 UI 的批处理合并窗口（避免每到 1 张封面重绘整页）。
 const COVER_FLUSH_INTERVAL: Duration = Duration::from_millis(80);
@@ -71,6 +72,8 @@ const RELATION_PAGE_SIZE: u32 = 20;
 const APP_ICON_48_PNG: &[u8] = include_bytes!("../../../packaging/store/QAQ-Bx-48.png");
 /// 同时在飞的 Hover 预解析上限（防连续快速扫过触发风控）。
 const MAX_PRERESOLVE_INFLIGHT: usize = 4;
+/// #7 简介预取缓存条目上限(超限整体清空,预览本就是弱一致缓存)。
+const MAX_PEEK_DESC_CACHE: usize = 64;
 /// 离屏封面纹理裁剪窗口（保留当前行上下各 4 屏，更远仅保留轻量元数据）。
 const COVER_WINDOW_BUFFER_SCREENS: usize = 4;
 /// 距离列表底部不足几行时预拉下一逻辑页（留出 ~1 屏无感缓冲）。
@@ -569,6 +572,14 @@ pub struct ShellProbe {
     pub window_width: f64,
     pub prefer_official_cdn: bool,
     pub multi_thread_preload: bool,
+    /// #7:悬停预览卡是否挂载(Open 或宽限期)。
+    pub peek_open: bool,
+    /// #7:当前挂载预览卡的 bvid。
+    pub peek_bvid: Option<String>,
+    /// #7:首页已加载真实视频条数(peek 场景选点用)。
+    pub home_videos: usize,
+    /// #7:首页首个真实卡 bvid(peek 场景注入悬停用)。
+    pub home_first_bvid: Option<String>,
 }
 
 pub struct AppShell {
@@ -596,6 +607,8 @@ pub struct AppShell {
     home_source: VirtualSource,
     home_on_open: Callback<String>,
     home_on_hover: Callback<String>,
+    /// #7:卡片悬停进入/离开上报回调(Preview 单例计时由 Shell 持有)。
+    home_on_hover_report: Callback<HoverReport>,
     home_on_row_active: Callback<(u64, usize, bool)>,
     home_active_rows: BTreeSet<usize>,
     /// bvid → 当前 `home_slots` 下标（封面批刷 O(1) 原地更新）。
@@ -627,6 +640,22 @@ pub struct AppShell {
     preresolved_order: VecDeque<String>,
     preresolve_inflight: HashMap<String, ResolveProfileKey>,
     pending_open_preresolve: Option<(String, u64, ResolveProfileKey)>,
+    // ---- #7 悬停预览卡(全局单例,Shell 驱动计时) ----
+    /// 计时/阶段状态机(纯逻辑,单测覆盖)。
+    peek: peek::PeekMachine,
+    /// 弹出两帧进场:挂载帧为起点(true),16ms 翻牌帧置 false。
+    peek_anim_pending: bool,
+    peek_prefetch_timer: Option<ComponentTimer>,
+    peek_pop_timer: Option<ComponentTimer>,
+    peek_grace_timer: Option<ComponentTimer>,
+    peek_anim_timer: Option<ComponentTimer>,
+    /// bvid → 简介缓存(None 值 = 已拉过但失败/为空,不再重发)。
+    peek_desc: HashMap<String, Option<String>>,
+    peek_desc_inflight: HashSet<String>,
+    /// PeekCard 行内提示(「稍后再看」结果;离开即清)。
+    peek_notice: Option<String>,
+    /// 本会话用户手动关闭过预览卡(Escape/✕):不再自动弹出,点卡前保持静默。
+    peek_dismissed: bool,
     /// 不可播稿件标记(bvid → 准确原因):预解析/点击解析命中充电/付费未解锁试看降级时登记,
     /// 首页卡面据此打「充电专稿」角标,后续不再重复请求。
     unplayable: HashMap<String, String>,
@@ -1043,6 +1072,30 @@ pub enum Message {
         key: ResolveProfileKey,
         result: Result<ResolvedMedia, String>,
     },
+    // ---- #7 悬停预览卡(全局单例 PeekCard) ----
+    /// 卡片进入/离开上报(含窗口坐标锚点;焦点触发 rect 为 None,弹出时解析)。
+    CardHover(HoverReport),
+    /// 300ms 预取简介 tick(带悬停代次,旧代次作废)。
+    PeekPrefetchTick(u64),
+    /// 1s 弹出 tick。
+    PeekPopTick(u64),
+    /// 200ms 宽限到期收起 tick。
+    PeekGraceTick(u64),
+    /// 挂载帧 → 翻牌帧(Composition 两帧进场)。
+    PeekAnimTick(u64),
+    /// 指针移入/移出 PeekCard 本体(移入撤销收起)。
+    PeekPointerEntered,
+    PeekPointerExited,
+    /// 简介预取到货(None = 拉取失败/无简介,不再重发)。
+    PeekDescReady { bvid: String, desc: Option<String> },
+    /// PeekCard「播放」→ 进播放页(等同点卡)。
+    PeekPlay(String),
+    /// PeekCard「稍后再看」→ 登录后走 toview/add,未登录行内提示。
+    PeekWatchLater(String),
+    /// 「稍后再看」回执(None = 成功;仅当前预览仍为该稿件时展示)。
+    PeekWatchLaterDone { bvid: String, error: Option<String> },
+    /// PeekCard「关闭」:本流预览立即收起。
+    PeekClose,
 
     // ---- 热门页（真实 popular API，无签名 pn/ps 分页）----
     /// 加载下一页/首屏失败重试（`next_pn` 由单源状态推进；失败不推进=自动重取同页）。
@@ -1290,6 +1343,12 @@ impl AppShell {
         out.home_half_pane = self.home_half_pane;
         out.is_mobile = self.viewport_layout.is_mobile();
         out.grid_cols = self.home_state.grid_cols;
+        // #7:预览卡状态 + 首页选点数据(selftest/E18 驱动用)。
+        out.peek_open = self.peek.is_mounted();
+        out.peek_bvid = self.peek_mounted_bvid();
+        out.home_videos = self.home_state.video_count;
+        out.home_first_bvid =
+            self.home_slots.iter().find_map(|slot| slot.bvid().map(str::to_string));
         out.whisper_detail_open = self.whisper_detail_open;
         out.search_overlay_open = self.search_overlay_open;
         out.danmaku_enabled = self.settings.danmaku_enabled;
@@ -1453,6 +1512,9 @@ impl AppShell {
     }
 
     fn open_video(&mut self, bvid: &str, context: &ComponentContext<Self>) {
+        // #7:进播放页即消费悬停意图:收净预览并复位「手动关闭」静默位。
+        self.peek_hide_now();
+        self.peek_dismissed = false;
         // 数据源：首页已加载卡 → 搜索/热门/相关推荐索引 → 最小模型（真实标题由 video_meta 回填）。
         let mut item = match self
             .home_index
@@ -1987,9 +2049,201 @@ impl AppShell {
             focused,
             &self.home_on_open,
             &self.home_on_hover,
+            &self.home_on_hover_report,
             &self.home_on_row_active,
             &self.unplayable,
         );
+    }
+
+    // ---- #7 悬停预览卡生命周期 ----
+
+    /// 预览卡生效面:仅首页推荐流(非半窗/非浮层/非全屏/非紧凑卡),且设置允许;
+    /// 用户手动关闭过(`peek_dismissed`)则保持静默,直至点卡消费复位。
+    fn peek_allowed(&self) -> bool {
+        self.settings.hover_preview
+            && !self.peek_dismissed
+            && self.route == Route::Home
+            && !self.is_fullscreen
+            && !self.home_half_pane
+            && !self.search_overlay_open
+            && !self.more_menu_open
+            && !self.viewport_layout.cards.compact_card
+    }
+
+    /// 立即收起并作废全部在飞定时器(路由切换/尺寸变化/回收等外部作废路径)。
+    fn peek_hide_now(&mut self) {
+        self.peek_prefetch_timer = None;
+        self.peek_pop_timer = None;
+        self.peek_grace_timer = None;
+        self.peek_anim_timer = None;
+        self.peek_anim_pending = false;
+        self.peek_notice = None;
+        self.peek.cancel();
+    }
+
+    /// 卡片进入/离开上报的统一处置(指针与焦点共用)。
+    fn handle_card_hover(&mut self, report: HoverReport, context: &ComponentContext<Self>) {
+        if !self.peek_allowed() {
+            return;
+        }
+        if report.entering {
+            if std::env::var_os("QAQ_BX_TRACE_HOME").is_some() {
+                eprintln!("[qaq-bx-ui] peek enter {}", report.bvid);
+            }
+            if let Some(seq) = self.peek.on_card_enter(report.bvid, report.rect) {
+                self.peek_notice = None;
+                self.peek_prefetch_timer =
+                    Some(context.set_local_timeout(peek::PEEK_PREFETCH, move || {
+                        Message::PeekPrefetchTick(seq)
+                    }));
+                self.peek_pop_timer = Some(context.set_local_timeout(peek::PEEK_POP, move || {
+                    Message::PeekPopTick(seq)
+                }));
+            }
+        } else {
+            match self.peek.on_card_exit(&report.bvid) {
+                PeekExitAction::CancelPending => {
+                    self.peek_prefetch_timer = None;
+                    self.peek_pop_timer = None;
+                }
+                PeekExitAction::StartGrace(seq) => {
+                    self.peek_grace_timer =
+                        Some(context.set_local_timeout(peek::PEEK_GRACE, move || {
+                            Message::PeekGraceTick(seq)
+                        }));
+                }
+                PeekExitAction::Ignored => {}
+            }
+        }
+    }
+
+    /// 1s 弹出:焦点触发的上报没有 pointer 锚点,此刻经焦点元素解析矩形。
+    fn handle_peek_pop(&mut self, seq: u64, context: &ComponentContext<Self>) {
+        let Some(bvid) = self.peek.on_pop_tick(seq) else {
+            return;
+        };
+        if !self.peek.is_mounted() {
+            let cards = self.viewport_layout.cards;
+            match crate::winrt_ext::focused_element_rect(cards.card_width, cards.card_height)
+                .map(|(x, y, w, h)| CardRect { x, y, w, h })
+            {
+                Some(rect) => self.peek.attach_rect(rect),
+                None => {
+                    self.peek.cancel();
+                    return;
+                }
+            }
+        }
+        if std::env::var_os("QAQ_BX_TRACE_HOME").is_some() {
+            eprintln!("[qaq-bx-ui] peek pop {bvid}");
+        }
+        // 300ms 预取可能未发(进入即缓存命中/失败),弹出前兜底再试一次。
+        self.fetch_peek_desc(&bvid.to_string(), context);
+        if self.settings.reduce_animations {
+            self.peek_anim_pending = false;
+        } else {
+            self.peek_anim_pending = true;
+            self.peek_anim_timer =
+                Some(context.set_local_timeout(peek::PEEK_ANIM_SETTLE, move || {
+                    Message::PeekAnimTick(seq)
+                }));
+        }
+    }
+
+    /// 简介预取(view API;缓存 None 值 = 已失败,不再重发)。
+    fn fetch_peek_desc(&mut self, bvid: &str, context: &ComponentContext<Self>) {
+        if self.peek_desc.contains_key(bvid) || !self.peek_desc_inflight.insert(bvid.to_string()) {
+            return;
+        }
+        if self.peek_desc.len() >= MAX_PEEK_DESC_CACHE {
+            self.peek_desc.clear();
+            self.peek_desc_inflight.clear();
+        }
+        let auth = self.auth_service.clone();
+        let nav = auth.nav_client();
+        let owned = bvid.to_string();
+        context.spawn_background(move |_| {
+            let client = PlayerClient::with_nav(auth.http(), auth.credential_provider(), nav);
+            let desc = block_on(client.video_meta(&owned))
+                .ok()
+                .and_then(|meta| meta.desc)
+                .filter(|text| !text.trim().is_empty());
+            Message::PeekDescReady {
+                bvid: owned,
+                desc,
+            }
+        });
+    }
+
+    /// PeekCard 当前挂载内容(探针与视图共用判定)。
+    fn peek_mounted_bvid(&self) -> Option<String> {
+        self.peek.mounted_content().map(|(bvid, _)| bvid.to_string())
+    }
+
+    /// #7 根布局覆盖层:全局唯一 PeekCard,根 Grid 末子元素(z 序在液态玻璃宿主
+    /// child visual 之后,v0.4 G4/G7 教训);Canvas 无背景,空白区不拦截命中。
+    fn peek_overlay_layer(&self, context: &mut ViewContext<Self>) -> Option<KeyedView> {
+        if !self.peek_allowed() {
+            return None;
+        }
+        let (bvid, anchor) = self.peek.mounted_content()?;
+        // 槽位现值优先(封面回填/驱逐都发生在 home_slots 的 Rc 上,home_index
+        // 是加载时副本);越界时回落索引。
+        let slot_item = self
+            .home_slot_by_bvid
+            .get(&bvid)
+            .and_then(|idx| self.home_slots.get(*idx))
+            .and_then(|slot| match slot {
+                HomeSlot::Video { item, .. } => Some(Rc::clone(item)),
+                HomeSlot::Skeleton { .. } => None,
+            });
+        // 预览是低频弹出路径:直接拷贝槽位现值(封面随驱逐/回填的最新状态),
+        // 槽位越界时回落加载副本。
+        let item = match slot_item
+            .map(|item| (*item).clone())
+            .or_else(|| self.home_index.get(&bvid).cloned())
+        {
+            Some(item) => item,
+            None => return None,
+        };
+        let desc = self.peek_desc.get(&bvid).cloned().flatten();
+        let notice = self.peek_notice.clone();
+        let reduced = self.settings.reduce_animations;
+        let scale = if reduced { 1.0 } else { peek::PEEK_POP_SCALE };
+        let placement = peek::peek_placement(
+            anchor,
+            (
+                self.viewport_layout.window_width,
+                self.viewport_layout.window_height,
+            ),
+            (peek::PEEK_WIDTH, peek::PEEK_HEIGHT),
+            scale,
+            peek::PEEK_EDGE_MARGIN,
+            peek::PEEK_GAP,
+        );
+        let render = peek::peek_render(!self.peek.hiding(), !self.peek_anim_pending, reduced);
+        let on_enter = context.callback(|_: PointerEventInfo| Message::PeekPointerEntered);
+        let on_exit = context.callback(|_: PointerEventInfo| Message::PeekPointerExited);
+        let on_play = context.callback(Message::PeekPlay);
+        let on_later = context.callback(Message::PeekWatchLater);
+        let on_close = context.message(Message::PeekClose);
+        let card = peek::peek_card_view(
+            &item,
+            desc.as_deref(),
+            notice.as_deref(),
+            placement,
+            render,
+            &bvid,
+            on_enter,
+            on_exit,
+            &on_play,
+            &on_later,
+            &on_close,
+        );
+        Some(keyed(
+            "peek-overlay",
+            Canvas::new().children([card]),
+        ))
     }
 
     fn spawn_cover_fetch(
@@ -4406,6 +4660,7 @@ impl Component for AppShell {
         let volume = settings.volume;
         let home_on_open = context.callback(Message::OpenVideo);
         let home_on_hover = context.callback(Message::PreResolveVideo);
+        let home_on_hover_report = context.callback(Message::CardHover);
         let home_on_row_active =
             context.callback(|(rev, row_idx, active)| Message::HomeRowActive {
                 rev,
@@ -4421,6 +4676,7 @@ impl Component for AppShell {
             None,
             &home_on_open,
             &home_on_hover,
+            &home_on_hover_report,
             &home_on_row_active,
             &HashMap::new(),
         );
@@ -4485,6 +4741,7 @@ impl Component for AppShell {
             home_source,
             home_on_open,
             home_on_hover,
+            home_on_hover_report,
             home_on_row_active,
             home_active_rows: BTreeSet::new(),
             home_slot_by_bvid: HashMap::new(),
@@ -4511,6 +4768,16 @@ impl Component for AppShell {
             preresolved_order: VecDeque::new(),
             preresolve_inflight: HashMap::new(),
             pending_open_preresolve: None,
+            peek: peek::PeekMachine::new(),
+            peek_anim_pending: false,
+            peek_prefetch_timer: None,
+            peek_pop_timer: None,
+            peek_grace_timer: None,
+            peek_anim_timer: None,
+            peek_desc: HashMap::new(),
+            peek_desc_inflight: HashSet::new(),
+            peek_notice: None,
+            peek_dismissed: false,
             unplayable: HashMap::new(),
             image_cache,
             auth: AuthState::Unknown,
@@ -5673,6 +5940,7 @@ impl Component for AppShell {
             // ---- 首页推荐流与 Hover 预解析 ----
             Message::HomeRefresh => {
                 self.feed_gen = self.feed_gen.wrapping_add(1);
+                self.peek_hide_now();
                 self.feed_epoch.store(self.feed_gen, Ordering::SeqCst);
                 self.image_cache.clear();
                 self.pending_covers.clear();
@@ -5721,6 +5989,15 @@ impl Component for AppShell {
                 }
                 let cols = self.home_state.grid_cols.max(1);
                 let total_rows = self.home_slots.len().div_ceil(cols);
+                // #7:预览卡所在行被回收(滚动划出)→ 锚点失效,立即收起。
+                if !active
+                    && let Some(idx) = self
+                        .peek_mounted_bvid()
+                        .and_then(|bvid| self.home_slot_by_bvid.get(&bvid).copied())
+                    && idx / cols == row_idx
+                {
+                    self.peek_hide_now();
+                }
                 self.home_anchor_row = self
                     .home_active_rows
                     .iter()
@@ -5866,6 +6143,8 @@ impl Component for AppShell {
             }
             Message::WindowResizeSettled => {
                 self.close_resize_storm("settled");
+                // #7:resize 期间预览锚点已失真(尺寸泵静默,不重绘);静止即收净。
+                self.peek_hide_now();
                 // §8.2 收口:auto_refresh 关闭后,内容结构档位翻转不经 TitleBar
                 // 自身尺寸/属性变化;settled(150ms 静止)时新内容已渲染,这里
                 // 补算一次拖拽区。元素未发布/已退役时 reactor 侧静默忽略。
@@ -5913,6 +6192,10 @@ impl Component for AppShell {
                 replace,
             } => {
                 self.home_state.loading = false;
+                // #7:换一换/清流整源重建,在飞预览锚点即刻失效。
+                if replace {
+                    self.peek_hide_now();
+                }
                 if self.home_refresh_pending {
                     self.home_refresh_pending = false;
                     let target =
@@ -6180,6 +6463,85 @@ impl Component for AppShell {
                 }
             }
 
+            // ---- #7 悬停预览卡 ----
+            Message::CardHover(report) => self.handle_card_hover(report, context),
+            Message::PeekPrefetchTick(seq) => {
+                if let Some(bvid) = self.peek.on_prefetch_tick(seq) {
+                    self.fetch_peek_desc(&bvid.to_string(), context);
+                }
+            }
+            Message::PeekPopTick(seq) => self.handle_peek_pop(seq, context),
+            Message::PeekGraceTick(seq) => {
+                if self.peek.on_grace_tick(seq) {
+                    self.peek_notice = None;
+                    self.peek_anim_timer = None;
+                    self.peek_anim_pending = false;
+                    if std::env::var_os("QAQ_BX_TRACE_HOME").is_some() {
+                        eprintln!("[qaq-bx-ui] peek hide");
+                    }
+                }
+            }
+            Message::PeekAnimTick(_) => {
+                // 翻牌帧:此后视图发布 Scale 1.15/Opacity 终值(composition 隐式过渡)。
+                if self.peek.phase_open() {
+                    self.peek_anim_pending = false;
+                }
+            }
+            Message::PeekPointerEntered => {
+                if self.peek.on_peek_enter() {
+                    self.peek_grace_timer = None;
+                }
+            }
+            Message::PeekPointerExited => {
+                if let Some(seq) = self.peek.on_peek_exit() {
+                    self.peek_grace_timer =
+                        Some(context.set_local_timeout(peek::PEEK_GRACE, move || {
+                            Message::PeekGraceTick(seq)
+                        }));
+                }
+            }
+            Message::PeekDescReady { bvid, desc } => {
+                self.peek_desc_inflight.remove(&bvid);
+                self.peek_desc.entry(bvid).or_insert(desc);
+            }
+            Message::PeekPlay(bvid) => {
+                // 点「播放」消费了预览意图:dismissed 复位,悬停功能继续可用。
+                self.peek_hide_now();
+                self.peek_dismissed = false;
+                self.open_video(&bvid, context);
+                self.sync_smtc(context);
+            }
+            Message::PeekWatchLater(bvid) => {
+                if !matches!(self.auth, AuthState::LoggedIn(_)) {
+                    self.peek_notice = Some("未登录,「稍后再看」不可用".to_string());
+                } else {
+                    let auth = self.auth_service.clone();
+                    let nav = auth.nav_client();
+                    context.spawn_background(move |_| {
+                        let client =
+                            PlayerClient::with_nav(auth.http(), auth.credential_provider(), nav);
+                        let error = block_on(client.add_watch_later(&bvid)).err();
+                        Message::PeekWatchLaterDone {
+                            bvid,
+                            error: error.map(|err| err.to_string()),
+                        }
+                    });
+                }
+            }
+            Message::PeekWatchLaterDone { bvid, error } => {
+                // 仅当前预览仍为该稿件时展示回执(已收起则静默丢弃)。
+                if self.peek_mounted_bvid().as_deref() == Some(bvid.as_str()) {
+                    self.peek_notice = Some(match error {
+                        None => "已加入「稍后再看」".to_string(),
+                        Some(reason) => format!("稍后再看失败:{reason}"),
+                    });
+                }
+            }
+            Message::PeekClose => {
+                self.peek_dismissed = true;
+                self.peek_hide_now();
+            }
+
             // ---- 设置 ----
             Message::TogglePortraitDock => {
                 if !self.settings.portrait_mode {
@@ -6224,6 +6586,15 @@ impl Component for AppShell {
                 let next = next.normalized();
                 if next == self.settings {
                     return;
+                }
+                // #7:预览开关/动画开关翻转:收掉在飞预览;重新开启预览解除手动静默。
+                if next.hover_preview != self.settings.hover_preview
+                    || next.reduce_animations != self.settings.reduce_animations
+                {
+                    self.peek_hide_now();
+                    if next.hover_preview {
+                        self.peek_dismissed = false;
+                    }
                 }
                 // 竖屏模式(实验)翻转:切换系统最大化没收与宽度硬约束;
                 // 开启时当帧将 `viewport_layout` 收敛入竖屏宽度带 [390, 859] 并同步重建网格,
@@ -6765,6 +7136,10 @@ impl Component for AppShell {
             }
         }
         self.reconcile_playback_visibility(context);
+        // #7 兜底作废:路由/浮层/全屏/紧凑档翻转后仍在飞的预览统一收起。
+        if self.peek.phase_open() && !self.peek_allowed() {
+            self.peek_hide_now();
+        }
         self.refresh_probe();
     }
 
@@ -7270,9 +7645,15 @@ impl Component for AppShell {
             .rows([GridLength::Auto, GridLength::Star(1.0)])
             .children((title_bar, navigation));
 
+        // #7:预览卡覆盖层挂在 shell-root 之后(整窗最顶层,玻璃宿主之下无残留)。
+        let mut root_layers = vec![keyed("shell-root", shell_root)];
+        if let Some(layer) = self.peek_overlay_layer(context) {
+            root_layers.push(layer);
+        }
+
         Border::new()
             .on_preview_key_down(self.global_key_handler.clone())
-            .content(Grid::new().keyed_children([keyed("shell-root", shell_root)]))
+            .content(Grid::new().keyed_children(root_layers))
             .into()
     }
 }

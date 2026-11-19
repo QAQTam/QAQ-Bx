@@ -47,6 +47,13 @@ E14 拖拽脚本前后对比:settled 后首帧耗时、风暴期 UI 线程最大
 - 动画:Composition `Vector3KeyFrameAnimation` Scale 1.0→1.15(中心点居中)+ Opacity。
 - 复用 `video_card.rs` 现有 HoverState(on_enter/on_expand/on_preresolve),改为卡片只上报、Shell 驱动单例。
 
+### 实施状态(refs #7,2026-11-20):✅ 已实施,3 处口径偏差如下
+
+- 定位:指针路径直接用 `PointerEventInfo` 的窗口相对 DIP(`origin = window坐标 - 局部坐标`,精确且免 COM 调用),仅**焦点触发**路径经 `TransformToVisual` 解析(`winrt_ext::focused_element_rect`);两条路径同一 Canvas 坐标空间。
+- 动画:reactor DSL `scale_transition/opacity_transition` 隐式 composition 过渡(等价 `SetScaleTransition`,GPU 线程),两帧进场替代显式 KeyFrameAnimation。
+- 降级:系统 `UISettings.AnimationsEnabled` 不在 curated winmd,不可读——由设置项「减少动画」替代;ThemeShadow 同样无暴露面,以描边卡面替代。
+- 验收:workspace 236 绿(peek 单测 8+selftest `peek` 场景);E23 真实鼠标 hover/UIA 全链 PASS 一轮(高度溢出与封面旧副本两处修复后的复验受测试环境桌面会话中断,留真机)。详见 `docs/Update-0.4.0.md` §U。
+
 ## 实施状态(2026-11-19,refs #4)
 
 - 🔴 两项 P0 已实施:

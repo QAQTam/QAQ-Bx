@@ -291,6 +291,10 @@ pub struct AppSettings {
     /// 开启多线程分块预加载与自动节点容灾（本地有界滑窗代理）。
     #[serde(default = "default_true")]
     pub multi_thread_preload: bool,
+    /// #7:首页卡片悬停预览卡总开关(关闭即不弹 PeekCard,可关闭功能项)。
+    pub hover_preview: bool,
+    /// #7:减少动画(预览卡等直接终态显示,不播放 composition 过渡)。
+    pub reduce_animations: bool,
     pub window: Option<WindowBounds>,
 }
 
@@ -325,6 +329,8 @@ impl Default for AppSettings {
             portrait_mode: false,
             prefer_official_cdn: true,
             multi_thread_preload: true,
+            hover_preview: true,
+            reduce_animations: false,
             window: None,
         }
     }
@@ -449,6 +455,8 @@ mod tests {
             portrait_mode: true,
             prefer_official_cdn: false,
             multi_thread_preload: false,
+            hover_preview: false,
+            reduce_animations: true,
             window: Some(WindowBounds {
                 x: 100,
                 y: 80,
@@ -635,4 +643,19 @@ fn playback_cdn_and_preload_settings_default_true_and_roundtrip() {
         serde_json::from_str(&serde_json::to_string(&next).unwrap()).unwrap();
     assert!(!parsed.prefer_official_cdn);
     assert!(!parsed.multi_thread_preload);
+}
+
+/// #7 悬停预览开关:旧配置缺字段 → 预览默认开、减少动画默认关;显式值 serde 往返保真。
+#[test]
+fn hover_preview_and_reduce_animations_defaults_and_roundtrip() {
+    let legacy: AppSettings = serde_json::from_str("{}").unwrap();
+    assert!(legacy.hover_preview, "旧配置缺字段默认开悬停预览");
+    assert!(!legacy.reduce_animations, "旧配置缺字段默认不减少动画");
+    let mut next = AppSettings::default();
+    next.hover_preview = false;
+    next.reduce_animations = true;
+    let parsed: AppSettings =
+        serde_json::from_str(&serde_json::to_string(&next).unwrap()).unwrap();
+    assert!(!parsed.hover_preview);
+    assert!(parsed.reduce_animations);
 }
