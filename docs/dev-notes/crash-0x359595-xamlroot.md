@@ -322,6 +322,12 @@ checkout 丢弃(同事 WIP 已安全在 master)。
   附:复现步骤(全屏退出后立刻拖窗,打包应用 WinAppSDK 2.6.5/OS 26300)、
   §8.1 栈表、§3 反汇编、源码引文(§8.2)、dump 可复现符号化命令。
   修复建议:成员化 `winrt::auto_revoke` revoker 或 destructor revoke。
+  **【已执行 2026-11-19】issue = microsoft/microsoft-ui-xaml#12754(AI triage
+  自动定级 P1——CRASH×有 workaround 查表所得;needs-triage 等人类);
+  修复 PR = #12760(1 文件 +12/-0,destructor 逐字复用 UpdateIcon else 分支
+  撤销 idiom,基于最新 main;CLA 自动绿;CI 三条 run 挂 action_required——
+  首次贡献者的 GitHub 平台级待 maintainer 批准运行,非仓库拒绝;已留
+  降低巡检成本的评论)。全程记录:upstream-issue-titlebar-rectchanged-leak.md。**
 - **回归测试**:ui-edge 新场景 E12:全屏→退出→`MoveWindow` 连续 20 次
   (间隔 ≤100ms)→ 断言进程存活 + 窗口位置生效 + 无 UI 线程挂起;
   当前 E10(全屏二次进入)失败与本案同窗,修好后应一并转绿。
