@@ -166,6 +166,25 @@ fn title_bar_tier_signature(layout: ViewportLayout) -> u32 {
         | (u32::from(layout.shows_title_search_button()) << 2)
 }
 
+/// #5:resize 时必须翻动根 view 的结构签名——tier、列数、卡态与派生档位
+/// (移动端形态/内联搜索/私信钻取)。签名不翻 = 档内纯像素变化,交给 XAML
+/// 自动布局与静默状态累计,静止 150ms 后由 settled 普通消息统一重绘。
+fn resize_render_signature(layout: ViewportLayout) -> (u8, usize, bool, bool, bool, bool) {
+    let tier = match layout.tier {
+        layout::ContentLayoutTier::Compact => 0u8,
+        layout::ContentLayoutTier::Medium => 1,
+        layout::ContentLayoutTier::Expanded => 2,
+    };
+    (
+        tier,
+        layout.cards.cols,
+        layout.cards.compact_card,
+        layout.is_mobile(),
+        layout.shows_inline_title_search(),
+        layout.uses_whisper_drilldown(),
+    )
+}
+
 /// 竖屏模式窗口约束:客户区宽度钳制在底栏边界带 [390, 860) DIP,高度不设限
 /// (presenter 级硬钳制,reactor `WindowConstraints` → `SetPreferredMaximumWidth`)。
 fn portrait_window_constraints() -> WindowConstraints {
@@ -977,6 +996,10 @@ pub enum Message {
     SmtcAction(Option<SmtcCommand>),
     /// P1:窗口尺寸去抖到期(150ms 内无新 resize)→ 应用挂起的网格重建。
     WindowResizeSettled,
+    /// #5:结构档位(tier/cols/卡态)翻转的显式重绘请求。尺寸泵现走 silent
+    /// dispatch(只 update 不 render),需要重绘时由本消息走普通队列——其处理
+    /// 为空操作,dispatch 附带的根 view 重跑就是目的。
+    ShellInvalidateLayout,
     /// Xbox 手柄事件回调（None 表示通道已关闭）。
     GamepadInput(Option<GamepadEvent>),
     /// Windows Toast 通知激活回调（false 表示通道关闭）。
@@ -4230,6 +4253,8 @@ impl Component for AppShell {
         match message {
             Message::WindowResized(_) => Some(1),
             Message::FullscreenProbeResult { .. } => Some(2),
+            // #5:无载荷重绘请求,队尾合并——一帧内多次结构翻转只需一次重绘。
+            Message::ShellInvalidateLayout => Some(3),
             _ => None,
         }
     }
@@ -5763,12 +5788,21 @@ impl Component for AppShell {
             }
             Message::WindowResized(size) => {
                 self.track_resize_storm();
+                let prev_layout = self.viewport_layout;
                 if self.is_fullscreen {
                     // 全屏期间窗口被系统扩至屏幕分辨率(如 1920x1080):冻结底层
                     // `viewport_layout` 与首页网格,避免退出全屏首帧闪回桌面双栏布局
                     // 及连续二次拆装 XAML 视觉树导致卡顿;仅更新全屏 HUD 宽度并探针。
                     if size.width.is_finite() && size.width > 0.0 {
                         self.fullscreen_window_width = size.width;
+                    }
+                    // #5:HUD 宽度改按需读取——拖拽帧不再重绘,去抖到期经普通
+                    // dispatch 的 settled 消息统一收敛静默累计的新宽度。
+                    if self.grid_rebuild_timer.is_none() {
+                        self.grid_rebuild_timer =
+                            Some(context.set_local_timeout(GRID_REBUILD_DEBOUNCE, || {
+                                Message::WindowResizeSettled
+                            }));
                     }
                     if !self.fullscreen_sync_in_flight {
                         let gen_id = self.fullscreen_gen;
@@ -5780,7 +5814,7 @@ impl Component for AppShell {
                     }
                     return;
                 }
-                let prev_cards = self.viewport_layout.cards;
+                let prev_cards = prev_layout.cards;
                 let next_layout =
                     ViewportLayout::for_window(size.width, size.height, self.settings.portrait_mode);
                 self.viewport_layout = next_layout;
@@ -5818,6 +5852,16 @@ impl Component for AppShell {
                             Message::WindowResizeSettled
                         }));
                 }
+                // #5:silent 尺寸泵下根 view 不会自动重跑;仅结构签名翻转时显式
+                // 请求重绘(档内拖框交给 XAML 自动布局,静止后 settled 统一收敛)。
+                if resize_render_signature(next_layout)
+                    != resize_render_signature(prev_layout)
+                {
+                    let _ = context.sender().send(Message::ShellInvalidateLayout);
+                }
+            }
+            Message::ShellInvalidateLayout => {
+                // 空操作:状态已在 silent 路径落定,dispatch 的重绘即目的。
             }
             Message::WindowResizeSettled => {
                 self.close_resize_storm("settled");
@@ -6759,7 +6803,15 @@ impl Component for AppShell {
             });
         }
         context.window_visuals(visuals);
-        context.on_window_size(context.callback(Message::WindowResized));
+        // #5:尺寸泵改走 silent dispatch——逐帧 resize 只更新静默状态,不再
+        // 无条件重跑根 view(7.9k 行整树 IR 重建是拖框卡顿的另一半);结构
+        // 翻转由 handler 显式发 ShellInvalidateLayout,静止由 settled 收敛。
+        context.on_window_size({
+            let pump = context.sender();
+            move |size| {
+                let _ = pump.send_silent(Message::WindowResized(size));
+            }
+        });
         self.sync_key_route_ctx();
 
         let layout = self.viewport_layout;
@@ -7255,6 +7307,45 @@ mod tests {
         assert_eq!(AppShell::coalesce_key(&Message::PositionTick), None);
         assert_eq!(AppShell::coalesce_key(&Message::Back), None);
         assert_eq!(AppShell::coalesce_key(&Message::WindowResizeSettled), None);
+        assert_eq!(
+            AppShell::coalesce_key(&Message::ShellInvalidateLayout),
+            Some(3),
+            "#5 无载荷重绘请求可队尾合并"
+        );
+    }
+
+    /// #5 验收:「同档位 resize 不触发重渲染」判定——档内纯像素变化签名不翻,
+    /// 结构档位翻转必须翻签名(否则 silent 尺寸泵会把旧布局留在屏上)。
+    #[test]
+    fn same_tier_resize_keeps_render_signature_and_cross_tier_flips_it() {
+        // Expanded 档内小幅拖宽:cols/卡态不变 → 签名同。
+        let wide = ViewportLayout::for_window(1280.0, 800.0, false);
+        let also_wide = ViewportLayout::for_window(1240.0, 800.0, false);
+        assert_eq!(wide.cards.cols, also_wide.cards.cols, "样本须同列数");
+        assert_eq!(
+            resize_render_signature(wide),
+            resize_render_signature(also_wide),
+            "同档同列 resize 不得触发根 view 重绘"
+        );
+        // Mobile 带内拖宽:2 列紧凑卡不翻签名。
+        let mob = ViewportLayout::for_window(390.0, 760.0, false);
+        let mob2 = ViewportLayout::for_window(420.0, 760.0, false);
+        assert_eq!(resize_render_signature(mob), resize_render_signature(mob2));
+        // 跨档(Expanded → Medium):签名必翻。
+        let mid = ViewportLayout::for_window(700.0, 800.0, false);
+        assert_ne!(
+            resize_render_signature(wide),
+            resize_render_signature(mid),
+            "tier 翻转必须请求重绘"
+        );
+        // 同宽但列数不同(如 600..859 带内跨列曲线拐点):签名必翻。
+        let mut flipped = wide;
+        flipped.cards.cols += 1;
+        assert_ne!(
+            resize_render_signature(wide),
+            resize_render_signature(flipped),
+            "cols 翻转必须请求重绘"
+        );
     }
 
     #[test]

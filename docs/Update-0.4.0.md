@@ -169,3 +169,20 @@ Content-Range 的短 206」由整块接受改为收敛该块尾(等价旧上层�
 
 - `cargo test --workspace`:**223 passed, 0 failed**;`just selftest all`:**15/15 PASS**(含 mobile/half-pane/popular/search,覆盖虚拟化与静态两条网格通路;0 panic)。
 - E14 前后对照**不构成本项证据**:E14 直开播放页路由不经过首页行网格,风暴计数器被网络解码波动主导(pre 两样本 max_gap {167,197}ms vs post {97,178}ms,同噪声水平)。本项收益为结构性(收口 remount→diff),定量需真机首页拖框体感或将 E14 改为首页路由探针;新增 `scripts/home-storm-probe.ps1`(首页路由风暴采样,修复后 30×55ms 伸缩仅消费 3 条消息)。
+
+## S. WindowResized 不再每帧重跑根 view(refs #5,P1,2026-11-20)✅
+
+依赖 fork 能力:windows-reactor `b215f14`「silent dispatch」——`LocalSender::send_silent`/`ComponentSender::send_silent` 投递只跑 `update` 不排渲染的消息(同 coalesce 槽遇普通消息保守提升;fork 侧测试 `silent_message_updates_state_and_defers_render` 钉住「不重挂 effect、状态延后随首次普通消息可见」)。
+
+| 项 | 内容 | 落点 / 证据 |
+|---|---|---|
+| S-1 尺寸泵静默化 | `on_window_size` 回调改 `send_silent(Message::WindowResized)`:拖框每帧只更新 `viewport_layout`/探针/风暴计数等**非渲染状态**,7.9k 行根组件 view 不再每帧重建 | `shell.rs` view 注册点 + `Message::ShellInvalidateLayout`(空操作,dispatch 的重绘即目的;`coalesce_key=3` 队尾合并) |
+| S-2 结构签名门控 | `resize_render_signature`(tier/cols/compact/移动端/内联搜索/私信钻取)翻转才显式请求重绘;档内像素变化交给 XAML 自动布局 + 静止 150ms settled 普通消息统一收敛 | 单测 `same_tier_resize_keeps_render_signature_and_cross_tier_flips_it` |
+| S-3 全屏 HUD 按需读取 | 全屏冻结语义不变;`fullscreen_window_width` 更新走静默路径,去抖到期经 settled 重绘收敛(不再每帧) | `WindowResized` 全屏分支 |
+
+不变量验证:fullscreen/mobile/half-pane selftest 全 PASS(全屏冻结、竖屏锁 2 列不受影响)。
+
+### S 项验收实测(2026-11-20)
+
+- `cargo test --workspace`:**224 passed, 0 failed, 7 ignored**;`just selftest all` 15/15 PASS;fork `cargo test -p windows-reactor` 352+3+75 全绿。
+- E14 风暴 `max_gap_ms`(UI 线程最大节拍间隔):修复前样本 {233(文档基线), 167, 197} → 修复后 {96, 103},**约砍半**;消费/产出比与 CPU 占比变化在噪声范围内(播放页 CPU 由解码主导)。
