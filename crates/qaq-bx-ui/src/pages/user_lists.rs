@@ -31,17 +31,32 @@ pub struct UserVideoCard {
 }
 
 /// 列表页展示状态（历史与稍后再看共用；收藏的资源列表复用同构）。
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UserListState {
     pub loading: bool,
     pub loaded_once: bool,
     pub error: Option<String>,
     pub cards: Vec<UserVideoCard>,
-    /// 下一次请求页号（成功才推进）。
+    /// 下一次请求页号（1 起；成功才推进）。fetch 与 absorb 守卫共用此口径,
+    /// 初值若为 0 会把第 1 页结果当旧页丢弃,loading 永久卡死。
     pub next_page: u32,
     pub reached_end: bool,
     /// 服务端总数（稍后再看 count；历史端点无总数则 `None`）。
     pub total: Option<u64>,
+}
+
+impl Default for UserListState {
+    fn default() -> Self {
+        Self {
+            loading: false,
+            loaded_once: false,
+            error: None,
+            cards: Vec::new(),
+            next_page: 1,
+            reached_end: false,
+            total: None,
+        }
+    }
 }
 
 impl UserListState {
@@ -125,9 +140,11 @@ pub fn list_page(
     layout: ViewportLayout,
     on_open: &Callback<String>,
     on_more: &Callback<()>,
+    on_auto_more: &Callback<()>,
 ) -> View {
     let subtitle = state.subtitle(empty_hint);
-    let footer_pill: Option<View> = if state.error.is_some() && state.loaded_once {
+    // 首页失败(loaded_once=false)也要给重试入口,否则永远停在「加载失败」。
+    let footer_pill: Option<View> = if state.error.is_some() {
         Some(status_pill("重试", Some(on_more.clone()), false))
     } else if state.reached_end && !state.cards.is_empty() {
         Some(status_pill("没有更多了", None, false))
@@ -160,11 +177,20 @@ pub fn list_page(
         content_items.push(pill);
     }
 
-    let grid = ScrollViewer::new().grid_row(1).content(
-        Border::new()
-            .padding(Thickness::new(margin_x, 4.0, margin_x, 28.0))
-            .content(StackPanel::new().spacing(16.0).children(content_items)),
-    );
+    // 滚动接近底部 → 自动续页(shell 经 should_auto_page 门控,手动胶囊保留)。
+    let auto_cb = on_auto_more.clone();
+    let grid = ScrollViewer::new()
+        .grid_row(1)
+        .on_view_changed(move |ev: ScrollEventInfo| {
+            if crate::paging::near_bottom(&ev, crate::paging::AUTO_PAGE_LEAD_PX) {
+                auto_cb.call(());
+            }
+        })
+        .content(
+            Border::new()
+                .padding(Thickness::new(margin_x, 4.0, margin_x, 28.0))
+                .content(StackPanel::new().spacing(16.0).children(content_items)),
+        );
 
     Grid::new()
         .rows([GridLength::Auto, GridLength::Star(1.0)])
@@ -177,8 +203,9 @@ pub fn history_page(
     layout: ViewportLayout,
     on_open: &Callback<String>,
     on_more: &Callback<()>,
+    on_auto_more: &Callback<()>,
 ) -> View {
-    list_page(state, "历史", "暂无历史记录", layout, on_open, on_more)
+    list_page(state, "历史", "暂无历史记录", layout, on_open, on_more, on_auto_more)
 }
 
 pub fn watch_later_page(
@@ -186,8 +213,9 @@ pub fn watch_later_page(
     layout: ViewportLayout,
     on_open: &Callback<String>,
     on_more: &Callback<()>,
+    on_auto_more: &Callback<()>,
 ) -> View {
-    list_page(state, "稍后再看", "暂无内容", layout, on_open, on_more)
+    list_page(state, "稍后再看", "暂无内容", layout, on_open, on_more, on_auto_more)
 }
 
 /// 收藏页：夹 chip 横排（标题行下）+ 当前夹资源网格 + 分页胶囊。
@@ -197,10 +225,10 @@ pub fn favorites_page(
     on_select_folder: &Callback<u64>,
     on_open: &Callback<String>,
     on_more: &Callback<()>,
+    on_auto_more: &Callback<()>,
 ) -> View {
     let subtitle = state.resources.subtitle("选择收藏夹查看内容");
-    let footer_pill: Option<View> = if state.resources.error.is_some() && state.resources.loaded_once
-    {
+    let footer_pill: Option<View> = if state.resources.error.is_some() {
         Some(status_pill("重试", Some(on_more.clone()), false))
     } else if state.resources.reached_end && !state.resources.cards.is_empty() {
         Some(status_pill("没有更多了", None, false))
@@ -299,11 +327,20 @@ pub fn favorites_page(
         ));
     }
 
-    let grid = ScrollViewer::new().grid_row(1).content(
-        Border::new()
-            .padding(Thickness::new(margin_x, 4.0, margin_x, 28.0))
-            .content(StackPanel::new().spacing(16.0).children(content_items)),
-    );
+    // 滚动接近底部 → 自动续页(shell 经 should_auto_page 门控,手动胶囊保留)。
+    let auto_cb = on_auto_more.clone();
+    let grid = ScrollViewer::new()
+        .grid_row(1)
+        .on_view_changed(move |ev: ScrollEventInfo| {
+            if crate::paging::near_bottom(&ev, crate::paging::AUTO_PAGE_LEAD_PX) {
+                auto_cb.call(());
+            }
+        })
+        .content(
+            Border::new()
+                .padding(Thickness::new(margin_x, 4.0, margin_x, 28.0))
+                .content(StackPanel::new().spacing(16.0).children(content_items)),
+        );
 
     Grid::new()
         .rows([GridLength::Auto, GridLength::Star(1.0)])
@@ -636,9 +673,37 @@ mod tests {
     fn default_state_is_idle() {
         let state = UserListState::default();
         assert!(!state.loading && !state.loaded_once && !state.reached_end);
-        assert_eq!(state.next_page, 0);
+        assert_eq!(state.next_page, 1, "页号 1 起:0 会让首页结果被 absorb 守卫丢弃");
         assert!(state.total.is_none());
         assert_eq!(state.subtitle("空"), "空");
+    }
+
+    /// 回归:fetch 请求页号(`next_page.max(1)`)必须与 absorb 守卫(`page ==
+    /// next_page`)同口径——default/复位/换夹态首页往返不得被丢弃,成功后
+    /// 推进且不重复请求第 1 页(旧 bug:next_page=0 → 首页永久「加载中…」)。
+    #[test]
+    fn first_page_roundtrip_guard_and_advance() {
+        let mut state = UserListState::default();
+        let request = state.next_page.max(1);
+        assert_eq!(request, state.next_page, "首页结果必须能过 absorb 守卫");
+        // 模拟 absorb 成功:推进页号。
+        state.next_page += 1;
+        state.loaded_once = true;
+        let next_request = state.next_page.max(1);
+        assert_eq!(next_request, state.next_page);
+        assert_ne!(next_request, request, "第二页不得重复请求第 1 页");
+    }
+
+    /// 首页失败(未 loaded_once)也要渲染「重试」胶囊,给用户恢复入口。
+    #[test]
+    fn first_page_error_offers_retry() {
+        let mut state = UserListState::default();
+        state.error = Some("网络错误".into());
+        let layout = ViewportLayout::default();
+        let open = Callback::new(|_: String| {});
+        let more = Callback::new(|_: ()| {});
+        let view = list_page(&state, "历史", "空", layout, &open, &more, &more);
+        assert!(format!("{view:?}").contains("重试"), "首页失败必须提供重试入口");
     }
 
     #[test]
@@ -740,8 +805,8 @@ mod tests {
         ];
         state.selected = 1;
         state.resources.loaded_once = true;
-        let _ = favorites_page(&state, layout, &on_folder, &on_open, &on_more);
+        let _ = favorites_page(&state, layout, &on_folder, &on_open, &on_more, &on_more);
         state.resources.loading = false;
-        let _ = favorites_page(&state, layout, &on_folder, &on_open, &on_more);
+        let _ = favorites_page(&state, layout, &on_folder, &on_open, &on_more, &on_more);
     }
 }

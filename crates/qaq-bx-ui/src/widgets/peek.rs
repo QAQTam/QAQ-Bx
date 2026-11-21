@@ -249,6 +249,42 @@ impl PeekMachine {
     }
 }
 
+/// ✕ 手动关闭的静默范围:仅被关闭的那张卡,直到指针离开它或进入别的卡。
+/// 指针仍停在原卡上时不立刻再弹(防「关了又弹」);换卡/离开即恢复,
+/// 不做会话级全局静默(旧 `peek_dismissed` 教训:✕ 之后整个首页不再弹出)。
+#[derive(Default)]
+pub struct PeekDismissal {
+    bvid: Option<String>,
+}
+
+impl PeekDismissal {
+    /// ✕ 关闭当前预览:登记被静默的稿件(无挂载内容时等价复位)。
+    pub fn close(&mut self, bvid: Option<String>) {
+        self.bvid = bvid;
+    }
+
+    /// 进入上报:返回是否放行。进入别的卡即清除静默。
+    pub fn on_enter(&mut self, bvid: &str) -> bool {
+        if self.bvid.as_deref() == Some(bvid) {
+            return false;
+        }
+        self.bvid = None;
+        true
+    }
+
+    /// 离开上报:离开被静默的卡即解除(再次悬停可重新弹出)。
+    pub fn on_exit(&mut self, bvid: &str) {
+        if self.bvid.as_deref() == Some(bvid) {
+            self.bvid = None;
+        }
+    }
+
+    /// 外部复位(点卡进播放页/预览内播放/设置开关)。
+    pub fn reset(&mut self) {
+        self.bvid = None;
+    }
+}
+
 /// 预览卡落点:画布上的布局左上角(视觉盒按 1.15 中心缩放计入边缘避让)。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Placement {
@@ -455,26 +491,31 @@ pub fn peek_card_view(
     ));
 
     // 右上收起钮:键盘/手柄用户与降级模式下不依赖「离开宽限」也能关闭。
+    let content = Grid::new().children((
+        View::from(StackPanel::new().spacing(8.0).children(rows)),
+        View::from(
+            Button::new()
+                .content("✕")
+                .style(ButtonStyle::Subtle)
+                .horizontal_alignment(HorizontalAlignment::Right)
+                .vertical_alignment(VerticalAlignment::Top)
+                .automation_name("关闭预览")
+                .on_click(move || close_cb.call(())),
+        ),
+    ));
+    // 卡体浮在无背景覆盖 Canvas 上:CardBackground 深色主题仅 ~5% 白,
+    // 单独使用会透出下方视频网格;必须先垫不透明 Solid 底再叠 Card tint。
     let body = Border::new()
-        .background(ThemeBrush::CardBackground)
-        .border_brush(ThemeBrush::CardStroke)
-        .border_thickness(1.0)
+        .background(ThemeBrush::SolidBackground)
         .corner_radius(10.0)
-        .padding(Thickness::xy(12.0, 12.0))
         .content(
-            Grid::new()
-                .children((
-                    View::from(StackPanel::new().spacing(8.0).children(rows)),
-                    View::from(
-                        Button::new()
-                            .content("✕")
-                            .style(ButtonStyle::Subtle)
-                            .horizontal_alignment(HorizontalAlignment::Right)
-                            .vertical_alignment(VerticalAlignment::Top)
-                            .automation_name("关闭预览")
-                            .on_click(move || close_cb.call(())),
-                    ),
-                )),
+            Border::new()
+                .background(ThemeBrush::CardBackground)
+                .border_brush(ThemeBrush::CardStroke)
+                .border_thickness(1.0)
+                .corner_radius(10.0)
+                .padding(Thickness::xy(12.0, 12.0))
+                .content(content),
         );
 
     let placed = body
@@ -664,6 +705,76 @@ mod tests {
         assert!(!m.is_mounted(), "没有锚点不挂载");
         m.attach_rect(rect(50.0, 50.0, 100.0, 60.0));
         assert!(m.is_mounted());
+    }
+
+    /// 验收:✕ 只静默当前卡——原卡停留不重弹,离开原卡或换卡即恢复。
+    #[test]
+    fn dismissal_scopes_to_closed_card_only() {
+        let mut d = PeekDismissal::default();
+        assert!(d.on_enter("BVa"), "未关闭过任何卡时放行");
+        d.close(Some("BVa".into()));
+        assert!(!d.on_enter("BVa"), "指针停在被关的原卡上不得再弹");
+        assert!(!d.on_enter("BVa"), "重复进入同样被静默");
+        assert!(d.on_enter("BVb"), "换卡立即恢复");
+        // 换卡已清静默:回到原卡也放行。
+        assert!(d.on_enter("BVa"));
+        // 离开解除路径。
+        d.close(Some("BVa".into()));
+        d.on_exit("BVb");
+        assert!(!d.on_enter("BVa"), "离开别的卡不解除原卡静默");
+        d.on_exit("BVa");
+        assert!(d.on_enter("BVa"), "离开原卡后再悬停应恢复");
+        // 外部复位与空关闭。
+        d.close(Some("BVa".into()));
+        d.reset();
+        assert!(d.on_enter("BVa"));
+        d.close(None);
+        assert!(d.on_enter("BVa"), "无挂载内容时关闭等价复位");
+    }
+
+    /// 验收:卡体背景必须是不透明 Solid 底 + Card tint 两层。预览卡浮在无背景
+    /// 覆盖 Canvas 上,CardBackground(深色 ~5% 白)单独作底会透出下方视频网格。
+    #[test]
+    fn peek_body_paints_opaque_base_under_card_tint() {
+        let item = VideoItem {
+            bvid: "BV1t".into(),
+            aid: 1,
+            cid: 2,
+            title: "标题".into(),
+            author: "UP".into(),
+            author_mid: 3,
+            author_face_url: None,
+            duration_secs: 60,
+            play_count: 100,
+            danmaku_count: 10,
+            like_count: None,
+            coin_count: None,
+            favorite_count: None,
+            share_count: None,
+            cover: None,
+            pic_url: None,
+        };
+        let view = peek_card_view(
+            &item,
+            None,
+            None,
+            Placement { x: 0.0, y: 0.0, flipped_below: false },
+            peek_render(true, true, true),
+            "BV1t",
+            |_: PointerEventInfo| {},
+            |_: PointerEventInfo| {},
+            &Callback::new(|_: String| {}),
+            &Callback::new(|_: String| {}),
+            &Callback::new(|_: ()| {}),
+        );
+        let debug = format!("{view:?}");
+        // 封面 Border 已占一处 SolidBackground;卡体底层是第二处。
+        assert!(
+            debug.matches("SolidBackground").count() >= 2,
+            "卡体必须垫不透明 Solid 底,否则半透明 Card 刷透出下方网格"
+        );
+        assert!(debug.contains("CardBackground"), "Card tint 面层保留");
+        assert!(debug.contains("CardStroke"), "描边保留");
     }
 
     /// 两帧进场帧值:挂载帧=视觉起点,翻牌帧=终态;宽限期淡出;降级直接显示。

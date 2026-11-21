@@ -42,6 +42,137 @@ pub const MOBILE_MARGIN_X: f64 = 12.0;
 pub const MOBILE_CARD_GAP: f64 = 8.0;
 pub const MOBILE_CARD_TEXT_ALLOWANCE: f64 = 77.0;
 
+// ---------------------------------------------------------------------------
+// 卡片文本列严格不变量（首页/热门/搜索共用 `VideoCard`，#10）
+// ---------------------------------------------------------------------------
+// 旧实现缺陷：标题 TextBlock 只设 `max_lines(2)` 不定高，实际占高随标题字数
+// 在 1 行/2 行之间浮动；StackPanel 顺序流式布局把下方 UP 主行、播放·弹幕统计
+// 行跟着顶下去/升上来（同屏卡片信息行错位，即用户截图症状）。
+// 现约定：文本列三行（标题/UP 主/统计）全部使用**定高槽**，槽高只由字号与
+// Noto Sans SC 最坏行高系数推导，与标题实际字符数、换行数**无关**；UI 层
+// (`widgets/video_card.rs`) 必须从此处取槽值并配显式 `line_height`，禁止内联
+// 字面量，保证「数据无关」是结构性质而非目测对齐。
+
+/// Noto Sans SC 最坏行高系数（em）；单测沿用播放页相关推荐卡同口径。
+pub const CARD_LINE_EM: f64 = 1.48;
+/// 标题定高槽恒预留的行数（1 行标题也在槽内顶对齐，余量沉底不外溢）。
+pub const CARD_TITLE_MAX_LINES: f64 = 2.0;
+/// 标题字号（#10 调小一档）：桌面 14→13，紧凑 12.5→12。
+pub const CARD_TITLE_FONT_DESKTOP: f64 = 13.0;
+pub const CARD_TITLE_FONT_COMPACT: f64 = 12.0;
+/// UP 主行字号（沿用原值，纳入不变量推导）。
+pub const CARD_AUTHOR_FONT_DESKTOP: f64 = 12.0;
+pub const CARD_AUTHOR_FONT_COMPACT: f64 = 11.0;
+/// 播放量·弹幕统计行字号。
+pub const CARD_STATS_FONT: f64 = 11.0;
+/// 文本列行距（与 StackPanel::spacing 同源，供高度推导）。
+pub const CARD_TEXT_SPACING: f64 = 4.0;
+/// 文本列容器上/下缘距（与 video_card.rs margins 同值，供高度推导）。
+pub const CARD_TEXT_MARGIN_DESKTOP_TOP: f64 = 10.0;
+pub const CARD_TEXT_MARGIN_DESKTOP_BOTTOM: f64 = 12.0;
+pub const CARD_TEXT_MARGIN_COMPACT_TOP: f64 = 6.0;
+pub const CARD_TEXT_MARGIN_COMPACT_BOTTOM: f64 = 8.0;
+
+/// 一行定高（Noto Sans SC 最坏行高向上取整到整 DIP）。
+pub fn card_line_slot(font: f64) -> f64 {
+    (font * CARD_LINE_EM).ceil()
+}
+
+/// 卡片文本列纯值层几何：所有行的顶边 y 与总高只由本结构算术推导，
+/// 标题长度无输入通道 → 位置不变量由构造成立。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CardTextLayout {
+    pub compact: bool,
+}
+
+impl CardTextLayout {
+    pub fn title_font(self) -> f64 {
+        if self.compact {
+            CARD_TITLE_FONT_COMPACT
+        } else {
+            CARD_TITLE_FONT_DESKTOP
+        }
+    }
+
+    pub fn author_font(self) -> f64 {
+        if self.compact {
+            CARD_AUTHOR_FONT_COMPACT
+        } else {
+            CARD_AUTHOR_FONT_DESKTOP
+        }
+    }
+
+    pub fn stats_font(self) -> f64 {
+        CARD_STATS_FONT
+    }
+
+    pub fn spacing(self) -> f64 {
+        CARD_TEXT_SPACING
+    }
+
+    pub fn top_margin(self) -> f64 {
+        if self.compact {
+            CARD_TEXT_MARGIN_COMPACT_TOP
+        } else {
+            CARD_TEXT_MARGIN_DESKTOP_TOP
+        }
+    }
+
+    pub fn bottom_margin(self) -> f64 {
+        if self.compact {
+            CARD_TEXT_MARGIN_COMPACT_BOTTOM
+        } else {
+            CARD_TEXT_MARGIN_DESKTOP_BOTTOM
+        }
+    }
+
+    /// 标题定高槽：恒为两行最坏行高，任何标题内容不改变本值。
+    pub fn title_slot(self) -> f64 {
+        (CARD_TITLE_MAX_LINES * self.title_font() * CARD_LINE_EM).ceil()
+    }
+
+    /// 槽内单行行高（×2 恰铺满 title_slot，1 行标题顶对齐余量留白）。
+    pub fn title_line_height(self) -> f64 {
+        self.title_slot() / CARD_TITLE_MAX_LINES
+    }
+
+    pub fn author_slot(self) -> f64 {
+        card_line_slot(self.author_font())
+    }
+
+    pub fn stats_slot(self) -> f64 {
+        card_line_slot(self.stats_font())
+    }
+
+    /// UP 主行顶边（相对文本列容器顶）：纯常量，与标题换行无关。
+    pub fn author_top(self) -> f64 {
+        self.top_margin() + self.title_slot() + self.spacing()
+    }
+
+    /// 统计行顶边（紧凑卡无统计行，本值仅桌面态有意义）。
+    pub fn stats_top(self) -> f64 {
+        self.author_top() + self.author_slot() + self.spacing()
+    }
+
+    /// 文本列总占高（含上下缘距）；紧凑卡文本列只有标题+UP 两槽。
+    pub fn total_height(self) -> f64 {
+        if self.compact {
+            self.author_top() + self.author_slot() + self.bottom_margin()
+        } else {
+            self.stats_top() + self.stats_slot() + self.bottom_margin()
+        }
+    }
+
+    /// 文本列可用额度（card_height − cover_height，两态均为常量）。
+    pub fn allowance(compact: bool) -> f64 {
+        if compact {
+            MOBILE_CARD_TEXT_ALLOWANCE
+        } else {
+            DESKTOP_CARD_TEXT_ALLOWANCE
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellChromeMode {
     Desktop,
@@ -403,16 +534,61 @@ mod tests {
 
     #[test]
     fn mobile_card_text_budget_fits_without_clipping() {
-        // Noto Sans SC 常见行高约 1.48em；标题 2 行(12.5px) + UP 1 行(11px) + 内外边距与间距
+        // 不变量接线后预算以 CardTextLayout 定高槽推导：紧凑卡文本列总高
+        // 必须放进 MOBILE_CARD_TEXT_ALLOWANCE，且各槽容得下最坏字体行高。
         let m = ViewportLayout::from_window_size(390.0, 640.0).cards;
-        let line_em = 1.48;
-        let needed_text_h = (2.0 * 12.5 * line_em) + (11.0 * line_em) + 4.0 + 14.0 + 2.0;
+        let t = CardTextLayout { compact: true };
+        assert_eq!(m.card_height - m.cover_height, CardTextLayout::allowance(true));
         assert!(
-            m.card_height - m.cover_height >= needed_text_h,
-            "紧凑卡文本预留({})应容下标题+UP({})",
-            m.card_height - m.cover_height,
-            needed_text_h
+            t.total_height() <= CardTextLayout::allowance(true),
+            "紧凑卡文本预留({})应容下定高文本列({})",
+            CardTextLayout::allowance(true),
+            t.total_height()
         );
+        assert!(2.0 * t.title_font() * 1.48 <= t.title_slot(), "标题槽应容两行最坏行高");
+        assert!(t.author_font() * 1.48 <= t.author_slot(), "UP 槽应容一行最坏行高");
+    }
+
+    /// #10 首页/热门/搜索共用卡文本列**严格不变量**：
+    /// ① 标题 1 行/2 行/超长都不得改变 UP 主行与统计行的顶边（顶边是纯算术
+    ///    常量，标题内容没有输入通道）；
+    /// ② 桌面态文本列总高必须放进 DESKTOP_CARD_TEXT_ALLOWANCE（不许靠加大
+    ///    卡高来兜底）；
+    /// ③ 标题字号已调小一档（14→13 / 12.5→12），槽值随之锁死防回退。
+    #[test]
+    fn card_text_rows_are_title_length_independent() {
+        let desktop = CardTextLayout { compact: false };
+        // 槽值锚点：改字号/行数/缘距必须同步本测试（故意写死以拦截回归）。
+        assert_eq!(desktop.title_font(), 13.0, "桌面标题应为调小一档后的 13px");
+        assert_eq!(desktop.title_slot(), 39.0);
+        assert_eq!(desktop.title_line_height() * 2.0, 39.0, "两行须恰好铺满槽");
+        assert_eq!(desktop.author_slot(), 18.0);
+        assert_eq!(desktop.stats_slot(), 17.0);
+        assert_eq!(desktop.author_top(), 10.0 + 39.0 + 4.0);
+        assert_eq!(desktop.stats_top(), desktop.author_top() + 18.0 + 4.0);
+        assert!(
+            desktop.total_height() <= CardTextLayout::allowance(false),
+            "桌面文本列总高({})应容下({})",
+            desktop.total_height(),
+            CardTextLayout::allowance(false)
+        );
+
+        let compact = CardTextLayout { compact: true };
+        assert_eq!(compact.title_font(), 12.0, "紧凑标题应为调小一档后的 12px");
+        assert_eq!(compact.title_slot(), 36.0);
+        assert_eq!(compact.author_top(), 6.0 + 36.0 + 4.0);
+        assert!(compact.total_height() <= CardTextLayout::allowance(true));
+
+        // 不变量的「构造性」：CardTextLayout 上不存在标题输入通道；再跨整条
+        // 桌面卡宽曲线验证信息行顶边与文本列总高逐点一致（卡宽同样不参与）。
+        for width in [860.0, 1000.0, 1280.0, 1920.0, 3840.0] {
+            let m = ViewportLayout::from_window_size(width, 900.0).cards;
+            assert!(!m.compact_card, "{width} 应为桌面卡");
+            let t = CardTextLayout { compact: false };
+            assert_eq!(t.author_top(), desktop.author_top(), "{width}: UP 行顶边漂移");
+            assert_eq!(t.stats_top(), desktop.stats_top(), "{width}: 统计行顶边漂移");
+            assert!(t.total_height() <= m.card_height - m.cover_height);
+        }
     }
 
     #[test]

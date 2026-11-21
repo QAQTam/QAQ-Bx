@@ -182,6 +182,9 @@ pub struct FullscreenInput {
     pub on_toggle_danmaku: Callback<()>,
     pub on_select_quality: Callback<i64>,
     pub on_exit_fullscreen: Callback<()>,
+    /// HUD 覆盖模式:不创建渲染面,只画悬浮播控。全屏时播放面由 shell 中
+    /// 稳定 keyed 的播放页继续持有,组件不被销毁(否则 native 必须换源重载)。
+    pub hud_only: bool,
 }
 
 impl PartialEq for FullscreenInput {
@@ -217,6 +220,7 @@ impl PartialEq for FullscreenInput {
             && self.on_toggle_danmaku == other.on_toggle_danmaku
             && self.on_select_quality == other.on_select_quality
             && self.on_exit_fullscreen == other.on_exit_fullscreen
+            && self.hud_only == other.hud_only
     }
 }
 
@@ -459,11 +463,16 @@ impl Component for FullscreenPlayer {
                     Message::CanvasPressed(ev.window_x, ev.window_y, ev.is_left_button_pressed)
                 }));
 
-        // 保持 VideoSurface 稳定在 keyed("fs-canvas", ...) 首层，HUD 仅覆盖上层且不触发视频重建。
-        let mut layers: Vec<KeyedView> = vec![keyed(
-            "fs-canvas",
-            Grid::new().children((surface, View::from(hit_overlay))),
-        )];
+        // HUD 覆盖模式下不挂载任何渲染面:播放面由 shell 中稳定 keyed 的播放页
+        // 继续持有。普通模式下 VideoSurface 仍在 keyed("fs-canvas") 首层。
+        let mut layers: Vec<KeyedView> = if input.hud_only {
+            Vec::new()
+        } else {
+            vec![keyed(
+                "fs-canvas",
+                Grid::new().children((surface, View::from(hit_overlay))),
+            )]
+        };
 
         let show_hud =
             self.hud_visible || !input.playing || input.loading || input.notice.is_some();
@@ -617,9 +626,14 @@ impl Component for FullscreenPlayer {
 
         Border::new()
             .element_ref(&self.root_ref)
+            .automation_id("fs-hud")
             .is_tab_stop(true)
             .focus_on_pointer_release(true)
-            .background(Brush::Solid(Color::rgb(0, 0, 0)))
+            .background(Brush::Solid(if input.hud_only {
+                Color::argb(0, 0, 0, 0)
+            } else {
+                Color::rgb(0, 0, 0)
+            }))
             .horizontal_alignment(HorizontalAlignment::Stretch)
             .vertical_alignment(VerticalAlignment::Stretch)
             .content(Grid::new().keyed_children(layers))

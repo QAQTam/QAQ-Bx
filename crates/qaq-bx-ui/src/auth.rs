@@ -19,6 +19,7 @@ use qaq_bx_plugin_login::{CREDENTIALS_FILE, QrAuthPlugin};
 use windows_reactor::EncodedImage;
 
 use crate::runtime::block_on;
+use crate::image_disk_cache::ImageDiskCache;
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36";
 
@@ -117,6 +118,8 @@ pub struct Auth {
     nav: Arc<NavClient>,
     /// 通知中心客户端（跨刷新复用设置缓存）。
     notify: Arc<NotifyClient>,
+    /// 封面/头像磁盘缓存（重启免重下；一键清空缓存的清理对象之一）。
+    image_disk: Arc<ImageDiskCache>,
 }
 
 impl Auth {
@@ -175,6 +178,9 @@ impl Auth {
             plugin.credentials(),
             nav.clone(),
         ));
+        let image_disk = Arc::new(ImageDiskCache::open(
+            data_dir.join("cache").join("images"),
+        ));
         Self {
             data_dir,
             plugin,
@@ -182,6 +188,7 @@ impl Auth {
             ticket,
             nav,
             notify,
+            image_disk,
         }
     }
 
@@ -193,6 +200,25 @@ impl Auth {
     /// 通知中心客户端（复用同一份凭证、HTTP 客户端与共享 nav）。
     pub fn notify_client(&self) -> Arc<NotifyClient> {
         self.notify.clone()
+    }
+
+    /// 磁盘图片缓存（设置页展示占用字节用）。
+    pub fn image_disk_cache(&self) -> Arc<ImageDiskCache> {
+        self.image_disk.clone()
+    }
+
+    /// 一键清空缓存（白名单纪律,后台线程调用）：只清磁盘图片缓存与
+    /// `ticket.json`（作废内存票据,下次请求自动重签）；凭据/设置绝不动。
+    /// 返回实际释放的字节数。
+    pub fn clear_caches_blocking(&self) -> u64 {
+        let mut freed = self.image_disk.clear();
+        let ticket_path = self.data_dir.join(TICKET_FILE);
+        let ticket_len = std::fs::metadata(&ticket_path).map(|m| m.len()).unwrap_or(0);
+        if std::fs::remove_file(&ticket_path).is_ok() {
+            freed += ticket_len;
+        }
+        self.ticket.invalidate();
+        freed
     }
 
     /// 探测登录态 + 启动自动续期 + `bili_ticket` 预热。
@@ -321,9 +347,14 @@ impl Auth {
     }
 
     /// 异步下载头像/封面静态图（hdslb 静态资源无需 Referer）。
+    /// 三层取数：磁盘缓存命中免网络 → 网络下载 → 成功后回填磁盘缓存
+    /// （内存 LRU 由各调用方自行 put,保持分层解耦）。
     pub async fn fetch_image_async(&self, url: &str) -> Option<EncodedImage> {
         if url.is_empty() {
             return None;
+        }
+        if let Some(bytes) = self.image_disk.get(url) {
+            return Some(EncodedImage::new(bytes));
         }
         let bytes = self
             .http
@@ -335,6 +366,7 @@ impl Auth {
             .bytes()
             .await
             .ok()?;
+        self.image_disk.put(url, &bytes);
         // #6:Bytes → Arc<[u8]> 单次拷贝(旧 `to_vec()` 再转 Arc 为两次全量拷贝)。
         Some(EncodedImage::new(std::sync::Arc::<[u8]>::from(
             &bytes[..],

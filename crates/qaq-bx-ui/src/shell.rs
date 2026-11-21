@@ -61,7 +61,7 @@ use crate::runtime::{block_on, cover_semaphore};
 use crate::smtc::{NativeSmtc, SmtcCommand, SmtcController};
 use crate::widgets::chrome;
 use crate::widgets::video_card::{self, HomeSlot};
-use crate::widgets::peek::{self, CardRect, HoverReport, PeekExitAction};
+use crate::widgets::peek::{self, CardRect, HoverReport, PeekDismissal, PeekExitAction};
 
 /// 封面下载完成回填 UI 的批处理合并窗口（避免每到 1 张封面重绘整页）。
 const COVER_FLUSH_INTERVAL: Duration = Duration::from_millis(80);
@@ -592,8 +592,16 @@ pub struct ShellProbe {
     /// U5:收藏页已选夹与资源条数(selftest 断言)。
     pub user_fav_cards: usize,
     pub user_fav_folders: usize,
+    /// U5:当前夹资源是否落定(成功或失败;夹可空,不能只门控条数)。
+    pub user_fav_resources_settled: bool,
     /// U5:当前登录态(selftest user-lists 场景分流用)。
     pub lists_logged_in: bool,
+    /// 存储卡:磁盘图片缓存占用字节(selftest 清缓存断言)。
+    pub disk_cache_bytes: u64,
+    /// 存储卡:上次一键清空结果提示(selftest 断言)。
+    pub cache_notice: Option<String>,
+    /// 热门页是否在飞(自动续页门控 selftest 断言)。
+    pub popular_loading: bool,
 }
 
 pub struct AppShell {
@@ -603,6 +611,8 @@ pub struct AppShell {
     settings: AppSettings,
     settings_notice: Option<String>,
     settings_save_timer: Option<ComponentTimer>,
+    /// 设置页「存储」卡:上次一键清空缓存的结果提示。
+    cache_notice: Option<String>,
     /// 后台任务代次（切视频/换一换/重探登录态时递增，拦截在飞旧结果串台）。
     playback_gen: u64,
     playback_epoch: Arc<AtomicU64>,
@@ -668,8 +678,8 @@ pub struct AppShell {
     peek_desc_inflight: HashSet<String>,
     /// PeekCard 行内提示(「稍后再看」结果;离开即清)。
     peek_notice: Option<String>,
-    /// 本会话用户手动关闭过预览卡(Escape/✕):不再自动弹出,点卡前保持静默。
-    peek_dismissed: bool,
+    /// ✕ 手动关闭的静默范围:仅被关的那张卡,离开它或换卡即恢复(非会话级)。
+    peek_dismissal: PeekDismissal,
     /// 不可播稿件标记(bvid → 准确原因):预解析/点击解析命中充电/付费未解锁试看降级时登记,
     /// 首页卡面据此打「充电专稿」角标,后续不再重复请求。
     unplayable: HashMap<String, String>,
@@ -1150,13 +1160,21 @@ pub enum Message {
     PeekWatchLater(String),
     /// 「稍后再看」回执(None = 成功;仅当前预览仍为该稿件时展示)。
     PeekWatchLaterDone { bvid: String, error: Option<String> },
-    /// PeekCard「关闭」:本流预览立即收起。
+    /// PeekCard「关闭」:立即收起,仅静默当前卡直到指针离开/换卡。
     PeekClose,
 
     // ---- 热门页（真实 popular API，无签名 pn/ps 分页）----
     /// 加载下一页/首屏失败重试（`next_pn` 由单源状态推进；失败不推进=自动重取同页）。
     PopularMore,
     PopularLoaded(Result<Vec<VideoItem>, String>),
+
+    // ---- 列表页滚动自动续页(五页共用;经 should_auto_page 门控) ----
+    ListAutoMore(crate::paging::AutoPage),
+
+    // ---- 设置页存储卡:一键清空缓存(白名单:图片磁盘缓存+票据;凭据/设置不动) ----
+    ClearCaches,
+    /// 后台清理完成,携带实际释放字节数。
+    CachesCleared(u64),
 
     // ---- 播放页相关推荐（真实 archive/related API）----
     RelatedLoaded {
@@ -1445,6 +1463,8 @@ impl AppShell {
         out.user_watch_later_count = self.watch_later.cards.len();
         out.user_fav_cards = self.favorites.resources.cards.len();
         out.user_fav_folders = self.favorites.folders.len();
+        out.user_fav_resources_settled =
+            self.favorites.resources.loaded_once || self.favorites.resources.error.is_some();
         out.lists_logged_in = self.lists_logged_in();
         out.player_engine = self.effective_player_engine().tag().to_string();
         out.native_playback = self.native_playback;
@@ -1452,6 +1472,9 @@ impl AppShell {
         out.window_width = self.viewport_layout.window_width;
         out.prefer_official_cdn = self.settings.prefer_official_cdn;
         out.multi_thread_preload = self.settings.multi_thread_preload;
+        out.disk_cache_bytes = self.auth_service.image_disk_cache().size_bytes();
+        out.cache_notice = self.cache_notice.clone();
+        out.popular_loading = self.popular.loading;
     }
 
     fn submit_search(&mut self, context: &ComponentContext<Self>) {
@@ -1600,9 +1623,9 @@ impl AppShell {
     }
 
     fn open_video(&mut self, bvid: &str, context: &ComponentContext<Self>) {
-        // #7:进播放页即消费悬停意图:收净预览并复位「手动关闭」静默位。
+        // #7:进播放页即消费悬停意图:收净预览并复位「手动关闭」静默。
         self.peek_hide_now();
-        self.peek_dismissed = false;
+        self.peek_dismissal.reset();
         // 数据源：首页已加载卡 → 搜索/热门/相关推荐索引 → 最小模型（真实标题由 video_meta 回填）。
         let mut item = match self
             .home_index
@@ -2147,10 +2170,9 @@ impl AppShell {
     // ---- #7 悬停预览卡生命周期 ----
 
     /// 预览卡生效面:仅首页推荐流(非半窗/非浮层/非全屏/非紧凑卡),且设置允许;
-    /// 用户手动关闭过(`peek_dismissed`)则保持静默,直至点卡消费复位。
+    /// ✕ 的单卡静默在 [`handle_card_hover`](Self::handle_card_hover) 按 bvid 判定。
     fn peek_allowed(&self) -> bool {
         self.settings.hover_preview
-            && !self.peek_dismissed
             && self.route == Route::Home
             && !self.is_fullscreen
             && !self.home_half_pane
@@ -2176,6 +2198,10 @@ impl AppShell {
             return;
         }
         if report.entering {
+            // ✕ 关过的卡:指针未离开前不重弹;进入别的卡即清除静默。
+            if !self.peek_dismissal.on_enter(&report.bvid) {
+                return;
+            }
             if std::env::var_os("QAQ_BX_TRACE_HOME").is_some() {
                 eprintln!("[qaq-bx-ui] peek enter {}", report.bvid);
             }
@@ -2190,6 +2216,7 @@ impl AppShell {
                 }));
             }
         } else {
+            self.peek_dismissal.on_exit(&report.bvid);
             match self.peek.on_card_exit(&report.bvid) {
                 PeekExitAction::CancelPending => {
                     self.peek_prefetch_timer = None;
@@ -2333,6 +2360,25 @@ impl AppShell {
             "peek-overlay",
             Canvas::new().children([card]),
         ))
+    }
+
+    /// 根层编排单源。全屏 / compact / desktop 三条返回路径统一从这里出根 View:
+    /// 根 key 与覆盖层顺序集中在一处 —— keyed diff 按 key + kind 匹配,根 key
+    /// 变化即整树销毁重建(全屏换源重载的根因)。后续要让全屏沿用播放层同键,
+    /// 只需改这一个函数,不必再翻 570 行的 `view()`。
+    fn shell_root_view(
+        &self,
+        root_key: &str,
+        root_content: impl Into<View>,
+        overlays: Vec<KeyedView>,
+    ) -> View {
+        let mut layers = Vec::with_capacity(1 + overlays.len());
+        layers.push(keyed(root_key, root_content.into()));
+        layers.extend(overlays);
+        Border::new()
+            .on_preview_key_down(self.global_key_handler.clone())
+            .content(Grid::new().keyed_children(layers))
+            .into()
     }
 
     fn spawn_cover_fetch(
@@ -4079,6 +4125,8 @@ impl AppShell {
         comment_cb: &CommentCallbacks,
         on_open: &Callback<String>,
         layout: ViewportLayout,
+        fullscreen: bool,
+        pane: Option<(f64, f64, f64)>,
         context: &mut ViewContext<Self>,
     ) -> Option<View> {
             Some(            match (self.now_playing.as_ref(), self.engine.as_ref()) {
@@ -4123,6 +4171,14 @@ impl AppShell {
                         on_select_page: context.callback(Message::SelectPage),
                         on_enter_fullscreen: context.message(Message::EnterFullscreen),
                         demo_override: self.demo.as_ref().and_then(|d| d.player_override),
+                        fullscreen,
+                        pane_mode: pane.is_some(),
+                        pane_width: pane.map(|p| p.0).unwrap_or(0.0),
+                        pane_max_width: pane.map(|p| p.1).unwrap_or(0.0),
+                        pane_max_height: pane.map(|p| p.2).unwrap_or(0.0),
+                        on_pane_expand: context.message(Message::ExpandHalfPane),
+                        on_pane_close: context.message(Message::CloseHalfPane),
+                        on_pane_resize: context.callback(Message::ResizeHalfPane),
                     })
                 }
                 _ => self.home_view(context),
@@ -4151,6 +4207,7 @@ impl AppShell {
         author_avatar: Option<EncodedImage>,
         my_avatar: Option<EncodedImage>,
         comment_cb: CommentCallbacks,
+        on_open: &Callback<String>,
         context: &mut ViewContext<Self>,
     ) -> Option<KeyedView> {
         let (Some(item), Some(engine)) = (self.now_playing.as_ref(), self.engine.as_ref()) else {
@@ -4158,42 +4215,31 @@ impl AppShell {
         };
         let max_width =
             (self.viewport_layout.content_width() - 48.0).max(pages::player::HALF_PANE_MIN_WIDTH);
+        // 与主窗/全屏共用同一 key 与同一组件:surface 的 keyed 路径完全一致,
+        // 半窗↔主窗只是 input 属性切换,native MPE 不销毁、不换源重载。
+        let pane_geom = (
+            self.settings.half_pane_width,
+            max_width,
+            self.viewport_layout.content_height(),
+        );
+        let content = self.player_page_content(
+            &author_avatar,
+            &my_avatar,
+            &comment_cb,
+            on_open,
+            self.viewport_layout,
+            false,
+            Some(pane_geom),
+            context,
+        )?;
         Some(keyed(
-            format!("half-pane:{}", item.bvid),
-            View::component::<pages::player::HalfPanePreview>(pages::player::HalfPaneInput {
-                item: item.clone(),
-                author_avatar,
-                my_avatar,
-                desc: self.now_playing_desc.clone(),
-                playing: self.playing,
-                position: self.position,
-                duration_secs: self.display_duration(item),
-                volume: self.volume,
-                danmaku_enabled: self.settings.danmaku_enabled,
-                mount_tick: self.mount_tick,
-                width: self.settings.half_pane_width,
-                max_width,
-                max_height: self.viewport_layout.content_height(),
-                notice: self.player_notice.clone(),
-                loading: self.video_loading,
-                engine: engine.clone(),
-                native: self.native_sink().cloned(),
-                stage: self.stage_sink().cloned(),
-                comments: self.comments_snapshot.clone(),
-                comment_cb,
-                on_toggle: context.message(Message::TogglePlay),
-                on_seek: context.callback(|value: f64| Message::Seek(value)),
-                on_volume: context.callback(|value: f64| Message::SetVolume(value)),
-                on_volume_wheel: context.callback(|delta: i32| {
-                    Message::PlayerHotkey(pages::fullscreen::PlayerHotkey::VolumeDelta(delta))
-                }),
-                on_toggle_mute: context.message(Message::ToggleMute),
-                on_toggle_danmaku: context.message(Message::ToggleDanmaku),
-                on_fullscreen: context.message(Message::EnterFullscreen),
-                on_expand: context.message(Message::ExpandHalfPane),
-                on_close: context.message(Message::CloseHalfPane),
-                on_resize: context.callback(Message::ResizeHalfPane),
-            }),
+            format!("player:{}", item.bvid),
+            Border::new()
+                .width(pane_geom.0)
+                .horizontal_alignment(windows_reactor::HorizontalAlignment::Right)
+                .vertical_alignment(windows_reactor::VerticalAlignment::Stretch)
+                .background(ThemeBrush::SolidBackground)
+                .content(content),
         ))
     }
 
@@ -5137,6 +5183,7 @@ impl Component for AppShell {
             settings_store,
             settings_notice,
             settings_save_timer: None,
+            cache_notice: None,
             playback_gen,
             playback_epoch,
             feed_gen,
@@ -5185,7 +5232,7 @@ impl Component for AppShell {
             peek_desc: HashMap::new(),
             peek_desc_inflight: HashSet::new(),
             peek_notice: None,
-            peek_dismissed: false,
+            peek_dismissal: PeekDismissal::default(),
             unplayable: HashMap::new(),
             image_cache,
             auth: AuthState::Unknown,
@@ -5388,6 +5435,47 @@ impl Component for AppShell {
             }
             Message::PopularLoaded(res) => {
                 self.absorb_popular(res, context);
+            }
+            Message::ListAutoMore(target) => {
+                use crate::paging::{should_auto_page, AutoPage};
+                // 门控:首页已成功 + 无在飞 + 未终态 + 无错误才自动续页;
+                // 错误态留给手动「重试」胶囊,避免滚动事件反复打失败请求。
+                let ok = match target {
+                    AutoPage::History => {
+                        let s = &self.user_history;
+                        self.lists_logged_in()
+                            && should_auto_page(s.loaded_once, s.loading, s.reached_end, s.error.is_some())
+                    }
+                    AutoPage::WatchLater => {
+                        let s = &self.watch_later;
+                        self.lists_logged_in()
+                            && should_auto_page(s.loaded_once, s.loading, s.reached_end, s.error.is_some())
+                    }
+                    AutoPage::Favorites => {
+                        let s = &self.favorites.resources;
+                        self.lists_logged_in()
+                            && self.favorites.selected != 0
+                            && should_auto_page(s.loaded_once, s.loading, s.reached_end, s.error.is_some())
+                    }
+                    AutoPage::Popular => {
+                        let s = &self.popular;
+                        should_auto_page(s.loaded_once, s.loading, s.reached_end, s.error.is_some())
+                    }
+                    AutoPage::Live => {
+                        let s = &self.live;
+                        should_auto_page(s.loaded_once, s.loading, s.reached_end, s.error.is_some())
+                    }
+                };
+                if !ok {
+                    return;
+                }
+                match target {
+                    AutoPage::History => self.fetch_history(context),
+                    AutoPage::WatchLater => self.fetch_watch_later(context),
+                    AutoPage::Favorites => self.fetch_fav_resources(context),
+                    AutoPage::Popular => self.fetch_popular(context),
+                    AutoPage::Live => self.fetch_live_rooms(context),
+                }
             }
             Message::RelatedLoaded { seq, bvid, res } => {
                 self.absorb_related(seq, bvid, res, context);
@@ -6984,9 +7072,9 @@ impl Component for AppShell {
                 self.peek_desc.entry(bvid).or_insert(desc);
             }
             Message::PeekPlay(bvid) => {
-                // 点「播放」消费了预览意图:dismissed 复位,悬停功能继续可用。
+                // 点「播放」消费了预览意图:静默复位,悬停功能继续可用。
                 self.peek_hide_now();
-                self.peek_dismissed = false;
+                self.peek_dismissal.reset();
                 self.open_video(&bvid, context);
                 self.sync_smtc(context);
             }
@@ -7017,7 +7105,9 @@ impl Component for AppShell {
                 }
             }
             Message::PeekClose => {
-                self.peek_dismissed = true;
+                // 仅静默当前卡:指针离开它或换卡即恢复,不关闭整个首页的预览。
+                let bvid = self.peek_mounted_bvid();
+                self.peek_dismissal.close(bvid);
                 self.peek_hide_now();
             }
 
@@ -7061,6 +7151,24 @@ impl Component for AppShell {
                 self.portrait_docked = docked;
                 self.portrait_dock_restore = restore;
             }
+            Message::ClearCaches => {
+                // 内存层立即清(封面/头像 LRU + 待flush批次);已挂到卡片上的
+                // 位图与卡片共享 Arc,继续显示不受影响。磁盘层+票据走后台线程。
+                self.image_cache.clear();
+                self.avatar_cache.clear();
+                self.pending_covers.clear();
+                self.cache_notice = None;
+                let auth = self.auth_service.clone();
+                context.spawn_background(move |_| {
+                    Message::CachesCleared(auth.clear_caches_blocking())
+                });
+            }
+            Message::CachesCleared(freed) => {
+                self.cache_notice = Some(format!(
+                    "已清空缓存,释放 {}",
+                    pages::settings::fmt_bytes(freed)
+                ));
+            }
             Message::UpdateSettings(next) => {
                 let next = next.normalized();
                 if next == self.settings {
@@ -7072,7 +7180,7 @@ impl Component for AppShell {
                 {
                     self.peek_hide_now();
                     if next.hover_preview {
-                        self.peek_dismissed = false;
+                        self.peek_dismissal.reset();
                     }
                 }
                 // 竖屏模式(实验)翻转:切换系统最大化没收与宽度硬约束;
@@ -7211,6 +7319,13 @@ impl Component for AppShell {
                     self.fetch_account_summary(context);
                     if self.route == Route::Login {
                         self.ensure_active_tab_loaded(context);
+                    }
+                    // 登录落定时已停在列表路由:补触发首屏(ensure_* 自带去重)。
+                    match self.route {
+                        Route::History => self.ensure_history(context),
+                        Route::WatchLater => self.ensure_watch_later(context),
+                        Route::Favorites => self.ensure_favorites(context),
+                        _ => {}
                     }
                 } else {
                     self.reset_account_data();
@@ -7674,43 +7789,54 @@ impl Component for AppShell {
 
         let layout = self.viewport_layout;
         let is_mobile = layout.is_mobile();
-        if self.is_fullscreen
-            && let (Some(item), Some(engine)) = (self.now_playing.as_ref(), self.engine.as_ref())
-        {
-            let fs_view = View::component::<pages::fullscreen::FullscreenPlayer>(
-                pages::fullscreen::FullscreenInput {
-                    item: item.clone(),
-                    playing: self.playing,
-                    position: self.position,
-                    duration_secs: self.display_duration(item),
-                    volume: self.volume,
-                    danmaku_enabled: self.settings.danmaku_enabled,
-                    quality_menu: self.quality_menu_view(),
-                    current_qn: self.current_qn,
-                    mount_tick: self.mount_tick,
-                    notice: self.player_notice.clone(),
-                    loading: self.video_loading,
-                    window_width: self.fullscreen_window_width,
-                    engine: engine.clone(),
-                    native: self.native_sink().cloned(),
-                    stage: self.stage_sink().cloned(),
-                    on_toggle: context.message(Message::TogglePlay),
-                    on_seek: context.callback(|value: f64| Message::Seek(value)),
-                    on_volume: context.callback(|value: f64| Message::SetVolume(value)),
-                    on_volume_wheel: context.callback(|delta: i32| {
-                        Message::PlayerHotkey(pages::fullscreen::PlayerHotkey::VolumeDelta(delta))
-                    }),
-                    on_toggle_mute: context.message(Message::ToggleMute),
-                    on_toggle_danmaku: context.message(Message::ToggleDanmaku),
-                    on_select_quality: context.callback(Message::SelectQuality),
-                    on_exit_fullscreen: context.message(Message::ExitFullscreen),
-                },
-            );
-            return Border::new()
-                .on_preview_key_down(self.global_key_handler.clone())
-                .content(Grid::new().keyed_children([keyed("fs-root", fs_view)]))
-                .into();
-        }
+        // 全屏不再换根树:播放页组件留在 shell-root 原来的 keyed 位置,MPE 不销毁。
+        // 这里只构造悬浮 HUD 覆盖层(不挂渲染面);渲染面由同一个 PlayerPage 持有。
+        let fullscreen = self.is_fullscreen && self.now_playing.is_some() && self.engine.is_some();
+        let fs_hud_layer = if fullscreen {
+            if let (Some(item), Some(engine)) =
+                (self.now_playing.as_ref(), self.engine.as_ref())
+            {
+                Some(keyed(
+                    "fs-hud",
+                    View::component::<pages::fullscreen::FullscreenPlayer>(
+                        pages::fullscreen::FullscreenInput {
+                            item: item.clone(),
+                            playing: self.playing,
+                            position: self.position,
+                            duration_secs: self.display_duration(item),
+                            volume: self.volume,
+                            danmaku_enabled: self.settings.danmaku_enabled,
+                            quality_menu: self.quality_menu_view(),
+                            current_qn: self.current_qn,
+                            mount_tick: self.mount_tick,
+                            notice: self.player_notice.clone(),
+                            loading: self.video_loading,
+                            window_width: self.fullscreen_window_width,
+                            engine: engine.clone(),
+                            native: self.native_sink().cloned(),
+                            stage: self.stage_sink().cloned(),
+                            on_toggle: context.message(Message::TogglePlay),
+                            on_seek: context.callback(|value: f64| Message::Seek(value)),
+                            on_volume: context.callback(|value: f64| Message::SetVolume(value)),
+                            on_volume_wheel: context.callback(|delta: i32| {
+                                Message::PlayerHotkey(
+                                    pages::fullscreen::PlayerHotkey::VolumeDelta(delta),
+                                )
+                            }),
+                            on_toggle_mute: context.message(Message::ToggleMute),
+                            on_toggle_danmaku: context.message(Message::ToggleDanmaku),
+                            on_select_quality: context.callback(Message::SelectQuality),
+                            on_exit_fullscreen: context.message(Message::ExitFullscreen),
+                            hud_only: true,
+                        },
+                    ),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let on_open = context.callback(Message::OpenVideo);
         // U5:登录门控页「去登录」按钮(菜单导航路径,含 ensure_account_loaded)。
         let go_login = context.message(Message::NavigateCompact(Route::Login));
@@ -7738,13 +7864,15 @@ impl Component for AppShell {
             .map(avatar_thumbnail_url)
             .and_then(|url| self.avatar_cache.get(&url));
 
-        let content: View = if self.route == Route::Player {
+        let content: View = if fullscreen || self.route == Route::Player {
             match self.player_page_content(
                 &author_avatar,
                 &my_avatar,
                 &comment_cb,
                 &on_open,
                 layout,
+                fullscreen,
+                None,
                 context,
             ) {
                 Some(view) => view,
@@ -7809,12 +7937,18 @@ impl Component for AppShell {
             )
         } else if self.route == Route::Settings {
             let on_change = context.callback(Message::UpdateSettings);
+            let storage = pages::settings::StorageCardState {
+                cache_bytes: self.auth_service.image_disk_cache().size_bytes(),
+                notice: self.cache_notice.clone(),
+            };
             pages::settings::settings_page(
                 &self.settings,
                 is_vip,
                 layout,
                 self.settings_notice.as_deref(),
                 &on_change,
+                &storage,
+                &context.message(Message::ClearCaches),
             )
         } else if self.route == Route::Search {
             let on_draft =
@@ -7840,6 +7974,7 @@ impl Component for AppShell {
                 layout,
                 &on_open_room,
                 &context.message(Message::LiveMore),
+                &context.message(Message::ListAutoMore(crate::paging::AutoPage::Live)),
             )
         } else if self.route == Route::Popular {
             pages::popular::popular_page(
@@ -7847,6 +7982,7 @@ impl Component for AppShell {
                 layout,
                 &on_open,
                 &context.message(Message::PopularMore),
+                &context.message(Message::ListAutoMore(crate::paging::AutoPage::Popular)),
             )
         } else if self.route == Route::History {
             // U5:登录门控(未登录不发请求,与 U1 评论发布同款纪律)。
@@ -7863,6 +7999,7 @@ impl Component for AppShell {
                     layout,
                     &on_open,
                     &context.message(Message::HistoryMore),
+                    &context.message(Message::ListAutoMore(crate::paging::AutoPage::History)),
                 )
             }
         } else if self.route == Route::WatchLater {
@@ -7879,6 +8016,7 @@ impl Component for AppShell {
                     layout,
                     &on_open,
                     &context.message(Message::WatchLaterMore),
+                    &context.message(Message::ListAutoMore(crate::paging::AutoPage::WatchLater)),
                 )
             }
         } else if self.route == Route::Favorites {
@@ -7897,6 +8035,7 @@ impl Component for AppShell {
                     &on_select_folder,
                     &on_open,
                     &context.message(Message::FavMore),
+                    &context.message(Message::ListAutoMore(crate::paging::AutoPage::Favorites)),
                 )
             }
         } else {
@@ -7904,7 +8043,7 @@ impl Component for AppShell {
         };
 
         // 切换目的地时退役原生控件（含播放页换视频的场景）。
-        let key = if self.route == Route::Player {
+        let key = if fullscreen || self.route == Route::Player {
             format!(
                 "player:{}",
                 self.now_playing
@@ -7929,7 +8068,7 @@ impl Component for AppShell {
                     .map_or(String::new(), |item| item.bvid.clone())
             );
             let parked = self
-                .player_page_content(&author_avatar, &my_avatar, &comment_cb, &on_open, layout, context)
+                .player_page_content(&author_avatar, &my_avatar, &comment_cb, &on_open, layout, false, None, context)
                 .unwrap_or_else(|| self.home_view(context));
             keyed(
                 park_key,
@@ -8109,20 +8248,22 @@ impl Component for AppShell {
                     Grid::new().grid_row(2).children((bottom_bar,)),
                 ));
 
-            return Border::new()
-                .on_preview_key_down(self.global_key_handler.clone())
-                .content(Grid::new().keyed_children([keyed("shell-root", shell_root)]))
-                .into();
+            let overlays: Vec<KeyedView> = fs_hud_layer.into_iter().collect();
+            return self.shell_root_view("shell-root", shell_root, overlays);
         }
 
         let navigation = NavigationView::new()
-            .pane_display_mode(NavigationViewPaneDisplayMode::LeftCompact)
+            .pane_display_mode(if fullscreen {
+                NavigationViewPaneDisplayMode::LeftMinimal
+            } else {
+                NavigationViewPaneDisplayMode::LeftCompact
+            })
             .is_pane_toggle_button_visible(false)
             .is_back_button_visible(NavigationViewBackButtonVisible::Collapsed)
             .is_settings_visible(false)
             .always_show_header(false)
             .pane_title("QAQ-Bx")
-            .is_pane_open(self.pane_open)
+            .is_pane_open(if fullscreen { false } else { self.pane_open })
             .on_is_pane_open_changed(context.callback(Message::PaneOpenChanged))
             .on_selected_tag_changed(context.callback(|tag: Option<Rc<str>>| {
                 Message::NavTagSelected(tag.map(|tag| tag.to_string()))
@@ -8141,12 +8282,13 @@ impl Component for AppShell {
                                 .content(content),
                         ),
                     ]
-                } else if self.route == Route::Home && self.home_half_pane {
+                    } else if self.route == Route::Home && self.home_half_pane && !fullscreen {
                     let mut list = vec![keyed(key, content)];
                     if let Some(layer) = self.half_pane_layer(
                         author_avatar.clone(),
                         my_avatar.clone(),
                         comment_cb.clone(),
+                        &on_open,
                         context,
                     ) {
                         list.push(layer);
@@ -8179,19 +8321,17 @@ impl Component for AppShell {
             }));
 
         let shell_root = Grid::new()
-            .rows([GridLength::Auto, GridLength::Star(1.0)])
+            .rows([if fullscreen {
+                GridLength::Pixel(0.0)
+            } else {
+                GridLength::Auto
+            }, GridLength::Star(1.0)])
             .children((title_bar, navigation));
 
         // #7:预览卡覆盖层挂在 shell-root 之后(整窗最顶层,玻璃宿主之下无残留)。
-        let mut root_layers = vec![keyed("shell-root", shell_root)];
-        if let Some(layer) = self.peek_overlay_layer(context) {
-            root_layers.push(layer);
-        }
-
-        Border::new()
-            .on_preview_key_down(self.global_key_handler.clone())
-            .content(Grid::new().keyed_children(root_layers))
-            .into()
+        let mut overlays: Vec<KeyedView> = self.peek_overlay_layer(context).into_iter().collect();
+        overlays.extend(fs_hud_layer);
+        self.shell_root_view("shell-root", shell_root, overlays)
     }
 }
 

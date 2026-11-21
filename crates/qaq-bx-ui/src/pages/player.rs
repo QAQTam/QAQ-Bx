@@ -265,6 +265,23 @@ pub struct PlayerInput {
     pub on_enter_fullscreen: Callback<()>,
     /// `--demo` 导演器按时序覆写手机端标签页 / 简介展开态（生产路径固定为 None）。
     pub demo_override: Option<(u64, PlayerTab, bool)>,
+    /// 全屏呈现模式:播放面铺满窗口、其余页面内容以属性收起(树形不变)。
+    /// 全屏不再另建一个渲染面 —— 同一个 keyed 播放页组件必须留在原树位置,
+    /// 否则 native 的 MPE 被销毁并强制换源重载。
+    pub fullscreen: bool,
+    /// 半窗呈现模式:同一 PlayerPage 收进右侧抽屉,渲染面路径与主窗**完全一致**
+    /// (仍走桌面双栏分支,不切单列 early-return),只改属性。这样半窗↔主窗
+    /// 是同一 keyed 组件的 input 变化,native 不换源重载。
+    pub pane_mode: bool,
+    /// 半窗宽度(pane_mode 时有效,0 表示非半窗)。用于视频面/抽屉几何计算。
+    pub pane_width: f64,
+    /// 半窗最大宽度(拖拽缩放上限)。
+    pub pane_max_width: f64,
+    /// 半窗可用高度(视频高度按宽度与可用高度计算)。
+    pub pane_max_height: f64,
+    pub on_pane_expand: Callback<()>,
+    pub on_pane_close: Callback<()>,
+    pub on_pane_resize: Callback<f64>,
 }
 
 impl PartialEq for PlayerInput {
@@ -304,6 +321,14 @@ impl PartialEq for PlayerInput {
             && self.on_select_page == other.on_select_page
             && self.on_enter_fullscreen == other.on_enter_fullscreen
             && self.demo_override == other.demo_override
+            && self.fullscreen == other.fullscreen
+            && self.pane_mode == other.pane_mode
+            && (self.pane_width - other.pane_width).abs() < 0.5
+            && (self.pane_max_width - other.pane_max_width).abs() < 0.5
+            && (self.pane_max_height - other.pane_max_height).abs() < 0.5
+            && self.on_pane_expand == other.on_pane_expand
+            && self.on_pane_close == other.on_pane_close
+            && self.on_pane_resize == other.on_pane_resize
     }
 }
 
@@ -326,6 +351,9 @@ pub struct PlayerPage {
     /// F3:评论/相关列表虚拟源缓存(桌面/紧凑两档;同 (档位, rev) 复用同一实例)。
     comments_cache: VirtualSourceCache,
     related_cache: VirtualSourceCache,
+    /// 半窗拖拽缩放的瞬时宽度(仅 pane_mode 用;持久化走 shell 的 on_pane_resize)。
+    pane_live_width: Option<f64>,
+    pane_drag_origin: Option<(f64, f64)>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -336,6 +364,9 @@ pub enum Message {
     SelectTab(PlayerTab),
     ToggleDesc,
     VideoPressed(f64, f64, bool),
+    PaneDragStart(f64, f64),
+    PaneDragMove(f64),
+    PaneDragEnd,
 }
 
 impl PlayerPage {
@@ -392,6 +423,95 @@ impl PlayerPage {
                 )
             })
     }
+
+    /// 半窗 chrome:左侧窄条(关闭/拖拽柄/展开)+ 拖拽 scrim。作为**额外 keyed
+    /// 兄弟层**挂在 root,`player-surface-host` 的 keyed 路径与主窗完全一致 ⇒
+    /// surface 组件不重建(native 不换源重载)。
+    fn pane_chrome_layers(
+        &self,
+        input: &PlayerInput,
+        pane_w: f64,
+        context: &mut ViewContext<Self>,
+    ) -> Vec<KeyedView> {
+        let cur_w = pane_w;
+        let drag_handle = Border::new()
+            .grid_row(1)
+            .width(40.0)
+            .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
+            .on_pointer_pressed(context.callback(move |ev: PointerEventInfo| {
+                Message::PaneDragStart(ev.window_x, cur_w)
+            }))
+            .content(
+                StackPanel::new()
+                    .spacing(6.0)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .children((
+                        FontIcon::new()
+                            .glyph("\u{E76F}")
+                            .font_size(14.0)
+                            .opacity(if self.pane_drag_origin.is_some() { 1.0 } else { 0.55 }),
+                        Border::new()
+                            .width(3.0)
+                            .height(28.0)
+                            .corner_radius(1.5)
+                            .background(if self.pane_drag_origin.is_some() {
+                                ThemeBrush::Accent
+                            } else {
+                                ThemeBrush::CardStroke
+                            }),
+                    )),
+            );
+        let left_strip = Border::new()
+            .horizontal_alignment(HorizontalAlignment::Left)
+            .vertical_alignment(VerticalAlignment::Stretch)
+            .width(40.0)
+            .background(ThemeBrush::CardBackground)
+            .border_brush(ThemeBrush::CardStroke)
+            .border_thickness(Thickness::new(0.0, 0.0, 1.0, 0.0))
+            .content(
+                Grid::new()
+                    .rows([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
+                    .children((
+                        Button::new()
+                            .automation_id("half-pane-close")
+                            .style(ButtonStyle::Subtle)
+                            .width(40.0)
+                            .height(40.0)
+                            .content(FontIcon::new().glyph("\u{E711}").font_size(12.0))
+                            .on_click(input.on_pane_close.clone()),
+                        View::from(drag_handle),
+                        Button::new()
+                            .automation_id("half-pane-expand")
+                            .grid_row(2)
+                            .style(ButtonStyle::Subtle)
+                            .width(40.0)
+                            .height(44.0)
+                            .content(FontIcon::new().glyph("\u{E76B}").font_size(14.0))
+                            .on_click(input.on_pane_expand.clone()),
+                    )),
+            );
+        let mut layers = vec![keyed("pane-left-strip", left_strip)];
+        if self.pane_drag_origin.is_some() {
+            let on_resize = input.on_pane_resize.clone();
+            let final_w = pane_w;
+            let end_cancel = context.message(Message::PaneDragEnd);
+            layers.push(keyed(
+                "pane-drag-scrim",
+                Border::new()
+                    .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
+                    .on_pointer_moved(context.callback(|ev: PointerEventInfo| {
+                        Message::PaneDragMove(ev.window_x)
+                    }))
+                    .on_pointer_released(context.callback(move |_: PointerEventInfo| {
+                        on_resize.call(final_w);
+                        Message::PaneDragEnd
+                    }))
+                    .on_pointer_canceled(move || end_cancel.call(())),
+            ));
+        }
+        layers
+    }
 }
 
 impl Component for PlayerPage {
@@ -414,6 +534,8 @@ impl Component for PlayerPage {
             double_click: DoubleClickTracker::new(),
             comments_cache: VirtualSourceCache::default(),
             related_cache: VirtualSourceCache::default(),
+            pane_live_width: None,
+            pane_drag_origin: None,
         };
         page.refresh_virtual_sources(input);
         page
@@ -452,6 +574,23 @@ impl Component for PlayerPage {
             Message::ToggleDesc => {
                 self.desc_expanded = !self.desc_expanded;
             }
+            Message::PaneDragStart(x, w) => {
+                if x.is_finite() {
+                    self.pane_drag_origin = Some((x, w));
+                }
+            }
+            Message::PaneDragMove(x) => {
+                if x.is_finite()
+                    && let Some((start_x, start_w)) = self.pane_drag_origin
+                {
+                    let max_w = context.input().pane_max_width;
+                    let next = clamp_half_pane_width(start_w + (start_x - x), max_w);
+                    self.pane_live_width = Some(next);
+                }
+            }
+            Message::PaneDragEnd => {
+                self.pane_drag_origin = None;
+            }
             Message::VideoPressed(x, y, left_pressed) => {
                 if self
                     .double_click
@@ -464,7 +603,19 @@ impl Component for PlayerPage {
     }
 
     fn view(&self, input: &PlayerInput, context: &mut ViewContext<Self>) -> View {
-        let is_pip = self.pip_pinned || self.scroll_y >= PIP_SCROLL_THRESHOLD;
+        // 全屏/半窗由 shell 传入 flag:都强制走同一棵桌面主位树,保证 surface 的
+        // keyed 路径不变(单列 early-return 换树会销毁 MPE → native 换源重载)。
+        let is_pip = !input.fullscreen
+            && !input.pane_mode
+            && (self.pip_pinned || self.scroll_y >= PIP_SCROLL_THRESHOLD);
+        let pane_w = if input.pane_mode {
+            clamp_half_pane_width(
+                self.pane_live_width.unwrap_or(input.pane_width),
+                input.pane_max_width,
+            )
+        } else {
+            0.0
+        };
 
         let surface: View = if let Some(notice) = &input.notice {
             Border::new()
@@ -532,10 +683,17 @@ impl Component for PlayerPage {
                 )
                 .into()
         } else {
-            Border::new().height(PLAYER_SLOT_HEIGHT).into()
+            Border::new()
+                .height(if input.pane_mode {
+                    compute_half_pane_video_height(pane_w, input.pane_max_height)
+                } else {
+                    PLAYER_SLOT_HEIGHT
+                })
+                .into()
         };
 
-        let is_single_col = input.layout.is_single_column();
+        // 半窗强制走桌面双栏树(右栏以属性收起),绝不切单列 early-return。
+        let is_single_col = !input.pane_mode && input.layout.is_single_column();
         let is_mobile = input.layout.is_mobile();
         let margin_x = input.layout.page_margin_x();
 
@@ -935,7 +1093,7 @@ impl Component for PlayerPage {
 
         let left_scroll_content = StackPanel::new()
             .spacing(14.0)
-            .margin(Thickness::new(16.0, 16.0, 12.0, 24.0))
+            .margin(Thickness::new(if input.pane_mode { 52.0 } else { 16.0 }, 16.0, 12.0, 24.0))
             .children((
                 top_player_slot,
                 View::from(transport),
@@ -965,10 +1123,29 @@ impl Component for PlayerPage {
             ));
 
         let two_col_body = Grid::new()
-            .columns([GridLength::Star(1.0), GridLength::Pixel(RIGHT_RAIL_WIDTH)])
-            .children((View::from(left_scroll), View::from(right_rail)));
+            .columns([GridLength::Star(1.0), GridLength::Pixel(if input.pane_mode {
+                0.0
+            } else {
+                RIGHT_RAIL_WIDTH
+            })])
+            .children((View::from(left_scroll), View::from(right_rail)))
+            .opacity(if input.fullscreen {
+                0.0
+            } else {
+                1.0
+            });
 
-        // 稳定挂载 VideoSurface：通过对齐与尺寸切换在“顶部主位”和“右下角小窗”间过渡，不销毁 SwapChainPanel。
+        // 稳定挂载 surface:主位/小窗只切外层 Border 的尺寸与对齐,content 树形
+        // 由 floating_surface_content 保证完全一致 —— 跨 300px 阈值不再销毁重建。
+        let on_back_to_top = context.message(Message::BackToTop);
+        let surface_host = floating_surface_content(
+            surface,
+            is_pip,
+            &input.item.title,
+            input.playing,
+            input.on_toggle.clone(),
+            on_back_to_top,
+        );
         let floating_surface = if is_pip {
             Border::new()
                 .width(360.0)
@@ -980,56 +1157,45 @@ impl Component for PlayerPage {
                 .border_thickness(1.0)
                 .horizontal_alignment(HorizontalAlignment::Right)
                 .vertical_alignment(VerticalAlignment::Bottom)
-                .content(
-                    Grid::new()
-                        .rows([GridLength::Star(1.0), GridLength::Auto])
-                        .children((
-                            View::from(Border::new().corner_radius(8.0).content(surface)),
-                            Grid::new()
-                                .grid_row(1)
-                                .columns([
-                                    GridLength::Auto,
-                                    GridLength::Star(1.0),
-                                    GridLength::Auto,
-                                ])
-                                .margin(Thickness::xy(8.0, 4.0))
-                                .children((
-                                    Button::new()
-                                        .style(ButtonStyle::Subtle)
-                                        .content(if input.playing { "暂停" } else { "播放" })
-                                        .on_click(input.on_toggle.clone()),
-                                    TextBlock::new()
-                                        .grid_column(1)
-                                        .text(input.item.title.clone())
-                                        .font_size(11.0)
-                                        .max_lines(1)
-                                        .opacity(0.75)
-                                        .margin(Thickness::xy(6.0, 0.0))
-                                        .vertical_alignment(VerticalAlignment::Center),
-                                    Button::new()
-                                        .grid_column(2)
-                                        .style(ButtonStyle::Subtle)
-                                        .content("回主窗")
-                                        .on_click(context.message(Message::BackToTop)),
-                                )),
-                        )),
-                )
+                .content(surface_host)
         } else {
-            Border::new()
-                .height(PLAYER_SLOT_HEIGHT)
-                .margin(Thickness::new(16.0, 16.0, RIGHT_RAIL_WIDTH + 12.0, 0.0))
-                .corner_radius(8.0)
+            let host = Border::new()
+                .margin(if input.fullscreen {
+                    Thickness::new(0.0, 0.0, 0.0, 0.0)
+                } else if input.pane_mode {
+                    Thickness::new(52.0, 12.0, 12.0, 0.0)
+                } else {
+                    Thickness::new(16.0, 16.0, RIGHT_RAIL_WIDTH + 12.0, 0.0)
+                })
+                .corner_radius(if input.fullscreen { 0.0 } else { 8.0 })
                 .horizontal_alignment(HorizontalAlignment::Stretch)
-                .vertical_alignment(VerticalAlignment::Top)
-                .content(surface)
+                .vertical_alignment(if input.fullscreen {
+                    VerticalAlignment::Stretch
+                } else {
+                    VerticalAlignment::Top
+                });
+            // 全屏用 Stretch 填满父格,不依赖 viewport_layout 是否已跟上全屏尺寸。
+            let host = if input.fullscreen {
+                host
+            } else if input.pane_mode {
+                host.height(compute_half_pane_video_height(pane_w, input.pane_max_height))
+            } else {
+                host.height(PLAYER_SLOT_HEIGHT)
+            };
+            host.content(surface_host)
         };
 
-        Grid::new()
-            .keyed_children([
-                keyed("player-two-col", two_col_body),
-                keyed("player-surface-host", floating_surface),
-            ])
-            .into()
+        let core_layers = [
+            keyed("player-two-col", two_col_body),
+            keyed("player-surface-host", floating_surface),
+        ];
+        if input.pane_mode {
+            let mut layers: Vec<KeyedView> = core_layers.into_iter().collect();
+            layers.extend(self.pane_chrome_layers(input, pane_w, context));
+            Grid::new().keyed_children(layers).into()
+        } else {
+            Grid::new().keyed_children(core_layers).into()
+        }
     }
 }
 
@@ -1148,6 +1314,63 @@ fn surface_with_double_click(surface: View, on_pressed: PointerCallback) -> View
                     .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
                     .on_pointer_pressed(on_pressed),
             ),
+        ))
+        .into()
+}
+
+/// 页内小窗与主位**共用**的 surface 宿主树:两态必须保持同一 kind 序列
+/// `Grid{ index0 = Border(surface), index1 = 控制条 Grid }`。
+///
+/// 历史缺陷:非小窗分支把 surface 直挂 `Border.content`,小窗分支多包一层
+/// `Grid{Border(surface), 控制条}` —— positional diff 按索引 + kind 匹配,
+/// index-0 撞上 Grid vs Border 就销毁重建整棵子树(native 换源重载)。
+/// 现两态共用本函数, `is_pip` 只改尺寸/透明度/边距等属性,绝不增删层级,
+/// 与 `surface_with_loading` 的「状态翻转不改树形」同一约定。
+fn floating_surface_content(
+    surface: View,
+    is_pip: bool,
+    title: &str,
+    playing: bool,
+    on_toggle: Callback<()>,
+    on_back_to_top: Callback<()>,
+) -> View {
+    Grid::new()
+        .rows([GridLength::Star(1.0), GridLength::Auto])
+        .children((
+            View::from(Border::new().corner_radius(8.0).content(surface)),
+            Grid::new()
+                .grid_row(1)
+                .height(if is_pip { 36.0 } else { 0.0 })
+                .opacity(if is_pip { 1.0 } else { 0.0 })
+                .columns([
+                    GridLength::Auto,
+                    GridLength::Star(1.0),
+                    GridLength::Auto,
+                ])
+                .margin(if is_pip {
+                    Thickness::xy(8.0, 4.0)
+                } else {
+                    Thickness::xy(0.0, 0.0)
+                })
+                .children((
+                    Button::new()
+                        .style(ButtonStyle::Subtle)
+                        .content(if playing { "暂停" } else { "播放" })
+                        .on_click(on_toggle),
+                    TextBlock::new()
+                        .grid_column(1)
+                        .text(title.to_string())
+                        .font_size(11.0)
+                        .max_lines(1)
+                        .opacity(0.75)
+                        .margin(Thickness::xy(6.0, 0.0))
+                        .vertical_alignment(VerticalAlignment::Center),
+                    Button::new()
+                        .grid_column(2)
+                        .style(ButtonStyle::Subtle)
+                        .content("回主窗")
+                        .on_click(on_back_to_top),
+                )),
         ))
         .into()
 }
@@ -2818,6 +3041,7 @@ impl Component for HalfPanePreview {
                     .rows([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
                     .children((
                         Button::new()
+                            .automation_id("half-pane-close")
                             .style(ButtonStyle::Subtle)
                             .width(40.0)
                             .height(40.0)
@@ -2825,6 +3049,7 @@ impl Component for HalfPanePreview {
                             .on_click(input.on_close.clone()),
                         View::from(drag_handle),
                         Button::new()
+                            .automation_id("half-pane-expand")
                             .grid_row(2)
                             .style(ButtonStyle::Subtle)
                             .width(40.0)
@@ -3143,6 +3368,14 @@ mod tests {
             my_avatar: None,
             desc: None,
             playing: true,
+            fullscreen: false,
+            pane_mode: false,
+            pane_width: 0.0,
+            pane_max_width: 0.0,
+            pane_max_height: 0.0,
+            on_pane_expand: noop_unit.clone(),
+            on_pane_close: noop_unit.clone(),
+            on_pane_resize: noop_f64.clone(),
             position: 11,
             volume: 60,
             danmaku_enabled: true,
@@ -3490,6 +3723,52 @@ mod tests {
         assert!(
             with_native != with_stage,
             "stage 接入必须触发半窗弹幕透明层同步更新"
+        );
+    }
+
+    /// 小窗/主位翻转不得改树形。reactor 的 positional diff 只按索引 + kind 匹配
+    /// (relations.rs:362-376);任一分支增删 wrapper 都会销毁重建 surface 组件,
+    /// native 下即一次换源重载。这里逐项钉住两态的 kind 序列。
+    #[test]
+    fn floating_surface_keeps_identical_kind_tree_across_pip_toggle() {
+        fn kinds(view: &super::View) -> Vec<String> {
+            let dbg = format!("{view:?}");
+            dbg.split("kind: ")
+                .skip(1)
+                .map(|tail| {
+                    tail.chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect::<String>()
+                })
+                .filter(|s| !s.is_empty())
+                .collect()
+        }
+
+        let noop = super::Callback::new(|()| {});
+        let surface: super::View = super::Border::new().into();
+        let main = kinds(&super::floating_surface_content(
+            surface.clone(),
+            false,
+            "标题",
+            true,
+            noop.clone(),
+            noop.clone(),
+        ));
+        let pip = kinds(&super::floating_surface_content(
+            surface,
+            true,
+            "标题",
+            true,
+            noop.clone(),
+            noop,
+        ));
+
+        assert_eq!(main, pip, "小窗翻转改变了 surface 宿主树形，会触发组件重建");
+        assert_eq!(main.first().map(String::as_str), Some("Grid"));
+        assert_eq!(
+            main.get(1).map(String::as_str),
+            Some("Border"),
+            "index-0 必须恒为 Border，否则与旧主位分支的 Grid 撞 kind"
         );
     }
 }

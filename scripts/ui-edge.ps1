@@ -1156,7 +1156,14 @@ foreach ($mode in @(
             [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
             [System.Windows.Automation.ControlType]::Button
         )
-        $btnsHidden = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condBtn)
+        # 全屏现在保留底层播放页组件(避免 MPE 销毁换源),播放页播控条仍在 UIA 树中
+        # 但已属性收起;自动隐藏只针对 HUD 覆盖层本身判定。
+        $hudRoot = Find-UiaByAutomationId -Root $root -Id "fs-hud"
+        if ($hudRoot) {
+            $btnsHidden = $hudRoot.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condBtn)
+        } else {
+            $btnsHidden = @()
+        }
         $visBtns = 0
         foreach ($b in $btnsHidden) {
             $r = $b.Current.BoundingRectangle
@@ -2163,7 +2170,7 @@ try {
 
 # ---------- 场景 E23：#7 卡片悬停 1s 弹出预览卡（真实鼠标 hover + UIA 点「播放」） ----------
 if (Should-RunScenario "E23") {
-Write-Host "[E23] 悬停预览卡：SetCursorPos hover -> peek-card 弹出 -> UIA Invoke 播放 -> 快速掠过 10 点不弹出" -ForegroundColor Cyan
+Write-Host "[E23] 悬停预览卡：SetCursorPos hover -> peek-card 弹出 -> ✕ 单卡静默/换卡恢复 -> UIA Invoke 播放 -> 快速掠过 10 点不弹出" -ForegroundColor Cyan
 $stderrLog = Join-Path $OutRoot "e23-stderr.log"
 $settingsPath = Join-Path $dataDir "settings.json"
 $settingsBak = "$settingsPath.e23-bak"
@@ -2244,6 +2251,47 @@ try {
     Capture-WindowFrame -Hwnd $hwnd -FileName "e23-1-peek-open.png"
     Write-Host "[E23] peek-card 已弹出" -ForegroundColor DarkCyan
 
+    # ②.5 ✕ 手动关闭只静默当前卡:原卡停留不重弹,换卡立即恢复(会话级静默回归点)。
+    $closeBtn = Find-UiaByName -Root $peek -Name "关闭预览"
+    if (-not $closeBtn) { throw "E23 FAIL: 预览卡内未找到「关闭预览」按钮" }
+    [void](Invoke-UiaElement -Element $closeBtn -What "预览卡关闭")
+    Start-Sleep -Milliseconds 400
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    if (Find-UiaByAutomationId -Root $root -Id "peek-card") { throw "E23 FAIL: ✕ 后预览卡未收起" }
+    # 光标仍停在原卡上微动 1.4s:不得重弹。
+    Move-Cursor ($c0x + 4) ($c0y + 1)
+    Start-Sleep -Milliseconds 700
+    Move-Cursor ($c0x + 5) ($c0y + 2)
+    Start-Sleep -Milliseconds 700
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    if (Find-UiaByAutomationId -Root $root -Id "peek-card") { throw "E23 FAIL: ✕ 后指针未离开原卡不得重弹" }
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e23-2-after-close.png"
+    # 换到第二张卡悬停 1.4s:必须恢复弹出。
+    $r1 = $cards[1].Current.BoundingRectangle
+    $c1x = [int]($r1.Left + $r1.Width / 2)
+    $c1y = [int]($r1.Top + $r1.Height / 2)
+    Move-Cursor $c1x $c1y
+    Start-Sleep -Milliseconds 60
+    Move-Cursor ($c1x + 2) $c1y
+    Start-Sleep -Milliseconds 1400
+    Move-Cursor ($c1x + 3) ($c1y + 1)
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    if (-not (Find-UiaByAutomationId -Root $root -Id "peek-card")) { throw "E23 FAIL: ✕ 后换卡悬停未恢复弹出" }
+    Write-Host "[E23] ✕ 单卡静默 + 换卡恢复 已验证" -ForegroundColor DarkCyan
+    # 撤到空白带让宽限收起,再重新悬停首卡取新预览引用(旧 $peek 已随 ✕ 销毁)。
+    Move-Cursor 8 8
+    Start-Sleep -Milliseconds 500
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    if (Find-UiaByAutomationId -Root $root -Id "peek-card") { throw "E23 FAIL: 移开空白带后预览卡未收起" }
+    Move-Cursor $c0x $c0y
+    Start-Sleep -Milliseconds 60
+    Move-Cursor ($c0x + 2) $c0y
+    Start-Sleep -Milliseconds 1400
+    Move-Cursor ($c0x + 3) ($c0y + 1)
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    $peek = Find-UiaByAutomationId -Root $root -Id "peek-card"
+    if (-not $peek) { throw "E23 FAIL: ✕ 后离开原卡再悬停未恢复弹出" }
+
     # ③ UIA Invoke 预览卡内「播放」-> 进入播放页(画质选择器出现,预览收起)。
     $playBtn = Find-UiaByName -Root $peek -Name "播放"
     if (-not $playBtn) { throw "E23 FAIL: 预览卡内未找到「播放」按钮" }
@@ -2258,7 +2306,7 @@ try {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
     if (Find-UiaByAutomationId -Root $root -Id "peek-card") { throw "E23 FAIL: 进入播放页后预览卡未收起" }
     Write-Host "[E23] 预览播放 -> 播放页 已验证" -ForegroundColor DarkCyan
-    Write-Host "[E23] PASS: 悬停 1s 弹出 + UIA 播放进页 + 快速掠过不弹出无 panic" -ForegroundColor Green
+    Write-Host "[E23] PASS: 悬停 1s 弹出 + ✕ 单卡静默换卡恢复 + UIA 播放进页 + 快速掠过不弹出无 panic" -ForegroundColor Green
 } finally {
     if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
     if ($script:settingsSeeded) {
@@ -2271,5 +2319,483 @@ try {
         $text | Set-Content -Path $stderrLog -Encoding UTF8
         Write-Host "[E23] stderr -> $stderrLog" -ForegroundColor DarkCyan
     }
+}
+}
+
+# ---------- 场景 E24：PiP/主位翻转不触发 surface 重建（native 换源重载回归） ----------
+# 对应 P0-1: pages/player.rs::floating_surface_content 统一两态树形。
+# 用播控条 [右下角小窗]/[还原主窗] 按钮确定性翻转 pip_pinned(滚动阈值路径受内容高度
+# 影响不稳定),每轮断言按钮文案确实翻转,再校验 stderr 无
+# "native surface detached: resume" / "native surface remount: 换源续播" 配对。
+# 全屏/半窗的同类重载属 P1 架构项,不在本场景覆盖范围。
+if (Should-RunScenario "E24") {
+Write-Host "[E24] PiP/主位树形统一回归：UIA 按钮往返翻转，断言零 detach/remount" -ForegroundColor Cyan
+$stderrLog = Join-Path $OutRoot "e24-stderr.log"
+$proc = $null
+$stderrSink = $null
+$stderrTask = $null
+$script:E24Fail = $false
+try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.WorkingDirectory = (Split-Path $exe)
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables["QAQ_BX_VIDEO"] = "BV1GJ411x7h7"
+    $psi.EnvironmentVariables["QAQ_BX_NATIVE"] = "1"
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stderrSink = $proc.StandardError
+    $stderrTask = $stderrSink.ReadToEndAsync()
+    $hwnd = Wait-MainWindow $proc
+    Start-Sleep -Milliseconds 5500 # native DASH 拉流 + 首帧预热(同 E12/E10)
+
+    # 3 轮确定性往返:点 [右下角小窗] 进 PiP → 点 [还原主窗] 回主位。
+    # 按钮文案随 is_pip 翻转(player.rs:608-625),可据此确认本次翻转真的发生。
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    $pipBtn = Find-UiaByName -Root $root -Name "右下角小窗"
+    if (-not $pipBtn) { throw "E24 FAIL: 未找到播控条 [右下角小窗] 按钮" }
+    for ($cycle = 1; $cycle -le 3; $cycle++) {
+        [void](Invoke-UiaElement -Element $pipBtn -What "进入小窗")
+        Start-Sleep -Milliseconds 800
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+        $mainBtn = Find-UiaByName -Root $root -Name "还原主窗"
+        if (-not $mainBtn) { throw "E24 FAIL: 第 $cycle 轮点击后未进入 PiP 态(按钮文案未翻转)" }
+        if ($cycle -eq 1) { Capture-WindowFrame -Hwnd $hwnd -FileName "e24-1-pip.png" }
+        [void](Invoke-UiaElement -Element $mainBtn -What "还原主窗")
+        Start-Sleep -Milliseconds 800
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+        $pipBtn = Find-UiaByName -Root $root -Name "右下角小窗"
+        if (-not $pipBtn) { throw "E24 FAIL: 第 $cycle 轮还原后未回到主位态" }
+    }
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e24-2-main.png"
+
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "E24 FAIL: 进程提前退出 ($($proc.ExitCode))" }
+    Write-Host "[E24] 3 轮 PiP/主位翻转已执行" -ForegroundColor DarkCyan
+} finally {
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    try {
+        if ($stderrSink) { $stderrSink.Close() }
+        if ($stderrTask -and $stderrTask.Wait(5000)) {
+            $text = $stderrTask.Result
+            $text | Set-Content -Path $stderrLog -Encoding UTF8
+            Write-Host "[E24] stderr -> $stderrLog" -ForegroundColor DarkCyan
+            if ($text -notmatch "native build_source ok" -or $text -notmatch "native media opened") {
+                Write-Host "[E24] FAIL: native 播放基线锚点缺失，本次翻转未真正命中播放通路" -ForegroundColor Red
+                $script:E24Fail = $true
+            }
+            $detachCount = ([regex]::Matches($text, [regex]::Escape("native surface detached: resume"))).Count
+            $remountCount = ([regex]::Matches($text, [regex]::Escape("native surface remount: 换源续播"))).Count
+            Write-Host "[E24] detach=$detachCount remount=$remountCount" -ForegroundColor DarkCyan
+            if ($detachCount -gt 0 -or $remountCount -gt 0) {
+                Write-Host "[E24] FAIL: PiP 翻转仍触发 surface 重建/换源重载" -ForegroundColor Red
+                $script:E24Fail = $true
+            }
+        }
+    } catch {}
+}
+if ($script:E24Fail) { throw "E24 FAIL: PiP/主位翻转触发重载(详见 $stderrLog)" }
+Write-Host "[E24] PASS: 3 轮 PiP 翻转零 detach/remount，native 播放链未中断" -ForegroundColor Green
+}
+
+# ---------- 场景 E25：全屏进出不销毁 MPE（native 换源重载回归） ----------
+# P1-1:全屏不再换根树,播放页组件留在 shell-root 原 keyed 位置,HUD 只是覆盖层。
+# 判据:2 轮进/出全屏后 stderr 中 detach/remount 计数为 0。
+if (Should-RunScenario "E25") {
+Write-Host "[E25] 全屏进出零重载回归：UIA 按钮往返 2 轮，断言零 detach/remount" -ForegroundColor Cyan
+$stderrLog = Join-Path $OutRoot "e25-stderr.log"
+$proc = $null
+$stderrSink = $null
+$stderrTask = $null
+$script:E25Fail = $false
+try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.WorkingDirectory = (Split-Path $exe)
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables["QAQ_BX_VIDEO"] = "BV1GJ411x7h7"
+    $psi.EnvironmentVariables["QAQ_BX_NATIVE"] = "1"
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stderrSink = $proc.StandardError
+    $stderrTask = $stderrSink.ReadToEndAsync()
+    $hwnd = Wait-MainWindow $proc
+    Start-Sleep -Milliseconds 5500
+
+    for ($cycle = 1; $cycle -le 2; $cycle++) {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+        $fsBtn = Find-PlayerFullscreenButton -Root $root
+        if (-not $fsBtn) { throw "E25 FAIL: 第 $cycle 轮未找到全屏按钮" }
+        [void](Invoke-UiaElement -Element $fsBtn -What "进入全屏")
+        Start-Sleep -Milliseconds 1200
+        Assert-FullscreenBounds -Hwnd $hwnd -StepName "E25 第 $cycle 轮进入全屏"
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+        $exitBtn = Find-HudExitButton -Root $root
+        if (-not $exitBtn) { throw "E25 FAIL: 第 $cycle 轮 HUD 未找到退出全屏按钮" }
+        [void](Invoke-UiaElement -Element $exitBtn -What "退出全屏")
+        Start-Sleep -Milliseconds 1200
+    }
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "E25 FAIL: 进程提前退出 ($($proc.ExitCode))" }
+    Write-Host "[E25] 2 轮全屏进出已执行" -ForegroundColor DarkCyan
+} finally {
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    try {
+        if ($stderrSink) { $stderrSink.Close() }
+        if ($stderrTask -and $stderrTask.Wait(5000)) {
+            $text = $stderrTask.Result
+            $text | Set-Content -Path $stderrLog -Encoding UTF8
+            Write-Host "[E25] stderr -> $stderrLog" -ForegroundColor DarkCyan
+            if ($text -notmatch "native build_source ok" -or $text -notmatch "native media opened") {
+                Write-Host "[E25] FAIL: native 播放基线锚点缺失" -ForegroundColor Red
+                $script:E25Fail = $true
+            }
+            $detachCount = ([regex]::Matches($text, [regex]::Escape("native surface detached: resume"))).Count
+            $remountCount = ([regex]::Matches($text, [regex]::Escape("native surface remount: 换源续播"))).Count
+            Write-Host "[E25] detach=$detachCount remount=$remountCount" -ForegroundColor DarkCyan
+            if ($detachCount -gt 0 -or $remountCount -gt 0) {
+                Write-Host "[E25] FAIL: 全屏进出仍触发 surface 重建/换源重载" -ForegroundColor Red
+                $script:E25Fail = $true
+            }
+        }
+    } catch {}
+}
+if ($script:E25Fail) { throw "E25 FAIL: 全屏进出触发重载(详见 $stderrLog)" }
+Write-Host "[E25] PASS: 2 轮全屏进出零 detach/remount" -ForegroundColor Green
+}
+
+# ---------- 场景 E26：半窗 <-> 主窗 不销毁 MPE（native 换源重载回归） ----------
+# P1-2:半窗复用同一 PlayerPage + player:{bvid} key,窄宽度走移动档;展开只切布局。
+# 判据:2 轮 [展开半窗->主窗->回半窗] 后 stderr 中 detach/remount 计数为 0。
+if (Should-RunScenario "E26") {
+Write-Host "[E26] 半窗/主窗零重载回归：UIA 展开半窗一次，断言零 detach/remount" -ForegroundColor Cyan
+$script:E26Cycles = 1
+$stderrLog = Join-Path $OutRoot "e26-stderr.log"
+$settingsPath = Join-Path $dataDir "settings.json"
+$settingsBak = "$settingsPath.e26-bak"
+$script:e26Seeded = $false
+$proc = $null
+$stderrSink = $null
+$stderrTask = $null
+$script:E26Fail = $false
+try {
+    if (Test-Path $settingsPath) { Copy-Item -Path $settingsPath -Destination $settingsBak -Force }
+    [System.IO.File]::WriteAllText(
+        $settingsPath,
+        '{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"HalfPane","danmaku_enabled":true,"autoplay":true,"hardware_decode":true,"volume":60,"webp_hint_shown":true,"player_engine":"Native","window":{"x":60,"y":60,"width":1296,"height":808,"maximized":false}}'
+    )
+    $script:e26Seeded = $true
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.WorkingDirectory = (Split-Path $exe)
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables.Remove("QAQ_BX_VIDEO")
+    $psi.EnvironmentVariables["QAQ_BX_NATIVE"] = "1"
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stderrSink = $proc.StandardError
+    $stderrTask = $stderrSink.ReadToEndAsync()
+    $hwnd = Wait-MainWindow $proc
+    for ($i = 0; $i -lt 5; $i++) {
+        if ([UiEdgeNative]::GetForegroundWindow() -eq $hwnd) { break }
+        [UiEdgeNative]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+        [UiEdgeNative]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+        [void][UiEdgeNative]::SetForegroundWindow($hwnd)
+        Start-Sleep -Milliseconds 200
+    }
+    Start-Sleep -Milliseconds 3500
+
+    # 打开首页卡片进入半窗
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    $condBtn = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Button)
+    $buttons = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condBtn)
+    $cardBtn = $null
+    for ($i = 0; $i -lt $buttons.Count; $i++) {
+        $br = $buttons[$i].Current.BoundingRectangle
+        if (-not ([double]::IsInfinity($br.X) -or [double]::IsNaN($br.X)) -and
+            $br.Top -ge 180 -and $br.Width -ge 120 -and $br.Height -ge 100) {
+            $cardBtn = $buttons[$i]; break
+        }
+    }
+    if (-not $cardBtn) { throw "E26 FAIL: 首页未找到可点击视频卡" }
+    [void](Invoke-UiaElement -Element $cardBtn -What "打开半窗")
+    Start-Sleep -Milliseconds 6500
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e26-0-halfpane.png"
+
+    for ($cycle = 1; $cycle -le $script:E26Cycles; $cycle++) {
+        # 展开半窗 -> 主窗播放页
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+        $expand = Find-UiaByAutomationId -Root $root -Id "half-pane-expand"
+        if (-not $expand) {
+            Capture-WindowFrame -Hwnd $hwnd -FileName "e26-fail-cycle-$cycle.png"
+            throw "E26 FAIL: 第 $cycle 轮未找到 [half-pane-expand] 按钮(见 e26-fail-cycle-$cycle.png)"
+        }
+        [void](Invoke-UiaElement -Element $expand -What "展开半窗")
+        Start-Sleep -Milliseconds 2000
+        Capture-WindowFrame -Hwnd $hwnd -FileName "e26-1-expanded-cycle-$cycle.png"
+    }
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "E26 FAIL: 进程提前退出 ($($proc.ExitCode))" }
+    Write-Host "[E26] 半窗→主窗展开已执行" -ForegroundColor DarkCyan
+} finally {
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    if ($script:e26Seeded) {
+        if (Test-Path $settingsBak) { Copy-Item -Path $settingsBak -Destination $settingsPath -Force }
+        else { Remove-Item -Path $settingsPath -Force -ErrorAction SilentlyContinue }
+        Remove-Item -Path $settingsBak -Force -ErrorAction SilentlyContinue
+    }
+    try {
+        if ($stderrSink) { $stderrSink.Close() }
+        if ($stderrTask -and $stderrTask.Wait(5000)) {
+            $text = $stderrTask.Result
+            $text | Set-Content -Path $stderrLog -Encoding UTF8
+            Write-Host "[E26] stderr -> $stderrLog" -ForegroundColor DarkCyan
+            $detachCount = ([regex]::Matches($text, [regex]::Escape("native surface detached: resume"))).Count
+            $remountCount = ([regex]::Matches($text, [regex]::Escape("native surface remount: 换源续播"))).Count
+            Write-Host "[E26] detach=$detachCount remount=$remountCount" -ForegroundColor DarkCyan
+            if ($detachCount -gt 0 -or $remountCount -gt 0) {
+                Write-Host "[E26] FAIL: 半窗/主窗切换仍触发 surface 重建/换源重载" -ForegroundColor Red
+                $script:E26Fail = $true
+            }
+        }
+    } catch {}
+}
+if ($script:E26Fail) { throw "E26 FAIL: 半窗/主窗切换触发重载(详见 $stderrLog)" }
+Write-Host "[E26] PASS: 半窗→主窗切换零 detach/remount" -ForegroundColor Green
+}
+
+# ---------- 场景 E27：列表页滚动自动续页 + 设置页一键清空缓存（真实滚轮 + UIA 点击） ----------
+# 判据:① 热门页真实滚轮滚到底,「N 个视频」计数越过首屏 20;② 设置页 [settings-clear-caches]
+# Invoke 后磁盘缓存目录 .bin 归零 + 「缓存已清理」InfoBar 出现;③ 白名单:settings.json 与
+# 缓存目录内非 .bin 哨兵文件绝不被动。
+if (Should-RunScenario "E27") {
+Write-Host "[E27] 热门页滚轮自动续页 + 设置页一键清空缓存(白名单纪律)" -ForegroundColor Cyan
+$proc = $null
+try {
+    $proc = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -PassThru
+    $hwnd = Wait-MainWindow $proc
+    Start-Sleep -Milliseconds 3500
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    if (-not (Select-UiaNav -Root $root -Name "热门")) { throw "E27 FAIL: 导航栏未找到「热门」项" }
+
+    # 页头副标题「N 个视频」计数解析(热门页专属文本)。
+    function Get-PopularCount {
+        param([System.Windows.Automation.AutomationElement]$Root)
+        $condText = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Text)
+        $texts = $Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condText)
+        for ($i = 0; $i -lt $texts.Count; $i++) {
+            if ($texts[$i].Current.Name -match "^(\d+) 个视频$") { return [int]$Matches[1] }
+        }
+        return -1
+    }
+
+    $base = -1
+    for ($i = 0; $i -lt 40; $i++) {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+        $base = Get-PopularCount -Root $root
+        if ($base -gt 0) { break }
+        Start-Sleep -Milliseconds 500
+    }
+    if ($base -le 0) { throw "E27 FAIL: 热门页首屏计数未就绪" }
+    Write-Host "[E27] 热门首屏 $base 个视频" -ForegroundColor DarkCyan
+
+    # 真实滚轮滚向底部:每轮大幅下滚,自动续页应把计数推过首屏。
+    $wr = New-Object UiEdgeNative+RECT
+    [void][UiEdgeNative]::GetWindowRect($hwnd, [ref]$wr)
+    $cx = [int](($wr.Left + $wr.Right) / 2)
+    $cy = [int](($wr.Top + $wr.Bottom) / 2)
+    Move-Cursor $cx $cy
+    $grown = $false
+    for ($round = 1; $round -le 12; $round++) {
+        Scroll-Fast -TotalDelta -3600
+        Start-Sleep -Milliseconds 900
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+        $now = Get-PopularCount -Root $root
+        Write-Host "[E27] 滚动第 $round 轮: $now 个视频" -ForegroundColor DarkCyan
+        if ($now -gt $base) { $grown = $true; break }
+    }
+    if (-not $grown) { throw "E27 FAIL: 滚到底后热门计数未自动增长(自动续页失效)" }
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e27-0-popular-autopaged.png"
+    # 等在飞封面下载落定,避免清缓存与写入赛跑。
+    Start-Sleep -Seconds 4
+
+    # 磁盘缓存目录应有真实 .bin(封面磁盘缓存落盘);放哨兵文件验证白名单。
+    $imgCacheDir = Join-Path $dataDir "cache\images"
+    if (-not (Test-Path $imgCacheDir)) { throw "E27 FAIL: 磁盘封面缓存目录未创建" }
+    $binsBefore = @(Get-ChildItem -Path $imgCacheDir -Filter "*.bin" -File -ErrorAction SilentlyContinue)
+    if ($binsBefore.Count -le 0) { throw "E27 FAIL: 浏览后磁盘缓存无 .bin 条目(磁盘缓存未生效)" }
+    Write-Host "[E27] 磁盘缓存 $($binsBefore.Count) 条 .bin" -ForegroundColor DarkCyan
+    $sentinel = Join-Path $imgCacheDir "e27-sentinel.txt"
+    [System.IO.File]::WriteAllText($sentinel, "keep")
+    $settingsPath = Join-Path $dataDir "settings.json"
+    $settingsExisted = Test-Path $settingsPath
+    $settingsHash = if ($settingsExisted) { (Get-FileHash $settingsPath -Algorithm SHA256).Hash } else { $null }
+
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    if (-not (Select-UiaNav -Root $root -Name "设置")) { throw "E27 FAIL: 导航栏未找到「设置」项" }
+    Start-Sleep -Milliseconds 800
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    $clearBtn = Find-UiaByAutomationId -Root $root -Id "settings-clear-caches"
+    if (-not $clearBtn) { throw "E27 FAIL: 设置页未找到 [settings-clear-caches] 按钮" }
+    # 在飞下载可能回填个别条目:最多点 3 轮直到 .bin 归零(幂等)。
+    $cleared = $false
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        [void](Invoke-UiaElement -Element $clearBtn -What "清空缓存")
+        Start-Sleep -Milliseconds 1200
+        $binsAfter = @(Get-ChildItem -Path $imgCacheDir -Filter "*.bin" -File -ErrorAction SilentlyContinue)
+        if ($binsAfter.Count -eq 0) { $cleared = $true; break }
+    }
+    if (-not $cleared) { throw "E27 FAIL: 一键清空后磁盘缓存仍有 .bin 条目" }
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    if (-not (Find-UiaByName -Root $root -Name "缓存已清理")) { throw "E27 FAIL: 清空后未出现「缓存已清理」结果提示" }
+    if (-not (Test-Path $sentinel)) { throw "E27 FAIL: 白名单违规——缓存目录内非 .bin 文件被误删" }
+    if ($settingsExisted) {
+        if (-not (Test-Path $settingsPath)) { throw "E27 FAIL: 白名单违规——settings.json 被误删" }
+        if ((Get-FileHash $settingsPath -Algorithm SHA256).Hash -ne $settingsHash) {
+            throw "E27 FAIL: 白名单违规——settings.json 内容被改动"
+        }
+    }
+    Remove-Item -Path $sentinel -Force -ErrorAction SilentlyContinue
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e27-1-caches-cleared.png"
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "E27 FAIL: 进程提前退出 ($($proc.ExitCode))" }
+    Write-Host "[E27] PASS: 滚轮自动续页 + 一键清空缓存 + 白名单(设置/哨兵)完好" -ForegroundColor Green
+} finally {
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    Remove-Item -Path (Join-Path $dataDir "cache\images\e27-sentinel.txt") -Force -ErrorAction SilentlyContinue
+}
+}
+
+# ---------- 场景 E28：首页横屏卡信息行顶边不变量（#10，标题长短不漂移） ----------
+# 判据：首屏同一行内每张卡的标题块顶边、UP 主行顶边、▶/弹幕统计行顶边逐卡
+# 完全一致（≤1 物理像素）；标题 1 行/2 行、UP 名长短都不得影响这些顶边。
+if (Should-RunScenario "E28") {
+Write-Host "[E28] 首页卡不变量：同一行卡片标题/UP/▶/弹幕顶边逐卡一致（与标题长度无关）" -ForegroundColor Cyan
+# 隔离访客态数据目录，不碰用户真实凭据；预置默认设置压制首启 WebP 提示模态窗。
+$e28Data = Join-Path $OutRoot "e28-data"
+$script:e28DirReady = $false
+$proc = $null
+try {
+    if (Test-Path $e28Data) { Remove-Item -Recurse -Force $e28Data }
+    New-Item -ItemType Directory -Force -Path $e28Data | Out-Null
+    $script:e28DirReady = $true
+    # 字段与应用首启落盘格式一致：webp_hint_shown=true 压制首启「图片格式提示」
+    # 模态窗(490x195，会把 Wait-MainWindow 拖到超时)；window=null 走默认尺寸，
+    # 随后由 SetWindowPos 钉死位置尺寸。
+    [System.IO.File]::WriteAllText(
+        (Join-Path $e28Data "settings.json"),
+        '{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"FullPlayer","half_pane_width":480.0,"danmaku_enabled":true,"autoplay":false,"hardware_decode":true,"volume":80,"player_engine":"Native","webp_hint_shown":true,"portrait_mode":false,"prefer_official_cdn":true,"multi_thread_preload":true,"hover_preview":false,"reduce_animations":false,"window":null}'
+    )
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.WorkingDirectory = (Split-Path $exe)
+    $psi.UseShellExecute = $false
+    $psi.EnvironmentVariables["QAQ_BX_DATA_DIR"] = $e28Data
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $hwnd = Wait-MainWindow $proc
+    [void][UiEdgeNative]::SetWindowPos($hwnd, [IntPtr]::Zero, 60, 60, 1296, 808, [UiEdgeNative]::SWP_NOZORDER)
+
+    # 等推荐流到货：命中盒=宽>150 高>120 的 Button（与 E23 同判据）。
+    $cards = @()
+    $btnCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Button)
+    $txtCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Text)
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 1000
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+        $cards = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond) |
+            Where-Object { $_.Current.BoundingRectangle.Width -gt 150 -and $_.Current.BoundingRectangle.Height -gt 120 })
+        if ($cards.Count -ge 8) { break }
+    }
+    if ($cards.Count -lt 8) { throw "E28 FAIL: 首页可测视频卡不足 8 张($($cards.Count))" }
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e28-0-home.png"
+
+    # 按行带分组（同一行卡 Top 相同），只取整卡完整落在客户区内的行，避免
+    # 视口裁切把卡内文本的 UIA 矩形剪空造成误报。
+    $wr = New-Object UiEdgeNative+RECT
+    [void][UiEdgeNative]::GetWindowRect($hwnd, [ref]$wr)
+    $visCards = @($cards | Where-Object {
+        $b = $_.Current.BoundingRectangle
+        $b.Top -ge $wr.Top -and $b.Bottom -le $wr.Bottom -and $b.Left -ge $wr.Left -and $b.Right -le $wr.Right
+    })
+    if ($visCards.Count -lt 3) { throw "E28 FAIL: 完整可见卡不足 3 张($($visCards.Count))" }
+    $bands = $visCards | Group-Object { [Math]::Round($_.Current.BoundingRectangle.Top) } |
+        Sort-Object { [double]$_.Name }
+
+    $parseCard = {
+        param($Card, $Cr, $Texts)
+        $play = $null; $danmu = $null; $rest = @()
+        foreach ($t in $Texts) {
+            $name = $t.Current.Name
+            $r = $t.Current.BoundingRectangle
+            # UIA 空矩形(未渲染/视口裁切/离屏克隆)是 Empty/±∞：必须先滤掉再取 Top。
+            if ([double]::IsNaN($r.Top) -or [double]::IsInfinity($r.Top) -or
+                [double]::IsInfinity($r.Left) -or $r.Width -le 0 -or $r.Height -le 0) { continue }
+            if ($t.Current.IsOffscreen) { continue }
+            # 只认卡盒纵向带内的文本(卡顶下方 2px 起)，排除 peer 泄漏。
+            if ($r.Top -lt $Cr.Top + 2 -or $r.Top -gt $Cr.Bottom) { continue }
+            $top = [Math]::Round($r.Top, 1)
+            if ($name -match '^▶ ') { $play = $top }
+            elseif ($name -match '^弹幕 ') { $danmu = $top }
+            elseif ($name -match '^\d{1,2}(:\d{2}){1,2}$') { }        # 时长徽标(封面盖层)
+            elseif ($name -in @('封面加载中', '无法播放', '充电专稿')) { } # 占位/角标
+            else { $rest += [pscustomobject]@{ Top = $top; Name = $name } }
+        }
+        if ($null -eq $play -or $null -eq $danmu -or $rest.Count -lt 2) { return $null }
+        $rest = @($rest | Sort-Object Top)
+        # rest[0]=标题块（定高槽，顶边=槽顶），rest[-1]=UP 主行。
+        [pscustomobject]@{ Title = $rest[0].Top; Author = $rest[-1].Top; Play = $play; Danmu = $danmu }
+    }
+
+    # 自上而下扫描行带：被视口底缘裁切的行整行解析为空(属采样问题而非布局缺陷)，
+    # 取第一个含 ≥3 张完整卡的行做严格同位断言。
+    $report = @()
+    $bandTouched = 0
+    foreach ($band in $bands) {
+        $bandTouched++
+        $candidate = @()
+        foreach ($card in @($band.Group)) {
+            $cr = $card.Current.BoundingRectangle
+            $texts = @($card.FindAll([System.Windows.Automation.TreeScope]::Descendants, $txtCond))
+            $parsed = & $parseCard $card $cr $texts
+            if ($parsed) { $candidate += $parsed }
+        }
+        Write-Host ("[E28] band top={0}: {1}/{2} 卡要素完整" -f $band.Name, $candidate.Count, $band.Count) -ForegroundColor DarkCyan
+        if ($candidate.Count -ge 3) { $report = $candidate; break }
+    }
+    if ($report.Count -lt 3) {
+        throw "E28 FAIL: 扫描 $($bandTouched) 个行带仍无 ≥3 张要素完整卡(视口/流未就绪?)"
+    }
+    Write-Host "[E28] 采样行带 top=$($bands[$bandTouched-1].Name)：完整卡 $($report.Count) 张" -ForegroundColor DarkCyan
+
+    foreach ($key in @('Title', 'Author', 'Play', 'Danmu')) {
+        $tops = @($report | ForEach-Object { $_.$key })
+        $spread = ($tops | Measure-Object -Maximum).Maximum - ($tops | Measure-Object -Minimum).Minimum
+        Write-Host ("[E28] {0} tops={1} spread={2}" -f $key, ($tops -join ','), $spread) -ForegroundColor DarkCyan
+        if ($spread -gt 1.0) {
+            throw "E28 FAIL: $key 行顶边跨卡漂移 $spread px（定高槽不变量被破坏，标题长短在影响下方行位）"
+        }
+    }
+    # 行序 sanity：标题槽顶 < UP 顶 < 统计顶，且统计行两要素同行。
+    foreach ($r in $report) {
+        if (-not ($r.Title -lt $r.Author -and $r.Author -lt $r.Play)) {
+            throw "E28 FAIL: 行序异常 title=$($r.Title) author=$($r.Author) play=$($r.Play)"
+        }
+        if ([Math]::Abs($r.Play - $r.Danmu) -gt 1.0) { throw "E28 FAIL: ▶/弹幕 不同行" }
+    }
+    Write-Host "[E28] PASS: $($report.Count) 卡标题/UP/▶/弹幕顶边逐卡一致（±1px）" -ForegroundColor Green
+} finally {
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 400
+    if ($script:e28DirReady) { Remove-Item -Recurse -Force $e28Data -ErrorAction SilentlyContinue }
 }
 }

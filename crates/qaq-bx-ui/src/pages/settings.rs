@@ -10,12 +10,40 @@ use windows_reactor::*;
 use crate::layout::ViewportLayout;
 use crate::theme;
 
+/// 存储卡展示态（shell 单源：磁盘缓存占用 + 上次清空结果提示）。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StorageCardState {
+    /// 磁盘图片缓存当前占用字节。
+    pub cache_bytes: u64,
+    /// 一键清空后的结果提示（「已清空…释放 …」）。
+    pub notice: Option<String>,
+}
+
+/// 字节数人类可读格式化（B/KB/MB/GB,一位小数;shell 提示与本卡共用）。
+pub fn fmt_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 pub fn settings_page(
     settings: &AppSettings,
     is_vip: bool,
     layout: ViewportLayout,
     save_status: Option<&str>,
     on_change: &Callback<AppSettings>,
+    storage: &StorageCardState,
+    on_clear_caches: &Callback<()>,
 ) -> View {
     let quality_labels: Vec<&'static str> = QualityPref::ALL.iter().map(|q| q.label()).collect();
     let codec_labels: Vec<&'static str> = CodecPref::ALL.iter().map(|c| c.label()).collect();
@@ -529,10 +557,49 @@ pub fn settings_page(
                 .text_wrapping(TextWrapping::Wrap),
         )),
     );
+
+    // 存储卡:磁盘缓存占用 + 一键清空(白名单:图片缓存与风控票据;凭据/设置不动)。
+    let clear_cb = on_clear_caches.clone();
+    let mut storage_items: Vec<View> = vec![
+        theme::text("存储").font_size(16.0).font_weight(FontWeight::SEMI_BOLD).into(),
+        TextBlock::new()
+            .text(format!(
+                "封面/头像磁盘缓存 {} · 上限 200 MB。清空后已加载图片仍显示,重新下载仅发生在下次浏览。",
+                fmt_bytes(storage.cache_bytes)
+            ))
+            .font_size(12.0)
+            .opacity(0.6)
+            .text_wrapping(TextWrapping::Wrap)
+            .into(),
+        Button::new()
+            .content("清空缓存")
+            .automation_id("settings-clear-caches")
+            .on_click(move || clear_cb.call(()))
+            .into(),
+        TextBlock::new()
+            .text("清理范围:封面/头像磁盘缓存与风控票据(自动重签)。登录凭据与设置不会被清除。")
+            .font_size(11.5)
+            .opacity(0.5)
+            .text_wrapping(TextWrapping::Wrap)
+            .into(),
+    ];
+    if let Some(notice) = &storage.notice {
+        storage_items.push(
+            InfoBar::new()
+                .title("缓存已清理")
+                .message(notice.clone())
+                .severity(InfoBarSeverity::Success)
+                .is_open(true)
+                .is_closable(false)
+                .into(),
+        );
+    }
+    let storage_card = card(StackPanel::new().spacing(12.0).children(storage_items));
+
     let cards_body: View = if layout.is_single_column() {
         StackPanel::new()
             .spacing(16.0)
-            .children((playback_card, danmaku_card, window_card))
+            .children((playback_card, danmaku_card, window_card, storage_card))
             .into()
     } else {
         Grid::new()
@@ -544,6 +611,7 @@ pub fn settings_page(
                 playback_card,
                 danmaku_card.grid_column(1),
                 window_card.grid_row(1),
+                storage_card.grid_row(1).grid_column(1),
             ))
             .into()
     };
@@ -560,4 +628,52 @@ pub fn settings_page(
                 ))),
         )
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(storage: &StorageCardState) -> String {
+        let settings = AppSettings::default();
+        let on_change = Callback::new(|_: AppSettings| {});
+        let on_clear = Callback::new(|_: ()| {});
+        let view = settings_page(
+            &settings,
+            false,
+            ViewportLayout::default(),
+            None,
+            &on_change,
+            storage,
+            &on_clear,
+        );
+        format!("{view:?}")
+    }
+
+    #[test]
+    fn fmt_bytes_scales() {
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(2048), "2.0 KB");
+        assert_eq!(fmt_bytes(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(fmt_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn storage_card_renders_clear_button_and_usage() {
+        let debug = render(&StorageCardState { cache_bytes: 5 * 1024 * 1024, notice: None });
+        assert!(debug.contains("清空缓存"), "存储卡必须提供清空按钮");
+        assert!(debug.contains("settings-clear-caches"), "E2E 需 automation id 定位");
+        assert!(debug.contains("5.0 MB"), "须展示当前占用");
+        assert!(debug.contains("登录凭据与设置不会被清除"), "白名单口径须对用户明示");
+    }
+
+    #[test]
+    fn storage_card_shows_clear_result_notice() {
+        let debug = render(&StorageCardState {
+            cache_bytes: 0,
+            notice: Some("已清空缓存,释放 5.0 MB".into()),
+        });
+        assert!(debug.contains("已清空缓存,释放 5.0 MB"));
+        assert!(debug.contains("0 B"));
+    }
 }

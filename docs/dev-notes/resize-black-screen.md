@@ -35,9 +35,25 @@
    变化(切视频必翻转 → 「短暂亮屏又黑」)。现两种状态共用同一 Grid 结构,仅切
    覆盖层 opacity 与 `ProgressRing::is_active`。
 
-已知残留(非黑屏,低优先):pip/非 pip 分支结构不同仍会触发组件重建(实测仍有
-CREATE/DROP),但清黑已移除 + metrics 事件即时重挂,视觉无空窗;后续可在
-`floating_surface` 宿主上做结构统一彻底消除重建。
+原已知残留(pip/非 pip 分支结构不同仍触发组件重建)已消除:
+`pages/player.rs::floating_surface_content` 让两态共用同一宿主树形
+(`Grid{ index0 = Border(surface), index1 = 控制条 }`),`is_pip` 只改尺寸/透明度/
+边距等属性,不增删层级。证据:单测
+`floating_surface_keeps_identical_kind_tree_across_pip_toggle` 钉住两态 kind 序列
+逐项一致;自动化点击 `.\scripts\ui-edge.ps1 -SkipBuild -Scenario E24` 做 3 轮
+UIA 翻转后 stderr 中 `native surface detached: resume` / `native surface remount:
+换源续播` 均为 0(`target/ui-demo/e24-stderr.log`)。
+全屏同类重载亦已消除:全屏不再 early-return 换根树,播放页组件留在 `shell-root`
+原来的 keyed 位置,MPE 不销毁;HUD 由 `FullscreenPlayer` 的 `hud_only` 模式作为
+覆盖层叠加,渲染面仍由同一个 `PlayerPage` 持有。证据:`scripts/ui-edge.ps1
+-Scenario E25` 做 2 轮进出全屏,stderr 中 detach/remount 均为 0;
+`-Scenario E10` native/mpv 双引擎全链 PASS。
+半窗同类重载亦已消除:半窗不再用自持渲染面的 `HalfPanePreview`,而是与主窗/
+全屏共用同一 `PlayerPage` + 同一 keyed `player:{bvid}`(`pane_mode` 只改属性:
+右栏折 0、左侧 chrome 覆盖层、抽屉宽度/右对齐),三态是同一组件的 input 变化。
+证据:`scripts\ui-edge.ps1 -Scenario E26` 半窗展开到主窗 stderr 零 detach/remount
+(修复前为 2/2);`-Scenario E20` 半窗 native 出画验收 PASS;selftest
+`half-pane` 场景(含半窗态进/出全屏、关播)PASS。
 
 ## 4. 验证
 

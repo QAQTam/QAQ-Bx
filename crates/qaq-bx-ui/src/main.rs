@@ -11,9 +11,11 @@ mod demo;
 mod feed_pager;
 mod gamepad;
 mod image_cache;
+mod image_disk_cache;
 mod layout;
 mod notifications;
 mod pages;
+mod paging;
 #[cfg(feature = "probe")]
 mod probe;
 mod router;

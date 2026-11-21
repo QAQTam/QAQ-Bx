@@ -10,7 +10,7 @@ use std::time::Duration;
 use windows_reactor::*;
 
 use crate::data::VideoItem;
-use crate::layout::CardMetrics;
+use crate::layout::{CardMetrics, CardTextLayout, CARD_TITLE_MAX_LINES};
 use crate::theme;
 use crate::widgets::peek::{CardRect, HoverReport};
 
@@ -714,49 +714,73 @@ fn populated_card_view(
         .height(metrics.cover_height)
         .children(cover_layers);
 
+    // #10 文本列严格不变量：标题/UP/统计三行全部取 layout 纯值层定高槽 +
+    // 显式 line_height，标题 1 行/2 行/超长都不改变下方信息行的顶边。
+    let text_layout = CardTextLayout { compact };
+
     let text_area = if compact {
         StackPanel::new()
-            .margin(Thickness::new(8.0, 6.0, 8.0, 8.0))
-            .spacing(4.0)
+            .margin(Thickness::new(
+                8.0,
+                text_layout.top_margin(),
+                8.0,
+                text_layout.bottom_margin(),
+            ))
+            .spacing(text_layout.spacing())
             .children((
                 theme::text(item.title.clone())
-                    .font_size(12.5)
+                    .font_size(text_layout.title_font())
                     .font_weight(FontWeight::SEMI_BOLD)
                     .text_wrapping(TextWrapping::Wrap)
                     .text_trimming(TextTrimming::CharacterEllipsis)
-                    .max_lines(2),
+                    .line_height(text_layout.title_line_height())
+                    .max_lines(CARD_TITLE_MAX_LINES as i32)
+                    .height(text_layout.title_slot()),
                 theme::text(item.author.clone())
-                    .font_size(11.0)
+                    .font_size(text_layout.author_font())
                     .opacity(0.6)
                     .text_trimming(TextTrimming::CharacterEllipsis)
-                    .max_lines(1),
+                    .line_height(text_layout.author_slot())
+                    .max_lines(1)
+                    .height(text_layout.author_slot()),
             ))
     } else {
+        let stats_line = |label: String| {
+            theme::text(label)
+                .font_size(text_layout.stats_font())
+                .opacity(0.6)
+        };
         StackPanel::new()
-            .margin(Thickness::new(12.0, 10.0, 12.0, 12.0))
-            .spacing(4.0)
+            .margin(Thickness::new(
+                12.0,
+                text_layout.top_margin(),
+                12.0,
+                text_layout.bottom_margin(),
+            ))
+            .spacing(text_layout.spacing())
             .children((
                 theme::text(item.title.clone())
-                    .font_size(14.0)
+                    .font_size(text_layout.title_font())
                     .font_weight(FontWeight::SEMI_BOLD)
                     .text_wrapping(TextWrapping::Wrap)
                     .text_trimming(TextTrimming::CharacterEllipsis)
-                    .max_lines(2),
+                    .line_height(text_layout.title_line_height())
+                    .max_lines(CARD_TITLE_MAX_LINES as i32)
+                    .height(text_layout.title_slot()),
                 theme::text(item.author.clone())
-                    .font_size(12.0)
+                    .font_size(text_layout.author_font())
                     .opacity(0.6)
                     .text_trimming(TextTrimming::CharacterEllipsis)
-                    .max_lines(1),
+                    .line_height(text_layout.author_slot())
+                    .max_lines(1)
+                    .height(text_layout.author_slot()),
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .spacing(10.0)
+                    .height(text_layout.stats_slot())
                     .children((
-                        theme::text(format!("▶ {}", theme::fmt_count(item.play_count)))
-                            .font_size(11.0)
-                            .opacity(0.6),
-                        theme::text(format!("弹幕 {}", theme::fmt_count(item.danmaku_count)))
-                            .font_size(11.0)
-                            .opacity(0.6),
+                        stats_line(format!("▶ {}", theme::fmt_count(item.play_count))),
+                        stats_line(format!("弹幕 {}", theme::fmt_count(item.danmaku_count))),
                     )),
             ))
     };

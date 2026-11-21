@@ -269,11 +269,22 @@ fn search(s: &mut Scenario) -> Result<(), String> {
 /// 场景 8:热门页真实数据（导航进入 → popular 分页落定 → 首卡经 popular_index 打开）。
 fn popular(s: &mut Scenario) -> Result<(), String> {
     s.sync()?;
+    // 首页仍在飞/未成功时,自动续页门控必须拦下(不得重复请求第 1 页)。
+    s.send(Message::ListAutoMore(crate::paging::AutoPage::Popular))?;
+    s.sync()?;
     s.send(Message::NavTagSelected(Some("popular".into())))?;
     s.wait_for(Duration::from_secs(30), |p| {
         p.route_tag == "popular" && p.popular_items > 0
     })
     .map_err(|err| format!("热门数据未就绪:{err}"))?;
+    // 滚动自动续页等价消息:落定后投递 → 真实第 2 页到货,条数增长。
+    let base = s.probe.borrow().popular_items;
+    s.send(Message::ListAutoMore(crate::paging::AutoPage::Popular))?;
+    s.wait_for(Duration::from_secs(30), |p| p.popular_items > base)
+        .map_err(|err| format!("热门自动续页未增长:{err}"))?;
+    // 在飞期间重复投递不得叠加请求(loading 门控);落定后条数仍单调。
+    s.send(Message::ListAutoMore(crate::paging::AutoPage::Popular))?;
+    s.sync()?;
     let first = s
         .probe
         .borrow()
@@ -697,6 +708,50 @@ fn live(s: &mut Scenario) -> Result<(), String> {
     Ok(())
 }
 
+/// 场景 18:设置页存储卡一键清空缓存(白名单纪律)。
+/// 真实封面下载落盘 → ClearCaches → 磁盘占用归零 + 结果提示;
+/// 内存 LRU 同步清空;登录凭据/设置文件绝不触碰(单元层另有锚定)。
+fn storage(s: &mut Scenario) -> Result<(), String> {
+    // 首页封面经 fetch_image_async 双层写入,等磁盘缓存真实出现字节。
+    s.wait_for(Duration::from_secs(30), |p| p.disk_cache_bytes > 0)
+        .map_err(|err| format!("磁盘封面缓存未落盘:{err}"))?;
+    // 等在飞下载落定(占用连续两次采样不变),避免清空与回填赛跑导致断言抖动。
+    let mut last = s.probe.borrow().disk_cache_bytes;
+    let settle_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        std::thread::sleep(Duration::from_millis(400));
+        s.sync()?;
+        let now = s.probe.borrow().disk_cache_bytes;
+        if now == last {
+            break;
+        }
+        last = now;
+        if Instant::now() >= settle_deadline {
+            return Err("磁盘缓存占用 30s 未落定(下载持续在飞?)".into());
+        }
+    }
+    s.send(Message::NavTagSelected(Some("settings".into())))?;
+    s.sync()?;
+    assert_eq!(s.probe.borrow().route_tag, "settings");
+    assert!(s.probe.borrow().cache_notice.is_none(), "清空前不得有结果提示");
+    let before = s.probe.borrow().disk_cache_bytes;
+    s.send(Message::ClearCaches)?;
+    // 清空回执 + 占用严格下降。注意:清空后首页行会继续合法地重新下载
+    // 被驱逐封面(缓存清空≠停止缓存),不能断言占用恒为 0。
+    s.wait_for(Duration::from_secs(15), |p| {
+        p.cache_notice.is_some() && p.disk_cache_bytes < before
+    })
+    .map_err(|err| format!("一键清空缓存未落定:{err}"))?;
+    // 幂等:再清一次仍正常回执,不 panic(占用可能已被合法回填,不作 0 断言)。
+    s.send(Message::ClearCaches)?;
+    std::thread::sleep(Duration::from_millis(800));
+    s.sync()?;
+    assert!(s.probe.borrow().cache_notice.is_some(), "二次清空须仍有回执");
+    s.send(Message::NavTagSelected(Some("home".into())))?;
+    s.sync()?;
+    Ok(())
+}
+
 /// 场景 13:付费稿件过滤(充电/付费未解锁的试看降级)。
 /// 派发 MediaPreResolved 试看降级错误 → unplayable 登记;同 bvid 去重;
 /// 非试看错误(-404 等)不得登记。纯状态断言,不发网络请求。
@@ -865,7 +920,8 @@ fn loading_state(s: &mut Scenario) -> Result<(), String> {
 }
 
 /// 场景 16 #7:悬停预览卡状态机集成 —— 进入 1s 弹出、点「播放」进播放页、
-/// 宽限内移入 PeekCard 不收起、快速掠过 10 张卡全程不弹出(全部走真实定时器)。
+/// 宽限内移入 PeekCard 不收起、✕ 只静默当前卡(离开/换卡恢复)、
+/// 快速掠过 10 张卡全程不弹出(全部走真实定时器)。
 fn peek(s: &mut Scenario) -> Result<(), String> {
     s.sync()?;
     assert!(!s.probe.borrow().peek_open, "初始不得有预览卡");
@@ -914,6 +970,31 @@ fn peek(s: &mut Scenario) -> Result<(), String> {
     s.sync()?;
     assert!(!s.probe.borrow().peek_open, "宽限到期必须收起");
 
+    // ②.5 ✕ 手动关闭:只静默当前卡——指针停在原卡不重弹,离开后再悬停恢复。
+    s.send(hover(&bvid, true))?;
+    s.wait_for(Duration::from_secs(4), |p| p.peek_open)
+        .map_err(|err| format!("✕ 场景悬停未弹出:{err}"))?;
+    s.send(Message::PeekClose)?;
+    s.sync()?;
+    assert!(!s.probe.borrow().peek_open, "✕ 必须立即收起");
+    // 覆盖层卸载后指针仍在原卡上(等价重新上报进入):不得再弹。
+    s.send(hover(&bvid, true))?;
+    s.sync()?;
+    std::thread::sleep(Duration::from_millis(1200));
+    s.sync()?;
+    assert!(!s.probe.borrow().peek_open, "✕ 后指针未离开原卡不得重弹");
+    // 离开原卡解除静默 → 再悬停必须恢复弹出(旧会话级静默位的回归点)。
+    s.send(hover(&bvid, false))?;
+    s.sync()?;
+    s.send(hover(&bvid, true))?;
+    s.wait_for(Duration::from_secs(4), |p| p.peek_open)
+        .map_err(|err| format!("✕ 后离开原卡再悬停未恢复弹出:{err}"))?;
+    s.send(hover(&bvid, false))?;
+    s.sync()?;
+    std::thread::sleep(Duration::from_millis(450));
+    s.sync()?;
+    assert!(!s.probe.borrow().peek_open, "✕ 场景收尾须收起");
+
     // ③ 快速掠过 10 张卡:任何一张都不满 1s,全程不得弹出。
     for i in 0..10u32 {
         let sweep = format!("BV1SWEEP{i}");
@@ -960,17 +1041,25 @@ fn user_lists(s: &mut Scenario) -> Result<(), String> {
         p.route_tag == "history" && p.user_history_count > 0
     })
     .map_err(|err| format!("历史数据未就绪:{err}"))?;
+    // 满一页(20 条)才有下一页可续;自动续页须真实增长。
+    let history_base = s.probe.borrow().user_history_count;
+    if history_base >= 20 {
+        s.send(Message::ListAutoMore(crate::paging::AutoPage::History))?;
+        s.wait_for(Duration::from_secs(30), |p| p.user_history_count > history_base)
+            .map_err(|err| format!("历史自动续页未增长:{err}"))?;
+    }
     s.send(Message::NavTagSelected(Some("watch-later".into())))?;
     s.wait_for(Duration::from_secs(30), |p| {
         p.route_tag == "watch-later" && p.user_watch_later_count > 0
     })
     .map_err(|err| format!("稍后再看数据未就绪:{err}"))?;
     s.send(Message::NavTagSelected(Some("favorites".into())))?;
+    // 夹列表与资源列表都必须落定(夹可空,门控 settled 而非条数;
+    // 旧 bug:页号守卫丢弃首页结果 → 资源永久「加载中…」)。
     s.wait_for(Duration::from_secs(30), |p| {
-        p.route_tag == "favorites" && p.user_fav_folders > 0
+        p.route_tag == "favorites" && p.user_fav_folders > 0 && p.user_fav_resources_settled
     })
-    .map_err(|err| format!("收藏夹未就绪:{err}"))?;
-    // 资源列表:夹内可能无视频,只要求落定不 panic(给一拍缓冲)。
+    .map_err(|err| format!("收藏夹/资源未就绪:{err}"))?;
     s.sync()?;
     s.send(Message::NavTagSelected(Some("home".into())))?;
     s.sync()?;
@@ -995,6 +1084,7 @@ const SCENARIOS: &[(&str, &str, fn(&mut Scenario) -> Result<(), String>)] = &[
     ("loading-state", "FullPlayer", loading_state),
     ("peek", "FullPlayer", peek),
     ("user-lists", "FullPlayer", user_lists),
+    ("storage", "FullPlayer", storage),
 ];
 
 /// 解析 `--selftest [scenario]`;非 selftest 调用返回 `None` 走正常启动。

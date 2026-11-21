@@ -36,6 +36,7 @@ pub fn live_page(
     layout: ViewportLayout,
     on_open: &Callback<(u64, String, String)>,
     on_more: &Callback<()>,
+    on_auto_more: &Callback<()>,
 ) -> View {
     let subtitle = if let Some(err) = &state.error {
         if state.loaded_once {
@@ -82,11 +83,20 @@ pub fn live_page(
         content_items.push(pill);
     }
 
-    let grid = ScrollViewer::new().grid_row(1).content(
-        Border::new()
-            .padding(Thickness::new(margin_x, 4.0, margin_x, 28.0))
-            .content(StackPanel::new().spacing(16.0).children(content_items)),
-    );
+    // 滚动接近底部 → 自动续页(shell 经 should_auto_page 门控,手动胶囊保留)。
+    let auto_cb = on_auto_more.clone();
+    let grid = ScrollViewer::new()
+        .grid_row(1)
+        .on_view_changed(move |ev: ScrollEventInfo| {
+            if crate::paging::near_bottom(&ev, crate::paging::AUTO_PAGE_LEAD_PX) {
+                auto_cb.call(());
+            }
+        })
+        .content(
+            Border::new()
+                .padding(Thickness::new(margin_x, 4.0, margin_x, 28.0))
+                .content(StackPanel::new().spacing(16.0).children(content_items)),
+        );
 
     Grid::new()
         .rows([GridLength::Auto, GridLength::Star(1.0)])
