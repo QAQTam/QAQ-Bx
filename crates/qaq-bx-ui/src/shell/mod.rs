@@ -165,136 +165,10 @@ impl ResizeStormTrack {
     }
 }
 
-/// §8.2:TitleBar 内容结构档位签名——只有会改变标题栏内容结构的档位
-/// (Mobile 砍副标题/盘钮、Medium 搜索浮窗钮、Expanded 内敛搜索框)才翻签名;
-/// 档内宽度变化不翻,补算不跟每次 resize 走。
-fn title_bar_tier_signature(layout: ViewportLayout) -> u32 {
-    u32::from(layout.is_mobile())
-        | (u32::from(layout.shows_inline_title_search()) << 1)
-        | (u32::from(layout.shows_title_search_button()) << 2)
-}
-
-/// #5:resize 时必须翻动根 view 的结构签名——tier、列数、卡态与派生档位
-/// (移动端形态/内联搜索/私信钻取)。签名不翻 = 档内纯像素变化,交给 XAML
-/// 自动布局与静默状态累计,静止 150ms 后由 settled 普通消息统一重绘。
-fn resize_render_signature(layout: ViewportLayout) -> (u8, usize, bool, bool, bool, bool) {
-    let tier = match layout.tier {
-        layout::ContentLayoutTier::Compact => 0u8,
-        layout::ContentLayoutTier::Medium => 1,
-        layout::ContentLayoutTier::Expanded => 2,
-    };
-    (
-        tier,
-        layout.cards.cols,
-        layout.cards.compact_card,
-        layout.is_mobile(),
-        layout.shows_inline_title_search(),
-        layout.uses_whisper_drilldown(),
-    )
-}
-
-/// 竖屏模式窗口约束:客户区宽度钳制在底栏边界带 [390, 860) DIP,高度不设限
-/// (presenter 级硬钳制,reactor `WindowConstraints` → `SetPreferredMaximumWidth`)。
-fn portrait_window_constraints() -> WindowConstraints {
-    WindowConstraints {
-        min_width: Some(layout::MIN_WINDOW_WIDTH),
-        min_height: Some(layout::MIN_WINDOW_HEIGHT),
-        max_width: Some(PORTRAIT_MAX_WIDTH_DIPS),
-        max_height: None,
-    }
-}
 /// 设置滑块（音量/透明度）去抖落盘窗口。
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 /// M7:直播间播放项 bvid 前缀(真实稿件不会以此开头;直播恒 mpv 的判据)。
 const LIVE_BVID_PREFIX: &str = "live:";
-
-/// 升级 https 并对 B 站图床追加 `@480w_270h_1c.{webp|jpg}` 缩略图后缀,
-/// 把单张封面流量与 WinUI 解码像素面积压缩到原图的 ~1/16–1/46。
-/// 格式由系统 WebP 解码能力探测决定(见 `codec` 模块)。
-pub fn thumbnail_url(raw: &str) -> String {
-    thumbnail_url_with(raw, crate::codec::raster_suffix())
-}
-
-fn thumbnail_url_with(raw: &str, suffix: &str) -> String {
-    let url = raw.replacen("http://", "https://", 1);
-    if url.contains(".hdslb.com/") && !url.contains('@') && !url.contains('?') {
-        let lower = url.to_ascii_lowercase();
-        if lower.ends_with(".jpg")
-            || lower.ends_with(".jpeg")
-            || lower.ends_with(".png")
-            || lower.ends_with(".webp")
-        {
-            return format!("{url}@480w_270h_1c.{suffix}");
-        }
-    }
-    url
-}
-
-/// FeedCard → 展示模型（`goto != av` 已由 `FeedSession::absorb` 过滤）。
-fn video_item(card: &FeedCard) -> VideoItem {
-    VideoItem {
-        bvid: card.bvid.clone().unwrap_or_default(),
-        aid: card.id,
-        cid: card.cid.unwrap_or(0),
-        title: card.title.clone().unwrap_or_default(),
-        author: card
-            .owner
-            .as_ref()
-            .map_or_else(String::new, |owner| owner.name.clone()),
-        author_mid: card.owner.as_ref().map_or(0, |owner| owner.mid),
-        author_face_url: card
-            .owner
-            .as_ref()
-            .and_then(|owner| owner.face.as_deref())
-            .and_then(normalize_face_url),
-        duration_secs: card
-            .duration
-            .unwrap_or_default()
-            .clamp(0, i64::from(u32::MAX)) as u32,
-        play_count: card
-            .stat
-            .as_ref()
-            .map_or(0, |stat| stat.view.unsigned_abs()),
-        danmaku_count: card
-            .stat
-            .as_ref()
-            .map_or(0, |stat| stat.danmaku.unsigned_abs()),
-        like_count: card
-            .stat
-            .as_ref()
-            .and_then(|stat| stat.like)
-            .map(|v| v.unsigned_abs()),
-        coin_count: card
-            .stat
-            .as_ref()
-            .and_then(|stat| stat.coin)
-            .map(|v| v.unsigned_abs()),
-        favorite_count: card
-            .stat
-            .as_ref()
-            .and_then(|stat| stat.favorite)
-            .map(|v| v.unsigned_abs()),
-        share_count: card
-            .stat
-            .as_ref()
-            .and_then(|stat| stat.share)
-            .map(|v| v.unsigned_abs()),
-        cover: None,
-        pic_url: card.pic.as_deref().map(thumbnail_url),
-    }
-}
-
-fn normalize_face_url(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(if let Some(rest) = trimmed.strip_prefix("//") {
-        format!("https://{rest}")
-    } else {
-        trimmed.replacen("http://", "https://", 1)
-    })
-}
 
 const SUB_REPLY_PAGE_SIZE: u32 = 10;
 
@@ -411,12 +285,6 @@ impl CommentsSessionState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ResolveProfileKey {
-    pub max_qn: i64,
-    pub codec_idx: usize,
-}
-
 #[derive(Clone)]
 struct CachedMedia {
     key: ResolveProfileKey,
@@ -424,79 +292,8 @@ struct CachedMedia {
     fetched_at: Instant,
 }
 
-/// 结合设置与当前大会员缓存推导请求清晰度上限和编码优先级（不发 IO）。
-fn resolve_params_for(settings: &AppSettings, nav: &NavClient) -> (i64, &'static [&'static str]) {
-    let is_vip = nav
-        .cached_profile()
-        .is_some_and(|profile| profile.vip.is_vip());
-    (
-        settings.quality.effective_max_qn(is_vip),
-        settings.codec.priority(),
-    )
-}
-
-fn resolve_profile_key(settings: &AppSettings, nav: &NavClient) -> ResolveProfileKey {
-    let (max_qn, _) = resolve_params_for(settings, nav);
-    ResolveProfileKey {
-        max_qn,
-        codec_idx: settings.codec.index(),
-    }
-}
-
-fn video_config_from(settings: &AppSettings) -> VideoConfig {
-    VideoConfig {
-        hardware_decode: settings.hardware_decode,
-        danmaku_enabled: settings.danmaku_enabled,
-        danmaku_opacity: settings.danmaku_opacity,
-        danmaku_max_lanes: settings.danmaku_max_lanes,
-        danmaku_font_family: settings.danmaku_font_family.clone(),
-        danmaku_font_scale: settings.danmaku_font_scale,
-        danmaku_filter: danmaku_filter_from(settings),
-    }
-}
-
-/// 弹幕过滤规则(设置模型 → 引擎规则;每行一条,空行忽略)。
-fn danmaku_filter_from(settings: &AppSettings) -> DanmakuFilter {
-    DanmakuFilter {
-        block_scroll: settings.danmaku_block_scroll,
-        block_bottom: settings.danmaku_block_bottom,
-        block_top: settings.danmaku_block_top,
-        block_color: settings.danmaku_block_color,
-        block_repeat: settings.danmaku_block_repeat,
-        weight_min: settings.danmaku_weight_min,
-        rules: settings
-            .danmaku_filter_rules
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect(),
-    }
-}
-
 /// 弹幕分段时长(秒;与 core `danmaku::SEGMENT_MS` 锚,B 站 6 分钟/段)。
 const DANMAKU_SEGMENT_SECS: u64 = SEGMENT_MS / 1000;
-
-/// 弹幕分段数(向上取整,至少 1;duration 缺失按单段兜底)。
-fn danmaku_segment_count(duration_secs: f64) -> u32 {
-    (duration_secs.max(0.0) / DANMAKU_SEGMENT_SECS as f64)
-        .ceil()
-        .max(1.0) as u32
-}
-
-/// 播放头所在分段(index 从 1 起)。
-fn danmaku_segment_at(secs: f64) -> u32 {
-    (secs.max(0.0) / DANMAKU_SEGMENT_SECS as f64).floor() as u32 + 1
-}
-
-/// 预存链的下一分段:优先段(播放头所在段)先到,其余按 1..=total 升序补齐。
-fn next_danmaku_segment(current: u32, first: u32, total: u32) -> Option<u32> {
-    if current == first {
-        (1..=total).find(|&i| i != first)
-    } else {
-        (current + 1..=total).find(|&i| i != first)
-    }
-}
 
 /// AppShell 输入:正常运行恒为默认值;selftest 下携带共享探针句柄,
 /// 状态经 reactor `test` 模块的 Input 句柄流出(reactor 测试同款模式)。
@@ -911,13 +708,6 @@ pub struct AppShell {
     demo_timer: Option<ComponentTimer>,
 }
 
-/// 全局搜索框壳的 Enter 判定:PreviewKeyDown 隧道命中主键盘/小键盘 Enter
-/// (`original_key` 对 NumpadEnter 上报 0x0D)才提交;释放与其余键放行不拦截。
-/// 纯函数便于单测锁行为,视图侧 `on_preview_key_down` 只做「判定→投递→handled」。
-pub(crate) fn search_enter_submits(ev: &KeyEventInfo) -> bool {
-    !ev.status.is_released && (ev.key == VirtualKey::ENTER || ev.original_key == VirtualKey::ENTER)
-}
-
 /// S3 tier1:播放引擎设置变更的收口动作(纯判定,单测覆盖)。
 /// 常驻播放层(park)落地后,切换当次生效:正在播的 VOD 定点换引擎续播。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -928,135 +718,12 @@ pub(crate) enum EngineSwitchAction {
     ReloadMpv,
 }
 
-/// S3:切换动作判定 —— 优先级:直播豁免 > 无会话 > 新引擎方向。
-fn engine_switch_plan(to_native: bool, live: bool, has_session: bool) -> EngineSwitchAction {
-    if live {
-        EngineSwitchAction::LiveKeepMpv
-    } else if !has_session {
-        EngineSwitchAction::RecordOnly
-    } else if to_native {
-        EngineSwitchAction::ReloadNative
-    } else {
-        EngineSwitchAction::ReloadMpv
-    }
-}
-
 mod message;
+mod util;
 
 pub use self::message::Message;
+pub use self::util::*;
 
-
-/// 搜索结果卡 → 展示模型(封面占位,由 ImageCache/CoverReady 异步填充)。
-fn search_video_item(video: &SearchVideo) -> VideoItem {
-    VideoItem {
-        bvid: video.bvid.clone(),
-        aid: video.aid,
-        cid: video.cid,
-        title: video.title.clone(),
-        author: video.author.clone(),
-        author_mid: video.author_mid,
-        author_face_url: None,
-        duration_secs: video.duration_secs,
-        play_count: video.play_count,
-        danmaku_count: video.danmaku_count,
-        // 搜索卡不下发互动计数，保持 None（进播放页后由 video_meta 回填）。
-        like_count: None,
-        coin_count: None,
-        favorite_count: None,
-        share_count: None,
-        cover: None,
-        pic_url: video.pic_url.clone(),
-    }
-}
-
-/// U5:用户列表卡 → open_video 展示模型(封面沿用已解码位图;aid/cid 由
-/// video_meta 解析管线回填,卡片不预置)。
-fn user_card_item(card: &UserVideoCard) -> VideoItem {
-    VideoItem {
-        bvid: card.bvid.clone(),
-        aid: 0,
-        cid: 0,
-        title: card.title.clone(),
-        author: card.up_name.clone(),
-        author_mid: 0,
-        author_face_url: None,
-        duration_secs: card.duration_secs,
-        play_count: card.play_count,
-        danmaku_count: 0,
-        like_count: None,
-        coin_count: None,
-        favorite_count: None,
-        share_count: None,
-        cover: card.cover.clone(),
-        pic_url: if card.cover_url.is_empty() {
-            None
-        } else {
-            Some(card.cover_url.clone())
-        },
-    }
-}
-
-/// 归档卡（popular/related 真实接口）→ 展示模型(封面占位,由 ImageCache/CoverReady 异步填充)。
-fn archive_video_item(card: &ArchiveCard) -> VideoItem {
-    VideoItem {
-        bvid: card.bvid.clone(),
-        aid: card.aid,
-        cid: card.cid,
-        title: card.title.clone(),
-        author: card.owner.name.clone(),
-        author_mid: card.owner.mid,
-        author_face_url: card.owner.face.as_deref().and_then(normalize_face_url),
-        duration_secs: card.duration.clamp(0, i64::from(u32::MAX)) as u32,
-        play_count: card.stat.view.unsigned_abs(),
-        danmaku_count: card.stat.danmaku.unsigned_abs(),
-        like_count: card.stat.like.map(|v| v.unsigned_abs()),
-        coin_count: card.stat.coin.map(|v| v.unsigned_abs()),
-        favorite_count: card.stat.favorite.map(|v| v.unsigned_abs()),
-        share_count: card.stat.share.map(|v| v.unsigned_abs()),
-        cover: None,
-        pic_url: Some(thumbnail_url(&card.pic)),
-    }
-}
-
-/// 未知元数据稿件的最小展示模型（QAQ_BX_VIDEO 冒烟路由 / open_video 兜底）：
-/// 标题暂以 bvid 占位，真实标题/UP 主/封面由 video_meta 解析管线回填。
-fn minimal_video_item(bvid: &str, title: &str) -> VideoItem {
-    VideoItem {
-        bvid: bvid.to_string(),
-        aid: 0,
-        cid: 0,
-        title: if title.trim().is_empty() {
-            bvid.to_string()
-        } else {
-            title.to_string()
-        },
-        author: String::new(),
-        author_mid: 0,
-        author_face_url: None,
-        duration_secs: 0,
-        play_count: 0,
-        danmaku_count: 0,
-        like_count: None,
-        coin_count: None,
-        favorite_count: None,
-        share_count: None,
-        cover: None,
-        pic_url: None,
-    }
-}
-
-/// 热门分页合并：按 bvid 去重（跨页重叠防御），返回实际新增项。
-fn merge_popular_items(existing: &mut Vec<VideoItem>, incoming: Vec<VideoItem>) -> Vec<VideoItem> {
-    let mut seen: HashSet<String> = existing.iter().map(|item| item.bvid.clone()).collect();
-    let mut fresh = Vec::new();
-    for item in incoming {
-        if seen.insert(item.bvid.clone()) {
-            fresh.push(item);
-        }
-    }
-    existing.extend(fresh.iter().cloned());
-    fresh
-}
 
 impl AppShell {
     /// selftest:将断言所需最小状态刷入共享探针(update 入口统一调用,
