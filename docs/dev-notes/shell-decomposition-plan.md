@@ -1,6 +1,7 @@
 # shell.rs 拆解计划(基于 codegraph 3256 节点/11087 边索引)
 
-> 状态:**计划待实施**(v0.7.0 分支)。所有行号基于当前 HEAD(`0435740`)的
+> 状态:**P1/P2/P3/P5-lite 已实施**(v0.7.0 分支,274 tests 绿,cycles 无新增);
+> P4(状态分组)/P6(Message 子枚举)按计划默认不做,P5 的 view() 根装配体进一步分拆留待后续。所有行号基于当前 HEAD(`0435740`)的
 > `crates/qaq-bx-ui/src/shell.rs`,codegraph 索引可随时 `codegraph sync .` 刷新复核。
 
 ## 0. 现状证据(codegraph node / callers / cycles)
