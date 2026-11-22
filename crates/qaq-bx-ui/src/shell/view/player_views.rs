@@ -63,6 +63,7 @@ impl AppShell {
                         on_enter_fullscreen: context.message(Message::EnterFullscreen),
                         demo_override: self.demo.as_ref().and_then(|d| d.player_override),
                         fullscreen,
+                        fullscreen_window_height: self.fullscreen_window_height,
                         pane_mode: pane.is_some(),
                         pane_width: pane.map(|p| p.0).unwrap_or(0.0),
                         pane_max_width: pane.map(|p| p.1).unwrap_or(0.0),

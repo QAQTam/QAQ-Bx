@@ -170,6 +170,28 @@ pub(super) fn video_config_from(settings: &AppSettings) -> VideoConfig {
         danmaku_font_family: settings.danmaku_font_family.clone(),
         danmaku_font_scale: settings.danmaku_font_scale,
         danmaku_filter: danmaku_filter_from(settings),
+        // D1:溢出策略默认丢弃(设置项接入随 D4/D5 批次)。
+        danmaku_overflow: DanmakuOverflow::Drop,
+        danmaku_density: settings.danmaku_density,
+        danmaku_area: settings.danmaku_area,
+        danmaku_speed_plus: settings.danmaku_speed_plus,
+        danmaku_prevent_shade: settings.danmaku_prevent_shade,
+    }
+}
+
+/// 弹幕样式热更新参数(设置 → 引擎/stage 单一参数源;与 video_config_from
+/// 的弹幕字段同源,夹取由引擎线程 DanmakuStyle::normalized 统一执行)。
+pub(super) fn danmaku_style_from(settings: &AppSettings) -> DanmakuStyle {
+    DanmakuStyle {
+        enabled: settings.danmaku_enabled,
+        opacity: settings.danmaku_opacity,
+        max_lanes: settings.danmaku_max_lanes,
+        font_family: settings.danmaku_font_family.clone(),
+        font_scale: settings.danmaku_font_scale,
+        density: settings.danmaku_density,
+        area: settings.danmaku_area,
+        speed_plus: settings.danmaku_speed_plus,
+        prevent_shade: settings.danmaku_prevent_shade,
     }
 }
 

@@ -41,7 +41,10 @@ use qaq_bx_core::reply::{ReplyClient, ReplyCursor, ReplyItem, ReplyPage, ReplySo
 use qaq_bx_core::search::{SearchClient, SearchVideo};
 use qaq_bx_core::settings::{AppSettings, FileSettingsStore, PlayerEngine, SETTINGS_FILE};
 use qaq_bx_core::stream_proxy::StreamProxy;
-use qaq_bx_video::engine::{ContentRef, DanmakuFilter, OverlayDanmaku, VideoConfig, VideoEngine};
+use qaq_bx_video::engine::{
+    ContentRef, DanmakuFilter, DanmakuOverflow, DanmakuStyle, OverlayDanmaku, VideoConfig,
+    VideoEngine,
+};
 use qaq_bx_video::native::NativePlayer;
 use qaq_bx_video::stage::DanmakuStage;
 use windows::Media::MediaPlaybackStatus;
@@ -477,6 +480,8 @@ pub struct AppShell {
     audio_fallback_done: bool,
     /// 播放状态节拍定时器：Drop 即取消投递，必须持有。
     timer: Option<ComponentTimer>,
+    /// 冒烟辅助:QAQ_BX_FS=1 的自动全屏一次性定时器(句柄必须存活)。
+    smoke_fs_timer: Option<ComponentTimer>,
     /// 登录轮询定时器（2s，独立于播放节拍）。
     login_timer: Option<ComponentTimer>,
     /// Windows 控制中心媒体控件（SMTC）控制器。
@@ -496,6 +501,9 @@ pub struct AppShell {
     is_fullscreen: bool,
     /// 全屏 HUD 专用实时窗口宽度（全屏期间冻结底层 `viewport_layout`，避免污染非全屏壳层与虚拟列表）。
     fullscreen_window_width: f64,
+    /// 全屏期间的真实窗口高度（同上；竖屏单列全屏的视频面按它铺满窗口——
+    /// 此时 `viewport_layout` 冻结为竖屏几何，高度不可再用）。
+    fullscreen_window_height: f64,
     /// 拖拽区重算结构指纹(路由 tag 长度/首字节、全屏、搜索展开、宽度桶):变化才补算。
     last_title_bar_sig: Cell<(u8, u8, bool, bool, u32)>,
     fullscreen_gen: u64,
@@ -785,6 +793,7 @@ impl Component for AppShell {
 
         // 冒烟播放与点卡同构:仅在 QAQ_BX_VIDEO 指定时才提前创建 VideoEngine；日常启动 0 播放内存占用。
         let mut timer = None;
+        let mut smoke_fs_timer: Option<ComponentTimer> = None;
         let mut engine = None;
         let mut video_loading = false;
         if let Some(item) = &now_playing {
@@ -798,6 +807,14 @@ impl Component for AppShell {
             );
             timer = Some(context.set_local_timeout(PLAYBACK_TICK, || Message::PositionTick));
             video_loading = true;
+            // 冒烟辅助:QAQ_BX_FS=1 启动视频后 4s 自动进全屏(白屏复现钩子,
+            // 2026-11-22;给足解析管线/引擎挂载时间)。定时器句柄必须存活
+            // (ComponentTimer Drop 即取消),存入冒烟槽位。
+            if std::env::var("QAQ_BX_FS").as_deref() == Ok("1") {
+                smoke_fs_timer = Some(context.set_local_timeout(Duration::from_secs(4), || {
+                    Message::EnterFullscreen
+                }));
+            }
         }
         let demo = crate::demo::DemoConfig::from_env_and_args().map(crate::demo::DemoState::new);
         let demo_timer = if demo.is_some() {
@@ -1047,6 +1064,7 @@ impl Component for AppShell {
             pages_menu: Vec::new(),
             current_cid: 0,
             timer,
+            smoke_fs_timer,
             login_timer: None,
             smtc: None,
             smtc_native: None,
@@ -1059,6 +1077,7 @@ impl Component for AppShell {
             home_half_pane: false,
             is_fullscreen: false,
             fullscreen_window_width: initial_layout.window_width,
+            fullscreen_window_height: initial_layout.window_height,
             last_title_bar_sig: Cell::new((0, 0, false, false, 0)),
             fullscreen_gen: 0,
             fullscreen_sync_in_flight: false,
@@ -1598,12 +1617,27 @@ impl Component for AppShell {
             );
 
             let shell_root = Grid::new()
-                .rows([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
-                .children((
-                    title_bar,
-                    content_host,
-                    Grid::new().grid_row(2).children((bottom_bar,)),
-                ));
+                .rows([
+                    // 全屏:标题栏行 0 高收起(与桌面分支同款;TitleBar 无显式高度,
+                    // 行高压得住)。底栏不能走同款 —— 胶囊是显式高(capsule::HEIGHT)
+                    // + 玻璃 composition 视觉,0 高行压不住溢出绘制,必须整块摘除。
+                    if fullscreen {
+                        GridLength::Pixel(0.0)
+                    } else {
+                        GridLength::Auto
+                    },
+                    GridLength::Star(1.0),
+                    GridLength::Auto,
+                ])
+                .children({
+                    // 全屏摘除底栏:positional key 只在尾位增删,前两位(标题栏/
+                    // 内容层,内含 keyed 播放页)路径不变 —— MPE 不销毁不换源。
+                    let mut children: Vec<View> = vec![title_bar.into(), content_host.into()];
+                    if !fullscreen {
+                        children.push(Grid::new().grid_row(2).children((bottom_bar,)).into());
+                    }
+                    children
+                });
 
             let overlays: Vec<KeyedView> = fs_hud_layer.into_iter().collect();
             return self.shell_root_view("shell-root", shell_root, overlays);

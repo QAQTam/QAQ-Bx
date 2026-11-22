@@ -81,13 +81,7 @@ impl AppShell {
             }
             Message::ToggleDanmaku => {
                 self.settings.danmaku_enabled = !self.settings.danmaku_enabled;
-                self.danmaku_config(
-                    self.settings.danmaku_enabled,
-                    self.settings.danmaku_opacity,
-                    self.settings.danmaku_max_lanes,
-                    &self.settings.danmaku_font_family,
-                    self.settings.danmaku_font_scale,
-                );
+                self.danmaku_config(danmaku_style_from(&self.settings));
                 self.schedule_settings_save(context);
             }
             Message::EnterFullscreen => {
@@ -508,6 +502,7 @@ impl AppShell {
         self.search_overlay_open = false;
         self.is_fullscreen = true;
         self.fullscreen_window_width = self.viewport_layout.window_width;
+        self.fullscreen_window_height = self.viewport_layout.window_height;
         self.sync_window_fullscreen(true, context);
         self.sync_key_route_ctx();
     }
@@ -520,6 +515,7 @@ impl AppShell {
         self.clear_native_remount_throttle();
         self.is_fullscreen = false;
         self.fullscreen_window_width = self.viewport_layout.window_width;
+        self.fullscreen_window_height = self.viewport_layout.window_height;
         self.sync_window_fullscreen(false, context);
         self.sync_key_route_ctx();
     }

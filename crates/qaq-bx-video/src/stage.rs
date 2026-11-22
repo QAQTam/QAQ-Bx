@@ -31,9 +31,10 @@ use std::time::{Duration, Instant};
 use windows_canvas::{ColorF, GpuDevice};
 
 use crate::engine::{
-    CompiledDanmakuFilter, DanmakuFilter, DanmakuFonts, OverlayDanmaku, RENDER_BUDGET,
+    CompiledDanmakuFilter, DanmakuFilter, DanmakuFonts, DanmakuStyle, OverlayDanmaku,
+    RENDER_BUDGET,
     SurfaceMetrics, SurfaceMountSlot, VideoConfig, compute_surface_metrics, configure_swap_chain,
-    draw_danmaku_overlay, interpolated_danmaku_time,
+    draw_danmaku_overlay, interpolated_danmaku_time, playhead_estimate, realloc_lanes,
 };
 
 /// 初始 swapchain 尺寸(挂载前占位;首个 metrics 到达即 ResizeBuffers)。
@@ -51,14 +52,8 @@ pub enum StageCmd {
     AppendItems { items: Vec<OverlayDanmaku> },
     /// 屏蔽规则变化:缓存弹幕全量重滤。
     SetFilter { filter: DanmakuFilter },
-    /// 弹幕样式(开关/透明度/轨道数/字体族/字号缩放)。
-    SetStyle {
-        enabled: bool,
-        opacity: f32,
-        max_lanes: usize,
-        font_family: String,
-        font_scale: f32,
-    },
+    /// 弹幕样式(单一参数源 [`DanmakuStyle`],与视频引擎同结构)。
+    SetStyle { style: DanmakuStyle },
     /// 时基输入:shell 状态节拍喂来的播放位置(秒)。
     SetTime { secs: f64 },
     /// 播放态(native 引擎真实状态;暂停即冻结弹幕并重锚时基)。
@@ -121,22 +116,9 @@ impl DanmakuStage {
         _ = self.cmd_tx.send(StageCmd::AppendItems { items });
     }
 
-    /// 样式下发:与 `VideoEngine::set_danmaku_config` 同参数、同夹取口径。
-    pub fn set_danmaku_config(
-        &self,
-        enabled: bool,
-        opacity: f32,
-        max_lanes: usize,
-        font_family: &str,
-        font_scale: f32,
-    ) {
-        _ = self.cmd_tx.send(StageCmd::SetStyle {
-            enabled,
-            opacity,
-            max_lanes,
-            font_family: font_family.to_string(),
-            font_scale,
-        });
+    /// 样式下发:与 `VideoEngine::set_danmaku_config` 同参数源、同夹取口径。
+    pub fn set_danmaku_config(&self, style: DanmakuStyle) {
+        _ = self.cmd_tx.send(StageCmd::SetStyle { style });
     }
 
     pub fn set_danmaku_filter(&self, filter: DanmakuFilter) {
@@ -278,15 +260,30 @@ fn stage_thread(
                     StageCmd::SetItems { items } => {
                         // 全量替换:重置去重表(新视频/换分P 清层语义)。
                         dm_dedup.clear();
-                        overlay = dm_filter.filter_batch(items, &mut dm_dedup);
+                        // D1:ingest 出口统一轨道/槽位分配(与 mpv 管线同源);
+                        // 全量替换=新视频语义,无飞行条目,全量重排。
+                        overlay = realloc_lanes(
+                            dm_filter.filter_batch(items, &mut dm_dedup),
+                            &cfg,
+                            width as f32 / scale_x,
+                            height as f32 / scale_y,
+                            f64::NEG_INFINITY,
+                        );
                         need_repaint = true;
                     }
                     StageCmd::AppendItems { items } => {
                         let kept = dm_filter.filter_batch(items, &mut dm_dedup);
                         if !kept.is_empty() {
                             overlay.extend(kept);
-                            // 归并回 progress 升序(渲染二分扫描的不变量)。
-                            overlay.sort_by_key(|e| e.progress_ms);
+                            // D1:分段到货触发重排;跳变治理:已起飞条目保留原
+                            // y 分配,仅未出现的条目参与 packing。
+                            overlay = realloc_lanes(
+                                std::mem::take(&mut overlay),
+                                &cfg,
+                                width as f32 / scale_x,
+                                height as f32 / scale_y,
+                                playhead_estimate(&dm_time_anchor, raw_t, !playing),
+                            );
                             need_repaint = true;
                         }
                     }
@@ -294,26 +291,36 @@ fn stage_thread(
                         dm_filter = CompiledDanmakuFilter::compile(&filter);
                         dm_dedup.clear();
                         let items = std::mem::take(&mut overlay);
-                        overlay = dm_filter.filter_batch(items, &mut dm_dedup);
+                        // D1:重滤后重跑分配;跳变治理同上(可见层不重排)。
+                        overlay = realloc_lanes(
+                            dm_filter.filter_batch(items, &mut dm_dedup),
+                            &cfg,
+                            width as f32 / scale_x,
+                            height as f32 / scale_y,
+                            playhead_estimate(&dm_time_anchor, raw_t, !playing),
+                        );
                         need_repaint = true;
                     }
-                    StageCmd::SetStyle {
-                        enabled,
-                        opacity,
-                        max_lanes,
-                        font_family,
-                        font_scale,
-                    } => {
-                        cfg.danmaku_enabled = enabled;
-                        cfg.danmaku_opacity = opacity.clamp(0.1, 1.0);
-                        cfg.danmaku_max_lanes = max_lanes.clamp(1, 20);
-                        if cfg.danmaku_font_family != font_family
-                            || (cfg.danmaku_font_scale - font_scale).abs() > f32::EPSILON
-                        {
-                            fonts = DanmakuFonts::with(&font_family, font_scale);
+                    StageCmd::SetStyle { style } => {
+                        // normalized 防 settings.json 手工越界值;字体变化重建格式。
+                        let style = style.normalized();
+                        let font_changed = cfg.danmaku_font_family != style.font_family
+                            || (cfg.danmaku_font_scale - style.font_scale).abs() > f32::EPSILON;
+                        if font_changed {
+                            fonts = DanmakuFonts::with(&style.font_family, style.font_scale);
                         }
-                        cfg.danmaku_font_family = font_family;
-                        cfg.danmaku_font_scale = font_scale;
+                        style.apply_to(&mut cfg);
+                        // D1:轨道数/字号/密度/区域/速度/防挡字幕均影响准入与
+                        // 行高,变化即重跑分配。
+                        if !overlay.is_empty() {
+                            overlay = realloc_lanes(
+                                std::mem::take(&mut overlay),
+                                &cfg,
+                                width as f32 / scale_x,
+                                height as f32 / scale_y,
+                                playhead_estimate(&dm_time_anchor, raw_t, !playing),
+                            );
+                        }
                         need_repaint = true;
                     }
                     StageCmd::SetTime { secs } => {
@@ -379,6 +386,16 @@ fn stage_thread(
                 height = metrics.height;
                 scale_x = metrics.scale_x;
                 scale_y = metrics.scale_y;
+                // D1 触发时机③:宽度/高度变化影响准入窗口与轨道数,重跑分配。
+                if !overlay.is_empty() {
+                    overlay = realloc_lanes(
+                        std::mem::take(&mut overlay),
+                        &cfg,
+                        width as f32 / scale_x,
+                        height as f32 / scale_y,
+                        playhead_estimate(&dm_time_anchor, raw_t, !playing),
+                    );
+                }
                 configure_swap_chain(&mut chain, scale_x, scale_y);
                 need_repaint = true;
             } else if scale_changed {
@@ -502,8 +519,12 @@ mod tests {
             fontsize: 25,
             color: 0xFFFFFF,
             content: content.into(),
+            lane: 0,
+            y_off: 0.0,
+            est_width: 0.0,
             mid_hash: None,
             weight: 0,
+            pool: 0,
         }
     }
 
@@ -513,7 +534,17 @@ mod tests {
         let stage = DanmakuStage::new();
         stage.set_danmaku(vec![item(1_000, "测试")]);
         stage.append_danmaku(vec![item(2_000, "追加")]);
-        stage.set_danmaku_config(true, 0.9, 10, DANMAKU_DEFAULT_FONT, 1.0);
+        stage.set_danmaku_config(DanmakuStyle {
+            enabled: true,
+            opacity: 0.9,
+            max_lanes: 10,
+            font_family: DANMAKU_DEFAULT_FONT.to_string(),
+            font_scale: 1.0,
+            density: 1.0,
+            area: 100,
+            speed_plus: 1.0,
+            prevent_shade: false,
+        });
         stage.set_danmaku_filter(DanmakuFilter::default());
         stage.set_time(1.5);
         stage.set_time(f64::NAN); // 非法时基必须被丢弃而非污染外推

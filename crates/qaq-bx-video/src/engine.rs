@@ -22,7 +22,7 @@ use bytes::Bytes;
 use windows::Win32::d3d11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
 use windows::core::Interface;
 use windows_canvas::{ColorF, GpuDevice, Rect, SwapChain};
-use windows_text::TextFormat;
+use windows_text::{TextFormat, WordWrapping};
 
 use crate::ffi::{MPV_FORMAT_DOUBLE, MPV_FORMAT_FLAG, MPV_FORMAT_STRING, MpvLib, mpv_d3d11_fbo};
 use crate::player::{MpvEvent, MpvPlayer, PropertyValue};
@@ -255,6 +255,105 @@ pub struct VideoConfig {
     pub danmaku_font_scale: f32,
     /// 弹幕过滤规则(网页版对齐;SetDanmakuFilter 热更新)。
     pub danmaku_filter: DanmakuFilter,
+    /// 轨道全满溢出策略(D1:丢弃=网页端口径 / 强放最早空出轨道)。
+    pub danmaku_overflow: DanmakuOverflow,
+    /// 弹幕显示密度(官方 dmdensity 口径,1.0=最密;越低碰撞容忍 A 越大、
+    /// 上屏越稀)。clamp 0.1..=1.0。
+    pub danmaku_density: f32,
+    /// 弹幕显示区域(官方 dmarea 口径,%:可用高度=视频区高度×area/100,
+    /// 字幕池弹幕豁免)。clamp 10..=100。
+    pub danmaku_area: u8,
+    /// 滚动速度倍率(官方 speedplus;1.0=官方默认手感,>1 更快)。clamp 0.5..=2.0。
+    pub danmaku_speed_plus: f32,
+    /// 防挡字幕(官方 preventshade:碰撞可用高度×0.85,底部 15% 让位)。
+    pub danmaku_prevent_shade: bool,
+}
+
+/// 弹幕样式热更新参数(单一参数源;VideoEngine/DanmakuStage 同结构、同夹取口径)。
+///
+/// UI 侧由设置构建后下发;引擎线程 `normalized()` 后写回 VideoConfig 并按需重跑分配。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DanmakuStyle {
+    pub enabled: bool,
+    pub opacity: f32,
+    pub max_lanes: usize,
+    pub font_family: String,
+    pub font_scale: f32,
+    /// 显示密度(官方 dmdensity;1.0=最密,越低碰撞容忍 A 越大)。
+    pub density: f32,
+    /// 显示区域(官方 dmarea,%;字幕池弹幕豁免)。
+    pub area: u8,
+    /// 滚动速度倍率(官方 speedplus;1.0=官方默认手感)。
+    pub speed_plus: f32,
+    /// 防挡字幕(官方 preventshade:可用高度×0.85)。
+    pub prevent_shade: bool,
+}
+
+impl DanmakuStyle {
+    /// 从引擎初始配置取当前值(启动播种/重播种复用)。
+    pub fn from_config(cfg: &VideoConfig) -> Self {
+        Self {
+            enabled: cfg.danmaku_enabled,
+            opacity: cfg.danmaku_opacity,
+            max_lanes: cfg.danmaku_max_lanes,
+            font_family: cfg.danmaku_font_family.clone(),
+            font_scale: cfg.danmaku_font_scale,
+            density: cfg.danmaku_density,
+            area: cfg.danmaku_area,
+            speed_plus: cfg.danmaku_speed_plus,
+            prevent_shade: cfg.danmaku_prevent_shade,
+        }
+    }
+
+    /// 与 settings.normalized 同口径的钳位(引擎侧自防御,不信任调用方)。
+    pub fn normalized(mut self) -> Self {
+        self.opacity = if self.opacity.is_finite() {
+            self.opacity.clamp(0.1, 1.0)
+        } else {
+            0.92
+        };
+        self.max_lanes = self.max_lanes.clamp(1, 20);
+        self.font_scale = if self.font_scale.is_finite() {
+            self.font_scale.clamp(0.5, 2.0)
+        } else {
+            1.0
+        };
+        self.density = if self.density.is_finite() {
+            self.density.clamp(0.1, 1.0)
+        } else {
+            1.0
+        };
+        self.area = self.area.clamp(10, 100);
+        self.speed_plus = if self.speed_plus.is_finite() {
+            self.speed_plus.clamp(0.5, 2.0)
+        } else {
+            1.0
+        };
+        self
+    }
+
+    /// 写回引擎配置(调用前必须 `normalized()`;字体族/字号变化由调用方重建格式)。
+    pub(crate) fn apply_to(self, cfg: &mut VideoConfig) {
+        cfg.danmaku_enabled = self.enabled;
+        cfg.danmaku_opacity = self.opacity;
+        cfg.danmaku_max_lanes = self.max_lanes;
+        cfg.danmaku_font_family = self.font_family;
+        cfg.danmaku_font_scale = self.font_scale;
+        cfg.danmaku_density = self.density;
+        cfg.danmaku_area = self.area;
+        cfg.danmaku_speed_plus = self.speed_plus;
+        cfg.danmaku_prevent_shade = self.prevent_shade;
+    }
+}
+
+/// 轨道溢出策略(设计稿 D1)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DanmakuOverflow {
+    /// 丢弃(与 B 站网页一致:放不下不上屏)。
+    #[default]
+    Drop,
+    /// findMin 强放:挑最早完全空出的轨道,允许有限重叠兜底(字太多的例外)。
+    Force,
 }
 
 impl Default for VideoConfig {
@@ -267,6 +366,11 @@ impl Default for VideoConfig {
             danmaku_font_family: DANMAKU_DEFAULT_FONT.into(),
             danmaku_font_scale: 1.0,
             danmaku_filter: DanmakuFilter::default(),
+            danmaku_overflow: DanmakuOverflow::Drop,
+            danmaku_density: 1.0,
+            danmaku_area: 100,
+            danmaku_speed_plus: 1.0,
+            danmaku_prevent_shade: false,
         }
     }
 }
@@ -293,14 +397,8 @@ pub enum EngineCmd {
     AppendDanmaku {
         items: Vec<OverlayDanmaku>,
     },
-    /// 运行时更新弹幕开关与绘制参数。
-    SetDanmakuConfig {
-        enabled: bool,
-        opacity: f32,
-        max_lanes: usize,
-        font_family: String,
-        font_scale: f32,
-    },
+    /// 运行时更新弹幕开关与绘制参数(单一参数源 [`DanmakuStyle`])。
+    SetDanmakuConfig { style: DanmakuStyle },
     /// 运行时更新弹幕过滤规则(引擎侧编译,并对已缓存弹幕全量重滤)。
     SetDanmakuFilter {
         filter: DanmakuFilter,
@@ -341,10 +439,20 @@ pub struct OverlayDanmaku {
     /// 0xRRGGBB。
     pub color: u32,
     pub content: ContentRef,
+    /// 分配结果(D1/D3):滚动=band 序号(0..3,y_off 见下),顶/底=驻留槽位
+    /// (ingest 时分配;渲染 stateless,x/y 仍由 t 与 progress 推导)。
+    pub lane: u16,
+    /// 滚动弹幕打包 y(DIP):官方 3-band 连续 y 打包结果(含 offsetTop 基线),
+    /// 渲染直接取用;顶/底驻留弹幕不使用(恒 0,y 由槽位推导)。
+    pub y_off: f32,
+    /// 估算文本宽度 DIP(准入判据与 x 推导共用;D2 排版缓存就绪前为估算值)。
+    pub est_width: f32,
     /// 发送者 mid CRC32 hash(网页版用户屏蔽同源;None = 未下发/非法)。
     pub mid_hash: Option<u32>,
     /// 云屏蔽权重(0 = 未下发;越低越疑似垃圾)。
     pub weight: u32,
+    /// 弹幕池(0=普通 1=字幕;1 号池在官方碰撞分配中豁免显示区域限制)。
+    pub pool: u8,
 }
 
 /// 弹幕文本引用:分段原始 protobuf 缓冲的 `(off,len)` 切片(`Bytes` 引用计数,
@@ -545,6 +653,375 @@ impl CompiledDanmakuFilter {
     }
 }
 
+// ---------- 轨道分配(设计稿 D1 滚动避让 + D3 顶/底驻留堆叠) ----------
+
+/// 字号档位基准 em(与 `DanmakuFonts` 16/22/30 对齐)。
+fn font_em(fontsize: i32) -> f32 {
+    match fontsize {
+        ..=20 => 16.0,
+        21..=28 => 22.0,
+        _ => 30.0,
+    }
+}
+
+/// 估算文本宽度(DIP;D2 排版缓存就绪前的兜底,§5 允许 D1/D2 解耦):
+/// 全宽字符 ≈ 1.0em、半宽 ≈ 0.55em。准入与绘制共用同一估算,
+/// 保证「尾部过缘」时刻与 x 推导一致。
+pub(crate) fn danmaku_est_width(fontsize: i32, font_scale: f32, text: &str) -> f32 {
+    let scale = if font_scale.is_finite() {
+        font_scale.clamp(0.5, 2.0)
+    } else {
+        1.0
+    };
+    let em = font_em(fontsize) * scale;
+    let w: f32 = text
+        .chars()
+        .map(|c| {
+            let u = c as u32;
+            let full = matches!(
+                u,
+                0x1100..=0x11FF         // Hangul Jamo
+                    | 0x2E80..=0xA4CF   // CJK 部首/符号/统一表意/谚文兼容
+                    | 0xAC00..=0xD7A3   // Hangul 音节
+                    | 0xF900..=0xFAFF   // CJK 兼容表意
+                    | 0x00B7            // 间隔号 ·(Noto Sans SC 实测 1.0em)
+                    | 0x2014..=0x2015   // 破折线 — ―(实测 — 0.894em)
+                    | 0x2018..=0x201D   // 弯引号 ‘ ’ “ ”(实测 1.0em)
+                    | 0x2025..=0x2026   // 两点引导/省略号 ‥ …(实测 1.0em)
+                    | 0x2190..=0x2199   // 箭头(实测 ↑ 1.0em)
+                    | 0x2600..=0x27BF   // 杂项符号/装饰 ★☆♥ 等(实测 ★ 1.0em)
+                    | 0x301C            // 波浪号 〜(实测 1.0em)
+                    | 0xFF00..=0xFF60   // 全角形式
+                    | 0xFFE0..=0xFFE6   // 全角符号
+                    | 0x20000..=0x2FA1F // CJK 扩展 B–F
+                    | 0x30000..=0x3234F // CJK 扩展 G–H
+            );
+            if full {
+                em
+            } else {
+                em * 0.55
+            }
+        })
+        .sum();
+    w.max(em)
+}
+
+/// 滚动弹幕打包起点 y(DIP;沿用渲染基线 8.0。官方 offsetTop 默认 4,为设置项)。
+const BAND_OFFSET_TOP: f32 = 8.0;
+
+/// 滚动弹幕打包行盒高:官方 DOM 口径 1.125×字号(em 已含档位与全局缩放)。
+/// 行距不再是离散 30px 行距——小字号可填进大字号下方的空隙(官方 2D packing 观感)。
+fn band_item_height(fontsize: i32, font_scale: f32) -> f64 {
+    1.125 * f64::from(font_em(fontsize)) * f64::from(font_scale)
+}
+
+/// band 占用记录(官方 spaceManager band 列表项;按 (bottom,退场时刻) 有序)。
+#[derive(Debug, Clone, Copy)]
+struct BandOccupant {
+    /// 占用 y 区间顶(DIP)。
+    y: f64,
+    /// 占用 y 区间底(y + 行盒高)。
+    bottom: f64,
+    /// 尾部越过右缘时刻(追尾判据 a;= spawn + 字宽/速度)。
+    to_right: f64,
+    /// 完全退场时刻(追尾判据 b 与过期剔除共用;= 官方 endTime)。
+    to_left: f64,
+}
+
+/// 官方 hasDm:自 `from` 起扫 band 列表,存在 y 区间覆盖 [v,x] 的条目则为占用。
+/// (列表按 bottom 升序:bottom < v 的在候选上方跳过,y > x 的已到候选下方中止。)
+fn band_has_dm(list: &[BandOccupant], from: usize, v: f64, x: f64) -> bool {
+    for s in list.get(from..).unwrap_or(&[]) {
+        if s.bottom < v {
+            continue;
+        }
+        if s.y > x {
+            break;
+        }
+        return true;
+    }
+    false
+}
+
+/// 占用记录按 (bottom, 退场时刻) 有序插入(官方 binsert 口径)。
+fn insert_occupant(
+    band: &mut Vec<BandOccupant>,
+    y: f64,
+    item_h: f64,
+    spawn: f64,
+    est_width: f32,
+    travel: &RollTravel,
+) {
+    let occ = BandOccupant {
+        y,
+        bottom: y + item_h,
+        to_right: spawn + f64::from(est_width) / travel.speed,
+        to_left: spawn + travel.duration,
+    };
+    let pos = band.partition_point(|s| (s.bottom, s.to_left) < (occ.bottom, occ.to_left));
+    band.insert(pos, occ);
+}
+
+/// realloc 时点的播放头估计(只读:复用外推锚但不重锚;暂停/无锚退回 raw_t)。
+/// 跳变治理口径:progress_ms/1000 < 该值 的条目视为飞行中,保留原 y 分配。
+pub(crate) fn playhead_estimate(anchor: &Option<(f64, Instant)>, raw_t: f64, paused: bool) -> f64 {
+    if paused {
+        return raw_t;
+    }
+    match anchor {
+        Some((t0, at)) if (raw_t - t0).abs() < TIMEPOS_EPSILON => {
+            t0 + at.elapsed().as_secs_f64().min(TIMEPOS_EXTRAP_CAP)
+        }
+        _ => raw_t,
+    }
+}
+
+/// ingest 统一重分配入口(D1 触发时机:分段到货 / 过滤变化 / 尺寸与样式变化)。
+/// `playhead_secs`:当前播放头(秒);其之前的条目保留原分配不再重排(跳变治理)。
+/// 全量重排(新视频/换 P)传 `f64::NEG_INFINITY`。
+pub(crate) fn realloc_lanes(
+    overlay: Vec<OverlayDanmaku>,
+    cfg: &VideoConfig,
+    dip_width: f32,
+    dip_height: f32,
+    playhead_secs: f64,
+) -> Vec<OverlayDanmaku> {
+    allocate_lanes(overlay, cfg, dip_width, dip_height, playhead_secs)
+}
+
+/// 轨道/槽位分配(官方判据移植;`docs/dev-notes/bilibili-danmaku-engine-research.md` §3.3/§3.4)。
+///
+/// 滚动(mode 1|2|3)=官方 spaceManager.add 的 3-band 连续 y 打包(2D packing):
+///   - 时长:屏宽分段+Logistic(`roll_base_secs`),速度=(屏宽+字宽)/时长×speedPlus;
+///   - 几何:屏外 50px 起笔、尾部越过左缘 50px 退场(`roll_travel`);
+///   - 空间:band 0 为常规占用列(占用区间按 bottom 有序),候选 y 自 offsetTop
+///     逐条走查——空隙(S.y > 候选底)直接放入;y 区间重叠时按追尾双判据
+///     (对前条 S):(a) `spawn >= S.尾过右缘` (b) `本条头部到左缘 >= S.退场 + A`
+///     放行同 y,否则 `v = S.bottom + 1` 连续下移(1px 步进,非离散轨道);
+///   - 高度:候选 bottom ≤ g = min(preventShade?0.85:1 × 高, offsetTop+轨道上限×行距);
+///   - area(显示区域%):非特权候选 bottom ≤ m = 高×area/100,越界整条丢弃
+///     (官方口径:不试下一 band);字幕池(pool=1)特权豁免 area 且可溢出 band 1/2;
+///   - 溢出策略只有丢弃,无强插路径(官方口径);`DanmakuOverflow::Force` 为
+///     项目扩展:落 band 0 走查最深处并钳回可用高度内(≈旧 findMin 近似)。
+///   - 行盒高 = 1.125×字号(官方 DOM 口径):小字号弹幕可填进大字号下方的空隙。
+/// 顶/底(mode 4|5)按 `PIN_SECONDS` 驻留槽位堆叠,槽位受 area 约束(离散模型)。
+/// 跳变治理:`playhead_secs` 之前出现(已起飞)的条目保留原 lane/y_off,并以其占用
+/// 播种 band 列表与驻留槽——分段到货/样式热更不再引起可见弹幕跳位。
+/// 渲染保持 stateless:lane/y_off/est_width 只是分配结果缓存,x 仍由 t 推导。
+/// 返回保留条目(progress 升序;y_off/lane/est_width 已回填;溢出条目移除)。
+pub(crate) fn allocate_lanes(
+    mut items: Vec<OverlayDanmaku>,
+    cfg: &VideoConfig,
+    width: f32,
+    height: f32,
+    playhead_secs: f64,
+) -> Vec<OverlayDanmaku> {
+    let max_lanes = cfg.danmaku_max_lanes.clamp(1, 20);
+    if items.is_empty() {
+        return items;
+    }
+    items.sort_by_key(|e| e.progress_ms);
+    let w = f64::from(width.max(1.0));
+    let h = f64::from(height.max(1.0));
+    let font_scale = if cfg.danmaku_font_scale.is_finite() {
+        cfg.danmaku_font_scale.clamp(0.5, 2.0)
+    } else {
+        1.0
+    };
+    let density = if cfg.danmaku_density.is_finite() {
+        f64::from(cfg.danmaku_density.clamp(0.1, 1.0))
+    } else {
+        1.0
+    };
+    let pitch = 30.0 * f64::from(font_scale);
+    // 官方 spaceManager.add 高度口径:g = 可用高度下界(候选 bottom 上限),
+    // preventShade ×0.85;再钉上「轨道上限」设置(项目扩展,官方无此帽)。
+    let shade = if cfg.danmaku_prevent_shade { 0.85 } else { 1.0 };
+    let g = (shade * h).min(f64::from(BAND_OFFSET_TOP) + max_lanes as f64 * pitch);
+    // area 下界 m(非特权候选 bottom 上限;官方 m 用容器高,本项目 overlay 即视频区)。
+    let area = u16::from(cfg.danmaku_area.clamp(10, 100));
+    let area_bottom = h * f64::from(area) / 100.0;
+    // 顶/底驻留槽上限(离散模型沿用:行距口径与 draw 侧一致)。
+    let slots_cap = (((shade * h) * f64::from(area) / 100.0 - 8.0) / pitch).floor() as usize;
+    let slots_cap = slots_cap.clamp(1, max_lanes);
+    // 3 个 band 占用列表(band 0=常规主列;band 1/2=特权溢出)与驻留槽释放时刻。
+    let mut bands: [Vec<BandOccupant>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut pin_end_top: Vec<f64> = Vec::new();
+    let mut pin_end_bottom: Vec<f64> = Vec::new();
+
+    // 跳变治理:progress < 播放头的条目(已起飞/已过期)保留原分配,以其占用
+    // 播种占用表——后打包条目绕开飞行中的弹幕,可见层不重排。
+    let mut kept: Vec<OverlayDanmaku> = Vec::with_capacity(items.len());
+    let mut ahead: Vec<OverlayDanmaku> = Vec::with_capacity(items.len());
+    for e in items {
+        let spawn = f64::from(e.progress_ms.max(0)) / 1000.0;
+        // 严格 <:spawn 瞬间的弹幕还在屏外右缘(elapsed≈0),重排不可见;
+        // 且 playhead=0(未起播)时 progress_ms=0 的条目也必须参与打包。
+        if spawn < playhead_secs {
+            match e.mode {
+                1 | 2 | 3 => {
+                    let lane = usize::from(e.lane);
+                    if lane < 3 && e.y_off > 0.0 && e.est_width > 0.0 {
+                        let travel =
+                            roll_travel(f64::from(e.est_width), w, cfg.danmaku_speed_plus);
+                        let y = f64::from(e.y_off);
+                        bands[lane].push(BandOccupant {
+                            y,
+                            bottom: y + band_item_height(e.fontsize, font_scale),
+                            to_right: spawn + f64::from(e.est_width) / travel.speed,
+                            to_left: spawn + travel.duration,
+                        });
+                    }
+                }
+                4 | 5 => {
+                    let ends = if e.mode == 5 {
+                        &mut pin_end_top
+                    } else {
+                        &mut pin_end_bottom
+                    };
+                    let slot = usize::from(e.lane);
+                    if slot >= ends.len() {
+                        ends.resize(slot + 1, 0.0);
+                    }
+                    ends[slot] = ends[slot].max(spawn + PIN_SECONDS);
+                }
+                _ => {}
+            }
+            kept.push(e);
+        } else {
+            ahead.push(e);
+        }
+    }
+    for band in &mut bands {
+        band.sort_by(|a, b| a.bottom.total_cmp(&b.bottom).then(a.to_left.total_cmp(&b.to_left)));
+    }
+
+    // 官方 spaceManager.add:逐条时间轴模拟打包(ahead 已升序)。
+    for mut e in ahead {
+        e.est_width = danmaku_est_width(e.fontsize, font_scale, &e.content.text());
+        let spawn = f64::from(e.progress_ms.max(0)) / 1000.0;
+        let placed = match e.mode {
+            1 | 2 | 3 => {
+                let travel = roll_travel(f64::from(e.est_width), w, cfg.danmaku_speed_plus);
+                let a_tol = (travel.duration * (1.0 - density) / 2.0).floor() + 0.1;
+                // 本条头部到左缘的时刻(含官方右侧 50px 跑道;追尾判据 b 左端)。
+                let head_left_at = spawn + (w + ROLL_SAFE_PX) / travel.speed;
+                // 字幕池弹幕=官方特权口径(豁免 area、可溢出 band 1/2)。
+                let privileged = e.pool == 1;
+                let item_h = band_item_height(e.fontsize, font_scale);
+                // 官方 destroy=endTime 过期即移出占用表(等价语义)。
+                for band in &mut bands {
+                    band.retain(|s| s.to_left > spawn);
+                }
+                let mut chosen: Option<(usize, f64)> = None;
+                let mut deepest = f64::from(BAND_OFFSET_TOP);
+                'bands: for b in 0..3 {
+                    let list = &bands[b];
+                    let mut v = f64::from(BAND_OFFSET_TOP);
+                    let mut x = v + item_h;
+                    if list.is_empty() {
+                        chosen = Some((b, v));
+                        break 'bands;
+                    }
+                    for (si, s) in list.iter().enumerate() {
+                        if x > g {
+                            break;
+                        }
+                        if s.bottom <= v {
+                            continue; // 前条在候选上方,不挡。
+                        }
+                        if s.y > x {
+                            // 候选整段落在前条上方:空隙,放入。
+                            chosen = Some((b, v));
+                            break 'bands;
+                        }
+                        // y 区间重叠:追尾双判据(官方 t.x>S.x+S.w && t.middle>S.end+A)。
+                        if spawn >= s.to_right && head_left_at >= s.to_left + a_tol {
+                            if x <= s.bottom && !band_has_dm(list, si + 1, v, x) {
+                                chosen = Some((b, v));
+                                break 'bands;
+                            }
+                            continue;
+                        }
+                        // 走查下移(官方 v = S.bottom + 1,1px 连续步进)。
+                        v = s.bottom + 1.0;
+                        x = v + item_h;
+                        deepest = deepest.max(v);
+                        if !privileged && x > area_bottom {
+                            // 官方:area 下界越界整条丢弃(不试下一 band)。
+                            break 'bands;
+                        }
+                    }
+                    if x <= g {
+                        // 走查耗尽仍可用:落在最后候选位(可与追尾放行的前条同 y)。
+                        chosen = Some((b, v));
+                        break 'bands;
+                    }
+                    if !privileged {
+                        break 'bands;
+                    }
+                    // 特权弹幕 band 0 走满仍放不下 → 溢出下一 band(官方口径)。
+                }
+                match chosen {
+                    Some((b, y)) => {
+                        insert_occupant(&mut bands[b], y, item_h, spawn, e.est_width, &travel);
+                        e.lane = b as u16;
+                        e.y_off = y as f32;
+                        true
+                    }
+                    None if cfg.danmaku_overflow == DanmakuOverflow::Force => {
+                        // 项目扩展:官方无强插路径;Force 落 band 0 走查最深处,
+                        // 钳回可用高度内(≈旧 findMin 的"最早空出行"近似)。
+                        let y = deepest.min(g - item_h).max(f64::from(BAND_OFFSET_TOP));
+                        insert_occupant(&mut bands[0], y, item_h, spawn, e.est_width, &travel);
+                        e.lane = 0;
+                        e.y_off = y as f32;
+                        true
+                    }
+                    None => false,
+                }
+            }
+            4 | 5 => {
+                let slots_for_item = if e.pool == 1 { max_lanes } else { slots_cap };
+                let ends = if e.mode == 5 {
+                    &mut pin_end_top
+                } else {
+                    &mut pin_end_bottom
+                };
+                let free = ends.iter().position(|&end| spawn >= end);
+                let chosen = match free {
+                    Some(i) => Some(i),
+                    None if ends.len() < slots_for_item => {
+                        ends.push(0.0);
+                        Some(ends.len() - 1)
+                    }
+                    None if cfg.danmaku_overflow == DanmakuOverflow::Force => ends
+                        .iter()
+                        .enumerate()
+                        .min_by(|&(ia, &ea), &(ib, &eb)| {
+                            ea.partial_cmp(&eb)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then(ia.cmp(&ib))
+                        })
+                        .map(|(i, _)| i),
+                    None => None,
+                };
+                if let Some(i) = chosen {
+                    ends[i] = spawn + PIN_SECONDS;
+                    e.lane = i as u16;
+                }
+                chosen.is_some()
+            }
+            // 其他 mode 原样保留(渲染跳过),不参与分配。
+            _ => true,
+        };
+        if placed {
+            kept.push(e);
+        }
+    }
+    kept
+}
+
 /// 视频引擎句柄(线程安全;UI 侧克隆共享)。
 pub struct VideoEngine {
     cmd_tx: Sender<EngineCmd>,
@@ -638,30 +1115,10 @@ impl VideoEngine {
         _ = self.cmd_tx.send(EngineCmd::AppendDanmaku { items });
     }
 
-    /// 动态调整弹幕开关、不透明度与最大轨道数。
-    pub fn set_danmaku_config(
-        &self,
-        enabled: bool,
-        opacity: f32,
-        max_lanes: usize,
-        font_family: &str,
-        font_scale: f32,
-    ) {
-        _ = self.cmd_tx.send(EngineCmd::SetDanmakuConfig {
-            enabled,
-            opacity: opacity.clamp(0.1, 1.0),
-            max_lanes: max_lanes.clamp(1, 20),
-            font_family: if font_family.trim().is_empty() {
-                DANMAKU_DEFAULT_FONT.to_string()
-            } else {
-                font_family.trim().to_string()
-            },
-            font_scale: if font_scale.is_finite() {
-                font_scale.clamp(0.5, 2.0)
-            } else {
-                1.0
-            },
-        });
+    /// 动态调整弹幕样式(开关/透明度/轨道/字体/密度/区域/速度/防挡字幕;
+    /// 单一参数源 [`DanmakuStyle`],引擎线程 normalized 后写回配置)。
+    pub fn set_danmaku_config(&self, style: DanmakuStyle) {
+        _ = self.cmd_tx.send(EngineCmd::SetDanmakuConfig { style });
     }
 
     /// 动态更新弹幕过滤规则(网页版对齐;规则变化时引擎全量重滤已缓存弹幕)。
@@ -791,10 +1248,17 @@ impl DanmakuFonts {
         } else {
             1.0
         };
+        // 单行不变量:弹幕永远单行绘制,禁用折行。est_width 若略小于
+        // DWrite 实际排版宽,应表现为「尾部溢出」而非折成第二行——
+        // 默认 Wrap + DrawText 无 CLIP 时折行会叠进下一轨道
+        // (2026-11-22 弹幕折行排查根因)。
         Self {
-            small: TextFormat::new(family, 16.0 * scale),
-            medium: TextFormat::new(family, 22.0 * scale),
-            large: TextFormat::new(family, 30.0 * scale),
+            small: TextFormat::new(family, 16.0 * scale)
+                .with_word_wrapping(WordWrapping::NoWrap),
+            medium: TextFormat::new(family, 22.0 * scale)
+                .with_word_wrapping(WordWrapping::NoWrap),
+            large: TextFormat::new(family, 30.0 * scale)
+                .with_word_wrapping(WordWrapping::NoWrap),
         }
     }
 }
@@ -918,6 +1382,8 @@ fn engine_thread(
     // P1 resize 合并状态:拖拽期间只记最新目标尺寸,120ms 节流应用。
     let mut pending_resize: Option<SurfaceMetrics> = None;
     let mut resize_first_seen: Option<Instant> = None;
+    // 诊断:render_present 失败限频日志节拍(全屏白屏排查 2026-11-22)。
+    let mut last_render_err_log: Option<Instant> = None;
     let mut active_load_seq: u64 = 0;
     'main: loop {
         // 命令段：若有已取出的首条指令先消费，再一口气排空。
@@ -974,14 +1440,34 @@ fn engine_thread(
                     EngineCmd::SetDanmaku { items } => {
                         // 全量替换:重置去重表(新视频/分P 清层语义)。
                         overlay = dm_filter.filter_batch(items, &mut dm_dedup);
+                        // D1:ingest 出口统一轨道/槽位分配(升序重排在分配内完成);
+                        // 全量替换=新视频语义,无飞行条目,全量重排。
+                        overlay = realloc_lanes(
+                            std::mem::take(&mut overlay),
+                            &cfg,
+                            width as f32 / scale_x,
+                            height as f32 / scale_y,
+                            f64::NEG_INFINITY,
+                        );
                         need_repaint = true;
                     }
                     EngineCmd::AppendDanmaku { items } => {
                         let kept = dm_filter.filter_batch(items, &mut dm_dedup);
                         if !kept.is_empty() {
                             overlay.extend(kept);
-                            // 归并回 progress 升序(渲染二分扫描的不变量)。
-                            overlay.sort_by_key(|e| e.progress_ms);
+                            // D1:分段到货触发重排;跳变治理:已起飞条目保留原
+                            // y 分配,仅未出现的条目参与 packing(O(n) 单遍毫秒级)。
+                            let (ph_paused, ph_raw) = match status.lock() {
+                                Ok(s) => (s.pause, s.time_pos),
+                                Err(_) => (false, 0.0),
+                            };
+                            overlay = realloc_lanes(
+                                std::mem::take(&mut overlay),
+                                &cfg,
+                                width as f32 / scale_x,
+                                height as f32 / scale_y,
+                                playhead_estimate(&dm_time_anchor, ph_raw, ph_paused),
+                            );
                             need_repaint = true;
                         }
                     }
@@ -990,27 +1476,45 @@ fn engine_thread(
                         // 规则变化:已缓存弹幕全量重滤(升序重跑,保留窗口内首条)。
                         dm_dedup.clear();
                         let items = std::mem::take(&mut overlay);
-                        overlay = dm_filter.filter_batch(items, &mut dm_dedup);
+                        // D1:重滤后重跑分配;跳变治理同上(可见层不重排)。
+                        let (ph_paused, ph_raw) = match status.lock() {
+                            Ok(s) => (s.pause, s.time_pos),
+                            Err(_) => (false, 0.0),
+                        };
+                        overlay = realloc_lanes(
+                            dm_filter.filter_batch(items, &mut dm_dedup),
+                            &cfg,
+                            width as f32 / scale_x,
+                            height as f32 / scale_y,
+                            playhead_estimate(&dm_time_anchor, ph_raw, ph_paused),
+                        );
                         need_repaint = true;
                     }
-                    EngineCmd::SetDanmakuConfig {
-                        enabled,
-                        opacity,
-                        max_lanes,
-                        font_family,
-                        font_scale,
-                    } => {
-                        cfg.danmaku_enabled = enabled;
-                        cfg.danmaku_opacity = opacity.clamp(0.1, 1.0);
-                        cfg.danmaku_max_lanes = max_lanes.clamp(1, 20);
-                        // 字体族/字号变化 → 重建 DWrite 格式(F3)。
-                        if cfg.danmaku_font_family != font_family
-                            || (cfg.danmaku_font_scale - font_scale).abs() > f32::EPSILON
-                        {
-                            fonts = DanmakuFonts::with(&font_family, font_scale);
+                    EngineCmd::SetDanmakuConfig { style } => {
+                        // 字体族/字号变化 → 重建 DWrite 格式(F3);normalized 防
+                        // 手工编辑 settings.json 的越界值(与 settings.normalized 同口径)。
+                        let style = style.normalized();
+                        let font_changed = cfg.danmaku_font_family != style.font_family
+                            || (cfg.danmaku_font_scale - style.font_scale).abs() > f32::EPSILON;
+                        if font_changed {
+                            fonts = DanmakuFonts::with(&style.font_family, style.font_scale);
                         }
-                        cfg.danmaku_font_family = font_family;
-                        cfg.danmaku_font_scale = font_scale;
+                        style.apply_to(&mut cfg);
+                        // D1:轨道数/字号/密度/区域/速度/防挡字幕均影响准入与
+                        // 行高,变化即重跑分配。
+                        if !overlay.is_empty() {
+                            let (ph_paused, ph_raw) = match status.lock() {
+                                Ok(s) => (s.pause, s.time_pos),
+                                Err(_) => (false, 0.0),
+                            };
+                            overlay = realloc_lanes(
+                                std::mem::take(&mut overlay),
+                                &cfg,
+                                width as f32 / scale_x,
+                                height as f32 / scale_y,
+                                playhead_estimate(&dm_time_anchor, ph_raw, ph_paused),
+                            );
+                        }
                         need_repaint = true;
                     }
                     EngineCmd::SetHardwareDecode(enabled) => {
@@ -1101,8 +1605,31 @@ fn engine_thread(
                     height = metrics.height;
                     scale_x = metrics.scale_x;
                     scale_y = metrics.scale_y;
+                    // D1 触发时机③:宽度/缩放变化影响准入窗口,重跑分配。
+                    if !overlay.is_empty() {
+                        let (ph_paused, ph_raw) = match status.lock() {
+                            Ok(s) => (s.pause, s.time_pos),
+                            Err(_) => (false, 0.0),
+                        };
+                        overlay = realloc_lanes(
+                            std::mem::take(&mut overlay),
+                            &cfg,
+                            width as f32 / scale_x,
+                            height as f32 / scale_y,
+                            playhead_estimate(&dm_time_anchor, ph_raw, ph_paused),
+                        );
+                    }
                     configure_swap_chain(&mut surface.chain, scale_x, scale_y);
                     need_repaint = true;
+                    eprintln!(
+                        "ENG-RS: resize {}x{} (dip {}x{}) video_format={:?} gen={}",
+                        metrics.width,
+                        metrics.height,
+                        width as f32 / scale_x,
+                        height as f32 / scale_y,
+                        status.lock().ok().map(|s| s.video_format.clone()).unwrap_or_default(),
+                        mount.current_gen(),
+                    );
                     if let Ok(raw) = surface.chain.into_unknown_raw() {
                         let _ = mount.republish_new_gen(raw);
                     }
@@ -1146,7 +1673,13 @@ fn engine_thread(
                 height as f32 / scale_y,
             ) {
                 need_repaint = true;
-                let _ = e;
+                // 诊断:此错误原先被静默吞掉(仅重绘节流),全屏白屏排查 2026-11-22
+                // 需要现场证据 —— 限频 1s 打到 stderr(打包环境丢失,直跑调试可见)。
+                let now = Instant::now();
+                if last_render_err_log.map(|t| now.duration_since(t) >= Duration::from_secs(1)).unwrap_or(true) {
+                    last_render_err_log = Some(now);
+                    eprintln!("ENG-R: render_present 失败({width}x{height}):{e:?}");
+                }
             }
         }
 
@@ -1310,8 +1843,25 @@ fn render_present(
 
 // ---------- D2D 弹幕 overlay ----------
 
-/// 滚动弹幕横穿屏幕时长(秒)。
-const ROLL_SECONDS: f64 = 8.0;
+/// 滚动弹幕基准时长分段表(官方 `tz()`,npd.491 抓取研究 RESEARCH.md §3.3):
+/// `(屏宽上界, maxTime, minTime)`;命中规则=第一个 `屏宽 ≤ 上界` 的段的**前一段**。
+const ROLL_TIME_BRACKETS: [(f64, f64, f64); 8] = [
+    (558.0, 13.0, 7.0),
+    (888.0, 14.0, 8.0),
+    (1082.0, 14.0, 9.0),
+    (1246.0, 15.0, 10.0),
+    (1452.0, 16.0, 11.0),
+    (1744.0, 18.0, 13.0),
+    (2314.0, 20.0, 14.0),
+    (2560.0, 22.0, 16.0),
+];
+/// 屏宽超出最大段时每 500px 追加的时长(官方同款)。
+const ROLL_BRACKET_PX: f64 = 500.0;
+/// 官方 `defaultDuration` 兜底:屏宽 <558 或参数非法时恒定 4.5s。
+const ROLL_FALLBACK_SECS: f64 = 4.5;
+/// 官方 SAFE_LEFT/RIGHT(秒级几何余量,px):弹幕从屏外 50px 起笔、尾部越过
+/// 左缘 50px 才算退场——准入判据与 x 推导共用,保证「尾部过缘」时刻一致。
+const ROLL_SAFE_PX: f64 = 50.0;
 /// 底部/顶部弹幕驻留时长(秒)。
 const PIN_SECONDS: f64 = 4.0;
 /// 滚动弹幕默认轨道数。
@@ -1320,6 +1870,107 @@ const ROLL_LANES: usize = 10;
 const TIMEPOS_EPSILON: f64 = 0.020;
 /// 墙钟外推上限(秒;属性停更/卡顿时冻结,防漂移)。
 const TIMEPOS_EXTRAP_CAP: f64 = 0.25;
+
+/// 滚动弹幕基准时长(官方 `tz()` 移植;`docs/dev-notes/bilibili-danmaku-engine-research.md` §3.3)。
+///
+/// 屏宽分段 `[minTime, maxTime]` 内,以 Logistic 曲线把「字宽/屏宽比」映射为
+/// 时长:常规文本实际≈段内 minTime(1920 屏≈13.1s),超长弹幕才向 maxTime 弯折;
+/// 屏宽 <558(官方小窗口径)或参数非法回退 4.5s。分配与渲染共用,换屏宽时
+/// 由 realloc 重算。
+pub(crate) fn roll_base_secs(dm_width: f64, screen_width: f64) -> f64 {
+    if !dm_width.is_finite() || !screen_width.is_finite() || screen_width < ROLL_TIME_BRACKETS[0].0 {
+        return ROLL_FALLBACK_SECS;
+    }
+    let dm_width = dm_width.max(1.0);
+    let last = ROLL_TIME_BRACKETS.last().expect("分段表非空");
+    let (max_time, min_time) = if screen_width > last.0 {
+        // 官方:超出最大段每 500px 各 +1s(4K 屏更慢的手感来源)。
+        let extra = ((screen_width - last.0) / ROLL_BRACKET_PX).floor();
+        (last.1 + extra, last.2 + extra)
+    } else {
+        // 命中规则:第一个 `屏宽 ≤ 上界` 的段取其前一段(min/max)。
+        let mut picked = (last.1, last.2);
+        for pair in ROLL_TIME_BRACKETS.windows(2) {
+            if screen_width <= pair[1].0 {
+                picked = (pair[0].1, pair[0].2);
+                break;
+            }
+        }
+        picked
+    };
+    let span = max_time - min_time;
+    if span <= 0.0 {
+        return min_time;
+    }
+    // Logistic 中点(官方公式):u=(a-s)/0.1-1, l=ln(u)/0.2+0.2。
+    let u = span / 0.1 - 1.0;
+    if u <= 0.0 {
+        return min_time;
+    }
+    let mid = u.ln() / 0.2 + 0.2;
+    let secs = min_time + span / (1.0 + (-0.2 * (dm_width / screen_width - mid)).exp());
+    if secs.is_finite() && secs > 0.0 {
+        secs
+    } else {
+        ROLL_FALLBACK_SECS
+    }
+}
+
+/// 滚动弹幕运动学(官方几何):`speed=(屏宽+字宽)/base×speedPlus`,从屏外
+/// `ROLL_SAFE_PX` 起笔,尾部越过左缘 `ROLL_SAFE_PX` 才算退场。准入与渲染共用,
+/// 保证「尾部过缘」时刻与 x 推导一致。
+pub(crate) struct RollTravel {
+    /// 恒速 px/s(duration 模型:时长定速度,字越宽跑得越快)。
+    pub speed: f64,
+    /// 屏外起笔到完全退场的总时长(秒;含双侧 50px 跑道)。
+    pub duration: f64,
+}
+
+pub(crate) fn roll_travel(dm_width: f64, screen_width: f64, speed_plus: f32) -> RollTravel {
+    let w = if screen_width.is_finite() && screen_width > 0.0 {
+        screen_width
+    } else {
+        1.0
+    };
+    let tw = if dm_width.is_finite() && dm_width > 0.0 {
+        dm_width
+    } else {
+        1.0
+    };
+    let base = roll_base_secs(tw, w);
+    let plus = if speed_plus.is_finite() {
+        f64::from(speed_plus.clamp(0.5, 2.0))
+    } else {
+        1.0
+    };
+    let speed = (w + tw) / base * plus;
+    let duration = (w + ROLL_SAFE_PX + tw + ROLL_SAFE_PX) / speed;
+    RollTravel { speed, duration }
+}
+
+/// 渲染扫描窗口上界(秒):最宽基准(分段 maxTime)× 跑道系数 ÷ 最低倍速,
+/// 覆盖任意字宽的 duration 上界,窗口裁剪不漏条。
+pub(crate) fn roll_window_secs(screen_width: f64, speed_plus: f32) -> f64 {
+    let w = if screen_width.is_finite() && screen_width > 0.0 {
+        screen_width
+    } else {
+        1.0
+    };
+    let plus = if speed_plus.is_finite() {
+        f64::from(speed_plus.clamp(0.5, 2.0))
+    } else {
+        1.0
+    };
+    // maxTime(含超界段 +1s/500px)为 base 上界;跑道系数 ≤ 1+2×SAFE/W。
+    let last = ROLL_TIME_BRACKETS.last().expect("分段表非空");
+    let extra = if w > last.0 {
+        ((w - last.0) / ROLL_BRACKET_PX).floor()
+    } else {
+        0.0
+    };
+    let base_max = last.1 + extra;
+    base_max * (1.0 + 2.0 * ROLL_SAFE_PX / w) / plus
+}
 
 /// 弹幕时基:mpv time-pos 随视频帧步进,直接取值会让滚动锯齿化。
 /// 播放中在两次属性更新之间用墙钟线性外推;`raw_t` 与锚值差在容差内视为
@@ -1361,7 +2012,6 @@ pub(crate) fn draw_danmaku_overlay(
     }
     let width_f = dip_width;
     let height_f = dip_height;
-    let max_lanes = cfg.danmaku_max_lanes.max(1);
     let alpha = cfg.danmaku_opacity.clamp(0.1, 1.0);
     let shadow_alpha = (0.85 * alpha).clamp(0.1, 0.9);
     // 行高/估算宽随字号缩放(F3),保证大字号弹幕不重叠。
@@ -1370,11 +2020,12 @@ pub(crate) fn draw_danmaku_overlay(
     } else {
         1.0
     };
-    let lane_pitch = 30.0 * font_scale;
+    let speed_plus = cfg.danmaku_speed_plus;
     let char_width = 22.0 * font_scale;
     let text_slot_h = 34.0 * font_scale;
-    // 窗口起点(排序数据二分;[t-ROLL_SECONDS, t] 的滚动 + [t-PIN, t] 的顶底)。
-    let start = ((t - ROLL_SECONDS) * 1000.0) as i32;
+    // 窗口起点(排序数据二分;[t-滚动窗口上界, t] 的滚动 + [t-PIN, t] 的顶底)。
+    let window = roll_window_secs(f64::from(width_f), speed_plus);
+    let start = ((t - window) * 1000.0) as i32;
     let begin = items.partition_point(|e| e.progress_ms < start);
     for elem in &items[begin.min(items.len())..] {
         let progress = f64::from(elem.progress_ms) / 1000.0;
@@ -1386,28 +2037,36 @@ pub(crate) fn draw_danmaku_overlay(
         let content = elem.content.text();
         let (x, y) = match elem.mode {
             1 | 2 | 3 => {
-                if elapsed > ROLL_SECONDS {
+                // 官方滚动几何(与 allocate_lanes 共用 roll_travel):屏外
+                // SAFE_RIGHT 起笔,恒速横穿,尾部越过左缘 SAFE_RIGHT 退场。
+                let travel = roll_travel(
+                    f64::from(elem.est_width.max(1.0)),
+                    f64::from(width_f),
+                    speed_plus,
+                );
+                if elapsed > travel.duration {
                     continue;
                 }
-                let lane = usize::try_from(elem.progress_ms.unsigned_abs() % max_lanes as u32)
-                    .unwrap_or(0);
-                let x = (1.0 - elapsed / ROLL_SECONDS) * f64::from(width_f) * 1.15 - elapsed * 40.0;
-                (x as f32, 8.0 + lane as f32 * lane_pitch)
+                let x = width_f as f64 + ROLL_SAFE_PX - travel.speed * elapsed;
+                (x as f32, elem.y_off)
             }
             4 | 5 => {
                 if elapsed > PIN_SECONDS {
                     continue;
                 }
-                let est_w = content.chars().count() as f32 * char_width;
-                let x = (width_f - est_w).max(8.0) / 2.0;
+                // D3:驻留槽位堆叠(顶自上而下 / 底自下而上),替换固定 y 互叠。
+                let slot = f32::from(elem.lane);
+                let x = (width_f - elem.est_width.max(char_width)).max(8.0) / 2.0;
                 let y = match elem.mode {
-                    4 => (height_f - lane_pitch - 14.0).max(0.0),
-                    _ => 8.0,
+                    4 => (height_f - (slot + 1.0) * text_slot_h - 14.0).max(0.0),
+                    _ => 8.0 + slot * text_slot_h,
                 };
                 (x, y)
             }
             _ => continue,
         };
+        // 画框随估算宽度伸缩(旧实现固定 600px,长文裁切/短文留白)。
+        let draw_w = elem.est_width.max(char_width);
         let format = match elem.fontsize {
             ..=20 => &small,
             21..=28 => &medium,
@@ -1416,7 +2075,7 @@ pub(crate) fn draw_danmaku_overlay(
         let rect = Rect {
             left: x,
             top: y,
-            right: x + 600.0,
+            right: x + draw_w,
             bottom: y + text_slot_h,
         };
         // 描边(近似):黑底四向偏移各画一次。
@@ -1431,7 +2090,7 @@ pub(crate) fn draw_danmaku_overlay(
                 &Rect {
                     left: x + dx,
                     top: y + dy,
-                    right: x + dx + 600.0,
+                    right: x + dx + draw_w,
                     bottom: y + dy + text_slot_h,
                 },
                 &shadow,
@@ -1658,8 +2317,12 @@ mod tests {
                 fontsize: 22,
                 color: 0xFFFFFF,
                 content: "滚动".into(),
+                lane: 0,
+                y_off: 0.0,
+                est_width: 0.0,
                 mid_hash: None,
                 weight: 0,
+                pool: 0,
             },
             OverlayDanmaku {
                 progress_ms: 1000,
@@ -1667,8 +2330,12 @@ mod tests {
                 fontsize: 22,
                 color: 0xFFFFFF,
                 content: "底端".into(),
+                lane: 0,
+                y_off: 0.0,
+                est_width: 0.0,
                 mid_hash: None,
                 weight: 0,
+                pool: 0,
             },
             OverlayDanmaku {
                 progress_ms: 1000,
@@ -1676,8 +2343,12 @@ mod tests {
                 fontsize: 22,
                 color: 0xFFFFFF,
                 content: "顶端".into(),
+                lane: 0,
+                y_off: 0.0,
+                est_width: 0.0,
                 mid_hash: None,
                 weight: 0,
+                pool: 0,
             },
         ];
         let session = chain.begin_draw().expect("D2D begin_draw");
@@ -1704,8 +2375,12 @@ mod tests {
                 fontsize: 25,
                 color: 0xFFFFFF,
                 content: "大字号滚动".into(),
+                lane: 0,
+                y_off: 0.0,
+                est_width: 0.0,
                 mid_hash: None,
                 weight: 0,
+                pool: 0,
             },
             OverlayDanmaku {
                 progress_ms: 500,
@@ -1713,8 +2388,12 @@ mod tests {
                 fontsize: 25,
                 color: 0xFFFFFF,
                 content: "底部".into(),
+                lane: 0,
+                y_off: 0.0,
+                est_width: 0.0,
                 mid_hash: None,
                 weight: 0,
+                pool: 0,
             },
             OverlayDanmaku {
                 progress_ms: 500,
@@ -1722,8 +2401,12 @@ mod tests {
                 fontsize: 25,
                 color: 0xFFFFFF,
                 content: "顶部".into(),
+                lane: 0,
+                y_off: 0.0,
+                est_width: 0.0,
                 mid_hash: None,
                 weight: 0,
+                pool: 0,
             },
         ];
         let session = chain.begin_draw().expect("begin_draw");
@@ -1818,8 +2501,12 @@ mod tests {
             fontsize: 22,
             color,
             content: content.into(),
+            lane: 0,
+            y_off: 0.0,
+            est_width: 0.0,
             mid_hash: None,
             weight: 0,
+            pool: 0,
         };
         // 关键词:忽略大小写子串。
         let f = CompiledDanmakuFilter::compile(&DanmakuFilter {
@@ -1892,8 +2579,12 @@ mod tests {
             fontsize: 22,
             color: 0xFFFFFF,
             content: content.into(),
+            lane: 0,
+            y_off: 0.0,
+            est_width: 0.0,
             mid_hash: None,
             weight: 0,
+            pool: 0,
         };
         let f = CompiledDanmakuFilter::compile(&DanmakuFilter {
             block_repeat: true,
@@ -2035,5 +2726,649 @@ mod tests {
         player
             .loadfile("null://", None, BILI_HEADERS)
             .expect("带逗号 User-Agent 与 Referer 单独设项应成功");
+    }
+
+    /// D1 前置:全宽/半宽估算与字号缩放联动(准入与绘制共用同一估算)。
+    #[test]
+    fn danmaku_est_width_full_and_half_width_scale() {
+        // medium 档 em=22(fontsize 25 → 21..=28)。
+        assert!((danmaku_est_width(25, 1.0, "啊啊") - 44.0).abs() < 1e-4);
+        assert!((danmaku_est_width(25, 1.0, "ab") - 22.0 * 0.55 * 2.0).abs() < 1e-4);
+        assert!((danmaku_est_width(25, 2.0, "啊") - 44.0).abs() < 1e-4);
+        // 小/大档位基准 16/30。
+        assert!((danmaku_est_width(18, 1.0, "啊") - 16.0).abs() < 1e-4);
+        assert!((danmaku_est_width(36, 1.0, "啊") - 30.0).abs() < 1e-4);
+        // NaN 缩放回退 1.0;空串至少一个 em。
+        assert!((danmaku_est_width(25, f32::NAN, "啊") - 22.0).abs() < 1e-4);
+        assert!((danmaku_est_width(25, 1.0, "") - 22.0).abs() < 1e-4);
+    }
+
+    /// 折行回归(2026-11-22 截图实拍样本):以 est 宽为布局上限时必须单行。
+    /// 曾因估算 em 与绘制档位脱节 + TextFormat 默认 WordWrapping::Wrap
+    /// (中文逐字可断)+ DrawText 无 CLIP 而折成第二行、叠进下一轨道。
+    /// 「绝活哥」→「绝活/哥」、「是时代变得太快」→ 5+2 即当年实拍折行点。
+    #[test]
+    fn danmaku_formats_never_wrap_within_est_width() {
+        use windows_text::TextLayout;
+        let fonts = DanmakuFonts::new();
+        for (text, fontsize) in [
+            ("是时代变得太快", 25),
+            ("绝活哥", 25),
+            ("话说哥终究赢不了版本神?就", 25),
+            // 半宽混排:est 按半角 0.55em 高估,天然 ≥ natural,更不该折。
+            ("数字: 经典数学 / AI数学: 现代数学 了?", 25),
+            // 全角名单内新增字符(… — “”)不再被 0.55em 低估。
+            ("是时代变得…太快—“”", 36),
+        ] {
+            let est = danmaku_est_width(fontsize, 1.0, text);
+            let format = match fontsize {
+                ..=20 => &fonts.small,
+                21..=28 => &fonts.medium,
+                _ => &fonts.large,
+            };
+            let layout = TextLayout::new(text, format, est, 34.0);
+            assert_eq!(
+                layout.metrics().line_count,
+                1,
+                "est={est:.1} {text:?} 不应折行"
+            );
+        }
+        // NoWrap 判据:布局宽砍半(远小于任何真实排版宽)仍必须单行——
+        // 这一条只有禁用折行才可能通过,防止 WordWrapping 被回退成默认 Wrap。
+        let cramped = TextLayout::new("绝活哥", &fonts.medium, 30.0, 34.0);
+        assert_eq!(cramped.metrics().line_count, 1, "NoWrap 不应折行");
+    }
+
+    /// D1 验收:band packing 分配结果回填,同 band 内任意 y 区间重叠的对
+    /// 必须满足官方追尾双判据(独立重算校验);落位全部在可用高度内。
+    #[test]
+    fn allocate_lanes_overlapping_pairs_satisfy_tailgate() {
+        let mk = |ms: i32, long: bool| OverlayDanmaku {
+            progress_ms: ms,
+            mode: 1,
+            fontsize: 25,
+            color: 0xFFFFFF,
+            content: ContentRef::from(if long {
+                "很长很长很长很长很长的弹幕文本"
+            } else {
+                "短弹幕"
+            }),
+            lane: 0,
+            y_off: 0.0,
+            est_width: 0.0,
+            mid_hash: None,
+            weight: 0,
+            pool: 0,
+        };
+        let items: Vec<_> = (0..60).map(|i| mk(i * 250, i % 3 == 0)).collect();
+        let cfg = VideoConfig {
+            danmaku_max_lanes: 10,
+            ..VideoConfig::default()
+        };
+        let kept = allocate_lanes(items, &cfg, 1000.0, 600.0, f64::NEG_INFINITY);
+        assert!(!kept.is_empty(), "适度密度下应有条目保留");
+        let w = 1000.0_f64;
+        let item_h = 1.125 * 22.0; // fontsize 25 → em 22(官方行盒 1.125×字号)。
+        assert!(
+            kept.iter().all(|e| (e.lane as usize) < 3),
+            "常规弹幕只落 band 0..2(特权溢出口径)"
+        );
+        // g = min(高 600, offsetTop 8 + 10 轨×行距 30) = 308:落位不得越过。
+        assert!(
+            kept.iter()
+                .all(|e| f64::from(e.y_off) + item_h <= 308.0 + 1e-6),
+            "落位不得超过可用高度 g"
+        );
+        // 独立重算(官方判据):同 band 内 y 区间重叠的对,后条入场时前条尾部
+        // 已过右缘(a);后条头部到左缘(含右侧跑道)时前条已完全退场+密度容忍(b)。
+        for lane in 0..3usize {
+            let band: Vec<&OverlayDanmaku> = kept
+                .iter()
+                .filter(|e| e.lane as usize == lane)
+                .collect();
+            for (i, cur) in band.iter().enumerate() {
+                for prev in &band[..i] {
+                    let (py, cy) = (f64::from(prev.y_off), f64::from(cur.y_off));
+                    let overlap = py < cy + item_h && cy < py + item_h;
+                    if !overlap {
+                        continue;
+                    }
+                    let (ps, cs) = (
+                        f64::from(prev.progress_ms) / 1000.0,
+                        f64::from(cur.progress_ms) / 1000.0,
+                    );
+                    let (pw, cw) = (f64::from(prev.est_width), f64::from(cur.est_width));
+                    let prev_travel = roll_travel(pw, w, 1.0);
+                    let cur_travel = roll_travel(cw, w, 1.0);
+                    assert!(
+                        cs >= ps + pw / prev_travel.speed,
+                        "band {lane}@{}: 条件 a 被破坏",
+                        cur.progress_ms
+                    );
+                    assert!(
+                        cs + (w + ROLL_SAFE_PX) / cur_travel.speed
+                            >= ps + prev_travel.duration,
+                        "band {lane}@{}: 条件 b 被破坏",
+                        cur.progress_ms
+                    );
+                }
+            }
+        }
+    }
+
+    /// D1 验收:逐段到货的增量分配与一次到位全量分配结果一致。
+    #[test]
+    fn allocate_lanes_incremental_matches_full() {
+        let mk = |ms: i32, long: bool| OverlayDanmaku {
+            progress_ms: ms,
+            mode: 1,
+            fontsize: 25,
+            color: 0xFFFFFF,
+            content: ContentRef::from(if long { "很长很长很长的弹幕" } else { "短" }),
+            lane: 0,
+            y_off: 0.0,
+            est_width: 0.0,
+            mid_hash: None,
+            weight: 0,
+            pool: 0,
+        };
+        let all: Vec<_> = (0..40).map(|i| mk(i * 400, i % 2 == 0)).collect();
+        let cfg = VideoConfig {
+            danmaku_max_lanes: 8,
+            ..VideoConfig::default()
+        };
+        let full = allocate_lanes(all.clone(), &cfg, 1200.0, 700.0, f64::NEG_INFINITY);
+        // 分段预存链语义:每段到货即对累计集合全量重跑。
+        let mut incremental: Vec<OverlayDanmaku> = Vec::new();
+        for chunk in all.chunks(14) {
+            incremental.extend(chunk.iter().cloned());
+            incremental = allocate_lanes(incremental, &cfg, 1200.0, 700.0, f64::NEG_INFINITY);
+        }
+        assert_eq!(full.len(), incremental.len());
+        for (a, b) in full.iter().zip(&incremental) {
+            assert_eq!(a.progress_ms, b.progress_ms);
+            assert_eq!(a.lane, b.lane, "progress {} 车道漂移", a.progress_ms);
+            assert!(
+                (a.y_off - b.y_off).abs() < 1e-3,
+                "progress {} y 漂移",
+                a.progress_ms
+            );
+            assert!((a.est_width - b.est_width).abs() < 1e-3);
+        }
+    }
+
+    /// D1 验收:轨道全满 drop 丢弃、force 强放不丢条目(字太多的兜底例外)。
+    #[test]
+    fn allocate_lanes_overflow_drop_vs_force() {
+        let mk = |ms: i32| OverlayDanmaku {
+            progress_ms: ms,
+            mode: 1,
+            fontsize: 25,
+            color: 0xFFFFFF,
+            content: ContentRef::from("同刻弹幕"),
+            lane: 0,
+            y_off: 0.0,
+            est_width: 0.0,
+            mid_hash: None,
+            weight: 0,
+            pool: 0,
+        };
+        // 12 条同刻弹幕:同刻入场必互相冲突(尾部尚未过右缘),走查连续下移。
+        // g = min(600, 8 + 10×30) = 308,行盒 24.75 → band 0 容量 11 条
+        // (v=8+25.75k ≤ 283.25 → k=0..10),第 12 条越界丢弃(官方 Drop 口径)。
+        let items: Vec<_> = (0..12).map(|_| mk(5000)).collect();
+        let drop_cfg = VideoConfig {
+            danmaku_max_lanes: 10,
+            ..VideoConfig::default()
+        };
+        let force_cfg = VideoConfig {
+            danmaku_max_lanes: 10,
+            danmaku_overflow: DanmakuOverflow::Force,
+            ..VideoConfig::default()
+        };
+        let dropped = allocate_lanes(items.clone(), &drop_cfg, 1000.0, 600.0, f64::NEG_INFINITY);
+        assert_eq!(dropped.len(), 11, "band 0 走满(308px/24.75px 行盒=11 条)后丢弃");
+        assert!(
+            dropped
+                .iter()
+                .all(|e| f64::from(e.y_off) + 24.75 <= 308.0 + 1e-6),
+            "落位全部在可用高度内"
+        );
+        let forced = allocate_lanes(items, &force_cfg, 1000.0, 600.0, f64::NEG_INFINITY);
+        assert_eq!(forced.len(), 12, "force 策略不丢条目");
+        assert!(forced.iter().all(|e| (e.lane as usize) < 3));
+    }
+
+    /// D3 验收:同刻驻留弹幕各占独立槽位(顶/底独立),超时释放后槽位复用。
+    #[test]
+    fn allocate_lanes_pin_slots_stack_and_release() {
+        let mk_pin = |ms: i32, mode: i32| OverlayDanmaku {
+            progress_ms: ms,
+            mode,
+            fontsize: 25,
+            color: 0xFFFFFF,
+            content: ContentRef::from("驻留"),
+            lane: 0,
+            y_off: 0.0,
+            est_width: 0.0,
+            mid_hash: None,
+            weight: 0,
+            pool: 0,
+        };
+        let pin_cfg = VideoConfig {
+            danmaku_max_lanes: 10,
+            ..VideoConfig::default()
+        };
+        let kept = allocate_lanes(
+            vec![mk_pin(1000, 5), mk_pin(1000, 5), mk_pin(1000, 5)],
+            &pin_cfg,
+            1000.0,
+            600.0,
+            f64::NEG_INFINITY,
+        );
+        assert_eq!(kept.len(), 3, "顶部槽位足够时全部保留");
+        let mut slots: Vec<u16> = kept.iter().map(|e| e.lane).collect();
+        slots.sort();
+        assert_eq!(slots, vec![0, 1, 2], "同刻顶部弹幕堆叠到不同槽");
+        // 顶/底槽序独立:同刻一顶一底都落槽 0。
+        let both = allocate_lanes(
+            vec![mk_pin(1000, 4), mk_pin(1000, 5)],
+            &pin_cfg,
+            1000.0,
+            600.0,
+            f64::NEG_INFINITY,
+        );
+        assert_eq!(both[0].lane, 0);
+        assert_eq!(both[1].lane, 0);
+        // PIN_SECONDS 后槽位释放,新条复用槽 0。
+        let reused = allocate_lanes(vec![mk_pin(5000, 5)], &pin_cfg, 1000.0, 600.0, f64::NEG_INFINITY);
+        assert_eq!(reused[0].lane, 0);
+    }
+
+    /// 官方 tz 分段表边界(抓取研究 §3.3):屏宽 <558 兜底 4.5s;命中规则=
+    /// 第一个 `屏宽 ≤ 上界` 的段取前一段 [min,max];>2560 每 500px 各 +1s。
+    /// Logistic 中点在 ratio≈20+,常规文本实际≈段内 minTime。
+    #[test]
+    fn roll_base_secs_follows_official_brackets() {
+        // 屏宽 <558(官方小窗口径)与非法参数 → 4.5s 兜底。
+        assert!((roll_base_secs(200.0, 500.0) - 4.5).abs() < 1e-9);
+        assert!((roll_base_secs(f64::NAN, 1920.0) - 4.5).abs() < 1e-9);
+        // 常规短文本 ≈ 段内 minTime(容差覆盖 Logistic 尾部)。
+        let short = 100.0;
+        assert!(
+            (roll_base_secs(short, 558.0) - 7.0).abs() < 0.15,
+            "558px 段应≈7s, 实得 {}",
+            roll_base_secs(short, 558.0)
+        );
+        assert!((roll_base_secs(short, 888.0) - 7.0).abs() < 0.15, "888 仍属第一段");
+        assert!((roll_base_secs(short, 900.0) - 8.0).abs() < 0.15, "900 落第二段");
+        assert!((roll_base_secs(short, 1246.0) - 9.0).abs() < 0.15, "1246 边界取前一段");
+        // 2560 恰在边界上:官方命中规则取前一段 (2314 → min 14)。
+        assert!((roll_base_secs(short, 2560.0) - 14.0).abs() < 0.15);
+        // 超界段:4000px = 2560 + floor(1440/500)=2 段外加成 → min 16+2=18。
+        assert!((roll_base_secs(short, 4000.0) - 18.0).abs() < 0.15);
+        // 超长弹幕向 maxTime 弯折(单调),但不超过 maxTime 上界。
+        let long = roll_base_secs(4000.0, 1000.0);
+        assert!(long > roll_base_secs(short, 1000.0), "字越长时长越长");
+        assert!(long < 14.0, "1000px 段 maxTime=14, 实得 {long}");
+        // 1920 屏常规文本 ≈13.1s(官方手感锚点;1744-2314 段 min=13)。
+        assert!(
+            (roll_base_secs(short, 1920.0) - 13.1).abs() < 0.2,
+            "1920 屏应≈13.1s, 实得 {}",
+            roll_base_secs(short, 1920.0)
+        );
+    }
+
+    /// 运动学一致性:speed=(屏宽+字宽)/base×speedPlus,duration 含双侧 50px
+    /// 跑道;渲染扫描窗口必须 ≥ 任意条目的 duration(窗口裁剪不漏条)。
+    #[test]
+    fn roll_travel_and_window_consistent() {
+        let w = 1000.0_f64;
+        let tw = 220.0_f64;
+        let travel = roll_travel(tw, w, 1.0);
+        let base = roll_base_secs(tw, w);
+        assert!((travel.speed - (w + tw) / base).abs() < 1e-9);
+        assert!((travel.duration - (w + 2.0 * ROLL_SAFE_PX + tw) / travel.speed).abs() < 1e-9);
+        // speedPlus 放慢(0.5)时长翻倍,加速(2.0)减半。
+        assert!((roll_travel(tw, w, 0.5).duration - travel.duration * 2.0).abs() < 1e-6);
+        assert!((roll_travel(tw, w, 2.0).duration - travel.duration / 2.0).abs() < 1e-6);
+        // 窗口覆盖任意字宽的 duration(含极宽/极窄文本与多屏宽)。
+        for width in [360.0, 1000.0, 1920.0, 4000.0] {
+            let window = roll_window_secs(width, 1.0);
+            for tw in [16.0, 220.0, 2000.0, 8000.0] {
+                assert!(
+                    roll_travel(tw, width, 1.0).duration <= window,
+                    "w={width} tw={tw}: duration 超出扫描窗口"
+                );
+            }
+        }
+    }
+
+    /// 官方密度容忍 A:density 1.0(最密,A≈0.1)可接纳的间隔,在低密度
+    /// (A=floor(dur×(1-d))/2+0.1)下被拒绝。max_lanes=1 隔离出纯 A 效应。
+    #[test]
+    fn allocate_lanes_density_tolerance_orders_admission() {
+        let mk = |ms: i32| OverlayDanmaku {
+            progress_ms: ms,
+            mode: 1,
+            fontsize: 25,
+            color: 0xFFFFFF,
+            content: ContentRef::from("同宽弹幕"),
+            lane: 0,
+            y_off: 0.0,
+            est_width: 0.0,
+            mid_hash: None,
+            weight: 0,
+            pool: 0,
+        };
+        // 同宽 → 同速同时长;1000px 屏/88px 宽:base≈8.1s,dur≈8.84s,
+        // head_left-delta≈7.82s → Δ=2s 在 density=1.0(A≈0.1)可复用同一轨,
+        // 在 density=0.2(A≈3.6)被拒(Drop 下丢弃)。
+        let dense = allocate_lanes(
+            vec![mk(0), mk(2000)],
+            &VideoConfig {
+                danmaku_max_lanes: 1,
+                ..VideoConfig::default()
+            },
+            1000.0,
+            600.0,
+            f64::NEG_INFINITY,
+        );
+        assert_eq!(dense.len(), 2, "最密档 2s 间隔应复用同一轨");
+        let sparse = allocate_lanes(
+            vec![mk(0), mk(2000)],
+            &VideoConfig {
+                danmaku_max_lanes: 1,
+                danmaku_density: 0.2,
+                ..VideoConfig::default()
+            },
+            1000.0,
+            600.0,
+            f64::NEG_INFINITY,
+        );
+        assert_eq!(sparse.len(), 1, "低密度档 2s 间隔不足以复用同一轨");
+    }
+
+    /// 官方 area + 字幕池豁免:area 30% → area 下界 m=90px,行盒 24.75 的
+    /// 同刻弹幕只能堆 3 条(8/33.75/59.5,候选底 84.25≤90);字幕池(pool=1)
+    /// 特权豁免 area,band 0 容量 11 条 + band 1 溢出 1 条 = 12 条全保。
+    #[test]
+    fn allocate_lanes_area_limits_and_subtitle_pool_exempt() {
+        let mk = |pool: u8| OverlayDanmaku {
+            progress_ms: 5000,
+            mode: 1,
+            fontsize: 25,
+            color: 0xFFFFFF,
+            content: ContentRef::from("同刻弹幕"),
+            lane: 0,
+            y_off: 0.0,
+            est_width: 0.0,
+            mid_hash: None,
+            weight: 0,
+            pool,
+        };
+        let cfg = VideoConfig {
+            danmaku_max_lanes: 10,
+            danmaku_area: 30,
+            ..VideoConfig::default()
+        };
+        let normal: Vec<_> = (0..12).map(|_| mk(0)).collect();
+        let kept = allocate_lanes(normal, &cfg, 1000.0, 300.0, f64::NEG_INFINITY);
+        assert_eq!(kept.len(), 3, "area 30%(m=90px)只允许 3 条连续 y 堆叠");
+        assert!(
+            kept.iter()
+                .all(|e| f64::from(e.y_off) + 24.75 <= 90.0 + 1e-6),
+            "普通弹幕落位不得超过 area 下界"
+        );
+        let subtitle: Vec<_> = (0..12).map(|_| mk(1)).collect();
+        let exempted = allocate_lanes(subtitle, &cfg, 1000.0, 300.0, f64::NEG_INFINITY);
+        assert_eq!(exempted.len(), 12, "字幕池弹幕豁免 area,band 溢出后不丢");
+        assert_eq!(
+            exempted.iter().filter(|e| e.lane == 0).count(),
+            11,
+            "band 0 容量 11 条"
+        );
+        assert_eq!(
+            exempted.iter().filter(|e| e.lane == 1).count(),
+            1,
+            "第 12 条特权溢出 band 1(官方 3-band 口径)"
+        );
+    }
+
+    /// 高度感知:窗口过矮时可用高度 g 收缩,连续 y 堆叠数随之减少——
+    /// 206px 高窗口 g=206,行盒 24.75 → 7 条(8+25.75k ≤ 181.25 → k=0..6)。
+    #[test]
+    fn allocate_lanes_height_aware_lane_count() {
+        let mk = || OverlayDanmaku {
+            progress_ms: 5000,
+            mode: 1,
+            fontsize: 25,
+            color: 0xFFFFFF,
+            content: ContentRef::from("同刻弹幕"),
+            lane: 0,
+            y_off: 0.0,
+            est_width: 0.0,
+            mid_hash: None,
+            weight: 0,
+            pool: 0,
+        };
+        let cfg = VideoConfig {
+            danmaku_max_lanes: 10,
+            ..VideoConfig::default()
+        };
+        let items: Vec<_> = (0..12).map(|_| mk()).collect();
+        let kept = allocate_lanes(items, &cfg, 1000.0, 206.0, f64::NEG_INFINITY);
+        assert_eq!(kept.len(), 7, "矮窗口按高度收缩到 7 条连续 y 堆叠");
+        assert!(kept.iter().all(|e| (e.lane as usize) < 3));
+        assert!(
+            kept.iter()
+                .all(|e| f64::from(e.y_off) + 24.75 <= 206.0 + 1e-6),
+            "落位全部在容器高内"
+        );
+    }
+
+    /// 官方 preventShade(防挡字幕):碰撞可用高度×0.85。300px 高窗关闭时
+    /// g=300 → 11 条连续 y 堆叠,开启时 g=255 → 9 条(底部 15% 让位)。
+    #[test]
+    fn allocate_lanes_prevent_shade_shrinks_usable_height() {
+        let mk = || OverlayDanmaku {
+            progress_ms: 5000,
+            mode: 1,
+            fontsize: 25,
+            color: 0xFFFFFF,
+            content: ContentRef::from("同刻弹幕"),
+            lane: 0,
+            y_off: 0.0,
+            est_width: 0.0,
+            mid_hash: None,
+            weight: 0,
+            pool: 0,
+        };
+        let cfg = VideoConfig {
+            danmaku_max_lanes: 10,
+            ..VideoConfig::default()
+        };
+        let items: Vec<_> = (0..12).map(|_| mk()).collect();
+        let plain = allocate_lanes(items.clone(), &cfg, 1000.0, 300.0, f64::NEG_INFINITY);
+        assert_eq!(plain.len(), 11, "无防挡字幕:300px 容 11 条");
+        let cfg_shade = VideoConfig {
+            danmaku_max_lanes: 10,
+            danmaku_prevent_shade: true,
+            ..VideoConfig::default()
+        };
+        let shaded = allocate_lanes(items, &cfg_shade, 1000.0, 300.0, f64::NEG_INFINITY);
+        assert_eq!(shaded.len(), 9, "防挡字幕:底部 15% 让位 → 9 条");
+        assert!(
+            shaded
+                .iter()
+                .all(|e| f64::from(e.y_off) + 24.75 <= 255.0 + 1e-6),
+            "防挡字幕落位不得超过 0.85×高"
+        );
+    }
+
+    /// 官方 2D packing 的连续 y:混排字号按各自行盒(1.125×字号)紧凑堆叠,
+    /// 小字号落位不在旧 30px 行距栅格上(小字号 y=大字号行盒底+1)。
+    #[test]
+    fn allocate_lanes_mixed_sizes_pack_continuous_y() {
+        let mk = |ms: i32, fontsize: i32| OverlayDanmaku {
+            progress_ms: ms,
+            mode: 1,
+            fontsize,
+            color: 0xFFFFFF,
+            content: ContentRef::from("混排弹幕"),
+            lane: 0,
+            y_off: 0.0,
+            est_width: 0.0,
+            mid_hash: None,
+            weight: 0,
+            pool: 0,
+        };
+        let cfg = VideoConfig {
+            danmaku_max_lanes: 6,
+            ..VideoConfig::default()
+        };
+        // 同刻大字号(em30,行盒 33.75)+小字号(em16,行盒 18):后者贴前者下方。
+        let kept = allocate_lanes(
+            vec![mk(5000, 36), mk(5000, 18)],
+            &cfg,
+            1000.0,
+            600.0,
+            f64::NEG_INFINITY,
+        );
+        assert_eq!(kept.len(), 2);
+        let (tall_y, small_y) = (f64::from(kept[0].y_off), f64::from(kept[1].y_off));
+        assert!((tall_y - 8.0).abs() < 1e-6, "首条落打包起点");
+        let expect = 8.0 + 1.125 * 30.0 + 1.0; // 走查下移 = 大行盒底 + 1px。
+        assert!(
+            (small_y - expect).abs() < 1e-4,
+            "小字号应连续贴排 y={small_y},期望 {expect}(非 30px 栅格 38)"
+        );
+    }
+
+    /// 跳变治理:playhead 之前的条目(已起飞)保留原 y 分配,不参与重排;
+    /// 后打包条目以飞行占用播种,绕开可见弹幕(重叠必须满足追尾双判据)。
+    #[test]
+    fn realloc_preserves_flying_y_and_packs_around_them() {
+        let mk = |ms: i32| OverlayDanmaku {
+            progress_ms: ms,
+            mode: 1,
+            fontsize: 25,
+            color: 0xFFFFFF,
+            content: ContentRef::from("跳变治理弹幕"),
+            lane: 0,
+            y_off: 0.0,
+            est_width: 0.0,
+            mid_hash: None,
+            weight: 0,
+            pool: 0,
+        };
+        let cfg = VideoConfig {
+            danmaku_max_lanes: 4,
+            ..VideoConfig::default()
+        };
+        // 第一遍:全量打包两条同刻弹幕(必然上下堆叠)。
+        let first = allocate_lanes(
+            vec![mk(1000), mk(1000)],
+            &cfg,
+            1000.0,
+            600.0,
+            f64::NEG_INFINITY,
+        );
+        assert_eq!(first.len(), 2);
+        let (y0, y1) = (first[0].y_off, first[1].y_off);
+        assert!((y1 - (y0 + 1.125 * 22.0 + 1.0)).abs() < 1e-4, "第二条紧贴第一条下方");
+        // 第二遍:playhead=2s(两条均已起飞)→ y 保持不变,可见层零跳变。
+        let reflowed = allocate_lanes(first.clone(), &cfg, 1000.0, 600.0, 2.0);
+        assert_eq!(reflowed[0].y_off, y0, "飞行条目 y 不变");
+        assert_eq!(reflowed[1].y_off, y1, "飞行条目 y 不变");
+        // 第三遍:playhead=5s(第一条飞行中,第二条为新到货)→ 第一条保持,
+        // 第二条重打包且与飞行条目重叠时必须满足追尾双判据(官方同 y 复用口径)。
+        let mixed = allocate_lanes(
+            vec![first[0].clone(), mk(9000)],
+            &cfg,
+            1000.0,
+            600.0,
+            5.0,
+        );
+        assert_eq!(mixed.len(), 2);
+        assert_eq!(mixed[0].y_off, y0, "飞行条目 y 不变");
+        let flying = &mixed[0];
+        let ahead = &mixed[1];
+        assert!(f64::from(ahead.y_off) >= f64::from(BAND_OFFSET_TOP));
+        let overlap = f64::from(ahead.y_off) < f64::from(flying.y_off) + 1.125 * 22.0
+            && f64::from(flying.y_off) < f64::from(ahead.y_off) + 1.125 * 22.0;
+        if overlap {
+            let (ps, cs) = (
+                f64::from(flying.progress_ms) / 1000.0,
+                f64::from(ahead.progress_ms) / 1000.0,
+            );
+            let flying_travel = roll_travel(f64::from(flying.est_width), 1000.0, 1.0);
+            let ahead_travel = roll_travel(f64::from(ahead.est_width), 1000.0, 1.0);
+            assert!(
+                cs >= ps + f64::from(flying.est_width) / flying_travel.speed,
+                "与飞行条目同 y 必须满足追尾判据 a"
+            );
+            assert!(
+                cs + (1000.0 + ROLL_SAFE_PX) / ahead_travel.speed
+                    >= ps + flying_travel.duration,
+                "与飞行条目同 y 必须满足追尾判据 b"
+            );
+        }
+    }
+
+    /// playhead=0(未起播)时 progress_ms=0 的条目必须参与打包——严格 <
+    /// 边界防止 0 时刻弹幕被误判为飞行条目(y_off=0 直落顶端裁切)。
+    #[test]
+    fn allocate_lanes_packs_zero_progress_items_at_playhead_zero() {
+        let mk = || OverlayDanmaku {
+            progress_ms: 0,
+            mode: 1,
+            fontsize: 25,
+            color: 0xFFFFFF,
+            content: ContentRef::from("零时刻弹幕"),
+            lane: 0,
+            y_off: 0.0,
+            est_width: 0.0,
+            mid_hash: None,
+            weight: 0,
+            pool: 0,
+        };
+        let cfg = VideoConfig {
+            danmaku_max_lanes: 4,
+            ..VideoConfig::default()
+        };
+        let kept = allocate_lanes(vec![mk(), mk()], &cfg, 1000.0, 600.0, 0.0);
+        assert_eq!(kept.len(), 2, "零时刻弹幕不得被跳过打包");
+        assert!(
+            kept.iter()
+                .all(|e| f64::from(e.y_off) >= f64::from(BAND_OFFSET_TOP)),
+            "全部条目必须获得合法打包 y"
+        );
+    }
+
+    /// DanmakuStyle.normalized 钳位口径与 settings.normalized 一致
+    /// (防 settings.json 手工越界值直灌引擎线程)。
+    #[test]
+    fn danmaku_style_normalizes_out_of_range_values() {
+        let style = DanmakuStyle {
+            enabled: true,
+            opacity: 5.0,
+            max_lanes: 0,
+            font_family: "  ".into(),
+            font_scale: f32::NAN,
+            density: -1.0,
+            area: 200,
+            speed_plus: 9.0,
+            prevent_shade: true,
+        }
+        .normalized();
+        assert!((style.opacity - 1.0).abs() < f32::EPSILON);
+        assert_eq!(style.max_lanes, 1);
+        assert!((style.density - 0.1).abs() < f32::EPSILON);
+        assert_eq!(style.area, 100);
+        assert!((style.speed_plus - 2.0).abs() < f32::EPSILON);
+        // 字体族空白不在此钳(与旧行为一致:引擎线程 DanmakuFonts::with 处理;
+        // normalized 只管数值域)。
+        assert_eq!(style.font_scale, 1.0);
     }
 }

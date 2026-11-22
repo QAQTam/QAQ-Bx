@@ -269,6 +269,10 @@ pub struct PlayerInput {
     /// 全屏不再另建一个渲染面 —— 同一个 keyed 播放页组件必须留在原树位置,
     /// 否则 native 的 MPE 被销毁并强制换源重载。
     pub fullscreen: bool,
+    /// 全屏期间的真实窗口高度(DIP;shell 逐 resize 静默跟踪,settled 收敛)。
+    /// 竖屏单列全屏的视频面按它铺满窗口 —— 此时 `layout` 已冻结为竖屏几何,
+    /// 不能再从 layout 取高度。非全屏模式不消费。
+    pub fullscreen_window_height: f64,
     /// 半窗呈现模式:同一 PlayerPage 收进右侧抽屉,渲染面路径与主窗**完全一致**
     /// (仍走桌面双栏分支,不切单列 early-return),只改属性。这样半窗↔主窗
     /// 是同一 keyed 组件的 input 变化,native 不换源重载。
@@ -322,6 +326,7 @@ impl PartialEq for PlayerInput {
             && self.on_enter_fullscreen == other.on_enter_fullscreen
             && self.demo_override == other.demo_override
             && self.fullscreen == other.fullscreen
+            && (self.fullscreen_window_height - other.fullscreen_window_height).abs() < 0.5
             && self.pane_mode == other.pane_mode
             && (self.pane_width - other.pane_width).abs() < 0.5
             && (self.pane_max_width - other.pane_max_width).abs() < 0.5
@@ -858,11 +863,19 @@ impl Component for PlayerPage {
         // Mobile / Medium 单列：参照 Bilibili 手机端结构，顶部吸顶「16:9 视频 + 单行紧凑播控 + 简介/评论双页签」，
         // 下方切换独立滚动：「简介」含 UP/标题/折叠简介/4 等分互动 + 相关推荐；「评论」直达评论区。
         if is_single_col {
-            let video_h = input.layout.player_video_height();
+            // 全屏(竖屏单列)只允许属性切换,树形与 keyed 路径不变(MPE 不销毁):
+            // 视频面铺满真实全屏窗口高度,播控条/页签零高收起,根行翻转让下方
+            // 滚动区零高 —— 页面内容与壳层底栏由 shell 侧同步收起。
+            let fs = single_column_fullscreen_attrs(
+                input.fullscreen,
+                input.layout.player_video_height(),
+                input.fullscreen_window_height,
+                margin_x,
+            );
             let sticky_video = Border::new()
-                .height(video_h)
-                .margin(Thickness::new(margin_x, 4.0, margin_x, 0.0))
-                .corner_radius(8.0)
+                .height(fs.video_height)
+                .margin(fs.video_margin)
+                .corner_radius(fs.video_corner_radius)
                 .content(surface);
 
             let comments_label = comments_tab_label(input.comments.data.total_count);
@@ -901,17 +914,25 @@ impl Component for PlayerPage {
                     )
             };
 
-            let tab_bar = StackPanel::new().children((
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(22.0)
-                    .margin(Thickness::new(margin_x, 2.0, margin_x, 0.0))
-                    .children((
-                        tab_item(PlayerTab::Intro, "简介".to_string()),
-                        tab_item(PlayerTab::Comments, comments_label),
-                    )),
-                Border::new().height(1.0).background(ThemeBrush::CardStroke),
-            ));
+            let tab_bar = {
+                let bar = StackPanel::new().children((
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(22.0)
+                        .margin(Thickness::new(margin_x, 2.0, margin_x, 0.0))
+                        .children((
+                            tab_item(PlayerTab::Intro, "简介".to_string()),
+                            tab_item(PlayerTab::Comments, comments_label),
+                        )),
+                    Border::new().height(1.0).background(ThemeBrush::CardStroke),
+                ));
+                // 全屏:页签行零高 + 透明收起(属性切换,不摘子级)。
+                if input.fullscreen {
+                    bar.height(0.0).opacity(0.0)
+                } else {
+                    bar
+                }
+            };
 
             let sticky_top = StackPanel::new().grid_row(0).children((
                 View::from(sticky_video),
@@ -1038,7 +1059,7 @@ impl Component for PlayerPage {
             )]);
 
             return Grid::new()
-                .rows([GridLength::Auto, GridLength::Star(1.0)])
+                .rows(fs.rows)
                 .children((View::from(sticky_top), View::from(lower_scroll)))
                 .into();
         }
@@ -1167,7 +1188,10 @@ impl Component for PlayerPage {
                 } else {
                     Thickness::new(16.0, 16.0, RIGHT_RAIL_WIDTH + 12.0, 0.0)
                 })
-                .corner_radius(if input.fullscreen { 0.0 } else { 8.0 })
+                // 全屏保持 1 DIP 圆角裁剪:铺满客户区 + 纯色底 + 圆角 0 会让
+                // MPE presenter 的 HWCompMediaNode 被合成器丢弃(v0.4.0 排查,
+                // 竖屏全屏白屏同因,2026-11-22 E21 复现)。视觉不可见。
+                .corner_radius(if input.fullscreen { 1.0 } else { 8.0 })
                 .horizontal_alignment(HorizontalAlignment::Stretch)
                 .vertical_alignment(if input.fullscreen {
                     VerticalAlignment::Stretch
@@ -2640,6 +2664,51 @@ pub(crate) fn quality_selector(
     Some(combo.into())
 }
 
+/// 竖屏单列树的全屏属性切换集(唯一允许的变化面 —— 树形/keyed 路径必须不变,
+/// 否则播放面组件销毁 → native MPE 换源重载,见 `shell_root_view` 注释):
+/// 全屏时视频面铺满真实全屏窗口高度(`fullscreen_window_height`;此时 `layout`
+/// 已冻结为竖屏几何,不能从 layout 取高度),播控条/页签零高收起,根行翻转为
+/// [Star, 0] 让下方简介/评论滚动区零高。
+pub(crate) struct SingleColumnFullscreenAttrs {
+    pub video_height: f64,
+    pub video_margin: Thickness,
+    pub video_corner_radius: f64,
+    pub rows: [GridLength; 2],
+}
+
+pub(crate) fn single_column_fullscreen_attrs(
+    fullscreen: bool,
+    layout_video_height: f64,
+    fullscreen_window_height: f64,
+    margin_x: f64,
+) -> SingleColumnFullscreenAttrs {
+    if !fullscreen {
+        return SingleColumnFullscreenAttrs {
+            video_height: layout_video_height,
+            video_margin: Thickness::new(margin_x, 4.0, margin_x, 0.0),
+            video_corner_radius: 8.0,
+            rows: [GridLength::Auto, GridLength::Star(1.0)],
+        };
+    }
+    // 全屏高度尚未同步(0/负/NaN,enter 首帧)时退回布局高度:宁可暂不满铺,
+    // 不得 0 高 —— settled 重绘随 shell 跟踪值收敛。
+    let video_height = if fullscreen_window_height.is_finite() && fullscreen_window_height > 1.0 {
+        fullscreen_window_height
+    } else {
+        layout_video_height
+    };
+    SingleColumnFullscreenAttrs {
+        video_height,
+        video_margin: Thickness::new(0.0, 0.0, 0.0, 0.0),
+        // WinUI 3 DirectComposition workaround(见 fullscreen.rs 同款注释):
+        // 包围 Border 无非零圆角裁剪时,MediaPlayerPresenter 的 HWCompMediaNode
+        // 在「铺满整个客户区 + 纯色 backdrop」下会被合成器丢弃 —— 全屏视频区
+        // 白屏(E21 实测复现)。1 DIP 圆角视觉不可见,仅为保住合成链。
+        video_corner_radius: 1.0,
+        rows: [GridLength::Star(1.0), GridLength::Pixel(0.0)],
+    }
+}
+
 /// 竖屏/单列播放页单行紧凑播控条。
 pub(crate) fn single_column_transport(input: &PlayerInput, margin_x: f64) -> View {
     let play_btn = play_pause_button(input.playing, true, false, input.on_toggle.clone());
@@ -2653,9 +2722,15 @@ pub(crate) fn single_column_transport(input: &PlayerInput, margin_x: f64) -> Vie
     let fullscreen_btn =
         fullscreen_toggle_button(false, true, false, input.on_enter_fullscreen.clone());
 
-    Grid::new()
+    let grid = Grid::new()
         .columns([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
-        .margin(Thickness::new(margin_x, 4.0, margin_x, 0.0))
+        // 全屏:播控条零高 + 透明收起(属性切换,树形不变)。
+        .margin(Thickness::new(
+            margin_x,
+            if input.fullscreen { 0.0 } else { 4.0 },
+            margin_x,
+            0.0,
+        ))
         .children((
             play_btn,
             seek_slider(input.position, input.duration_secs, input.on_seek.clone())
@@ -2700,8 +2775,12 @@ pub(crate) fn single_column_transport(input: &PlayerInput, margin_x: f64) -> Vie
                     items.push(fullscreen_btn);
                     items
                 }),
-        ))
-        .into()
+        ));
+    if input.fullscreen {
+        grid.height(0.0).opacity(0.0).into()
+    } else {
+        grid.into()
+    }
 }
 
 /// 分P选择器（U3）：ComboBox 呈现 "P{n} 标题"；少于 2 个分P返回 None。
@@ -3337,8 +3416,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn portrait_single_column_transport_omits_quality_header() {
+    /// 单列播控/全屏属性切换共用的测试输入(竖屏 initial 布局,单列成立)。
+    fn fullscreen_switch_input(fullscreen: bool, fs_window_height: f64) -> super::PlayerInput {
         let engine = super::VideoEngine::new();
         let item = super::VideoItem {
             bvid: "BV1GJ411x7h7".into(),
@@ -3362,13 +3441,14 @@ mod tests {
         let noop_f64 = super::Callback::new(|_: f64| {});
         let layout = super::ViewportLayout::initial(true);
         assert!(layout.is_single_column(), "竖屏模式应走单列布局");
-        let input = super::PlayerInput {
+        super::PlayerInput {
             item,
             author_avatar: None,
             my_avatar: None,
             desc: None,
             playing: true,
-            fullscreen: false,
+            fullscreen,
+            fullscreen_window_height: fs_window_height,
             pane_mode: false,
             pane_width: 0.0,
             pane_max_width: 0.0,
@@ -3406,7 +3486,12 @@ mod tests {
             on_enter_fullscreen: noop_unit,
             related: super::RelatedPane::default(),
             demo_override: None,
-        };
+        }
+    }
+
+    #[test]
+    fn portrait_single_column_transport_omits_quality_header() {
+        let input = fullscreen_switch_input(false, 0.0);
         let transport = super::single_column_transport(&input, input.layout.page_margin_x());
         let dbg = format!("{transport:?}");
         assert!(dbg.contains("player-quality-selector"));
@@ -3414,6 +3499,72 @@ mod tests {
         assert!(
             !dbg.contains("画质"),
             "竖屏模式视频页面播控条不得出现“画质”二字"
+        );
+    }
+
+    #[test]
+    fn single_column_fullscreen_attrs_stretch_video_and_collapse_rows() {
+        // 全屏:视频面用真实全屏窗口高度(不是被冻结的竖屏 layout 高度),
+        // 边距清零,根行翻转为 [Star, 0] 让简介/评论滚动区零高。
+        let fs = super::single_column_fullscreen_attrs(true, 480.0, 864.0, 12.0);
+        assert_eq!(fs.video_height, 864.0, "全屏视频面必须铺满全屏窗口高度");
+        assert_eq!(fs.video_margin, super::Thickness::new(0.0, 0.0, 0.0, 0.0));
+        // 1 DIP 圆角裁剪是 MPE presenter 合成 workaround(铺满客户区+纯色底+
+        // 圆角 0 会被 DirectComposition 丢弃 → 白屏),不得回到 0。
+        assert_eq!(fs.video_corner_radius, 1.0);
+        assert_eq!(
+            fs.rows,
+            [super::GridLength::Star(1.0), super::GridLength::Pixel(0.0)]
+        );
+
+        // 非全屏:与旧单列几何逐字段一致(回归基线,禁止顺手改普通模式)。
+        let normal = super::single_column_fullscreen_attrs(false, 480.0, 864.0, 12.0);
+        assert_eq!(normal.video_height, 480.0);
+        assert_eq!(
+            normal.video_margin,
+            super::Thickness::new(12.0, 4.0, 12.0, 0.0)
+        );
+        assert_eq!(normal.video_corner_radius, 8.0);
+        assert_eq!(
+            normal.rows,
+            [super::GridLength::Auto, super::GridLength::Star(1.0)]
+        );
+
+        // 全屏高度未同步(enter 首帧 0/NaN)时退回布局高度:不得 0 高。
+        let degenerate = super::single_column_fullscreen_attrs(true, 480.0, 0.0, 12.0);
+        assert_eq!(degenerate.video_height, 480.0);
+        let nan = super::single_column_fullscreen_attrs(true, 480.0, f64::NAN, 12.0);
+        assert_eq!(nan.video_height, 480.0);
+    }
+
+    #[test]
+    fn single_column_transport_keeps_identical_kind_tree_across_fullscreen() {
+        fn kinds(view: &super::View) -> Vec<String> {
+            let dbg = format!("{view:?}");
+            dbg.split("kind: ")
+                .skip(1)
+                .map(|tail| {
+                    tail.chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect::<String>()
+                })
+                .filter(|s| !s.is_empty())
+                .collect()
+        }
+        let normal = fullscreen_switch_input(false, 0.0);
+        let fullscreen = fullscreen_switch_input(true, 864.0);
+        let normal_view = super::single_column_transport(&normal, normal.layout.page_margin_x());
+        let fs_view =
+            super::single_column_transport(&fullscreen, fullscreen.layout.page_margin_x());
+        assert_eq!(
+            kinds(&normal_view),
+            kinds(&fs_view),
+            "全屏不得改变单列播控树形(组件/keyed 路径不变,MPE 不销毁)"
+        );
+        assert_ne!(
+            format!("{normal_view:?}"),
+            format!("{fs_view:?}"),
+            "全屏切换必须翻转属性(高度/边距/透明收起),否则收起未生效"
         );
     }
 

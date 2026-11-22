@@ -3,8 +3,13 @@
 //! 契约锚 `docs/bilibili-api-inventory.md` §3：每段 6 分钟（360s），
 //! `segment_index` 从 1 起；响应为 `DmSegMobileReply` protobuf（magic `0a…`
 //! = len-delim field 1 = 弹幕元素数组）。不引入 prost——渲染只需要
-//! `progress/mode/fontsize/color/content` 五个字段，手写 wire 解析
-//! （单测锚定字节级契约），schema 差异由"未知字段跳过"兜底。
+//! `progress/mode/fontsize/color/content` 与屏蔽/豁免用的
+//! `mid_hash/weight/pool`，手写 wire 解析（单测锚定字节级契约），
+//! schema 差异由"未知字段跳过"兜底。
+//!
+//! 字段号以官方网页播放器内嵌 schema 为准（2026-11 抓取研究,
+//! `docs/dev-notes/bilibili-danmaku-engine-research.md` §2.3）：weight=field 9
+//! (varint)、dmid=field 12 (string)、pool=field 11 (varint)。
 //!
 //! 注:`dm/web/view` 元信息端点实测同样返回 protobuf（非 JSON,2024-11 实弹）,
 //! 而分段数可由视频 duration 直接推导,故不请求该端点。
@@ -46,8 +51,12 @@ pub struct DanmakuElem {
     pub content_len: u32,
     /// 发送者 mid 的 CRC32（field 6,8 位 hex 串直解；非 hex/缺失 = None）。
     pub mid_hash: Option<u32>,
-    /// 云屏蔽权重（field 12;0 = 未下发。权重越低越疑似垃圾,网页版智能屏蔽同源）。
+    /// 云屏蔽权重（field 9 varint;0 = 未下发。权重越低越疑似垃圾,
+    /// 网页版智能屏蔽同源;官方 schema 佐证见研究文档 §2.3/§2.4）。
     pub weight: u32,
+    /// 弹幕池（field 11 varint;0=普通 1=字幕 2=特殊/BAS;1 号池为官方
+    /// 碰撞分配的「特权弹幕」豁免来源）。
+    pub pool: u8,
 }
 
 /// 一个分段：原始 protobuf 缓冲（`Bytes`,网络层零拷贝直达）+ 元素偏移表。
@@ -130,7 +139,11 @@ impl DanmakuClient {
                 ("oid", cid.to_string()),
                 ("pid", aid.to_string()),
                 ("segment_index", segment_index.to_string()),
-                ("pull_mode", "1".into()),
+                // 实测(2026-11,probe_dm_pullmode,两视频交叉验证):pull_mode=1
+                // 只让 segment_index=1 返回开头 ~1 分钟的弹幕(130/510 条),
+                // 1 分钟后到段尾全空 → 播放开头「一窝蜂」且随后长期无弹幕。
+                // pull_mode=0 与缺省均返回全段覆盖,取 0 显式锁定。
+                ("pull_mode", "0".into()),
             ])
             .await?;
         let bytes = get_bytes_with_ticket(
@@ -190,8 +203,11 @@ pub fn parse_segment(data: Bytes) -> Result<DanmakuSegment> {
 }
 
 /// 解析一条 `DanmakuElem`（2=progress 3=mode 4=fontsize 5=color 6=midHash
-/// 7=content 12=weight;无 content 的记录丢弃）。元素偏移为 `buf` 内绝对位置
-/// (子消息切片零拷贝,文本仅在 [`DanmakuSegment::content`] 调用时解码)。
+/// 7=content 9=weight 11=pool;12=dmid 字符串,只跳过不消费——历史上曾误把
+/// field 12 当 weight 读,真实数据里它是 len-delim 字符串,(12,0) 永不命中,
+/// 导致 weight 恒 0、智能屏蔽静默失效）。无 content 的记录丢弃。
+/// 元素偏移为 `buf` 内绝对位置(子消息切片零拷贝,文本仅在
+/// [`DanmakuSegment::content`] 调用时解码)。
 fn parse_elem(buf: &[u8], start: usize, end: usize) -> Option<DanmakuElem> {
     let bytes = buf.get(start..end)?;
     let mut elem = DanmakuElem {
@@ -203,6 +219,7 @@ fn parse_elem(buf: &[u8], start: usize, end: usize) -> Option<DanmakuElem> {
         content_len: 0,
         mid_hash: None,
         weight: 0,
+        pool: 0,
     };
     let mut has_content = false;
     let mut pos = 0usize;
@@ -233,7 +250,8 @@ fn parse_elem(buf: &[u8], start: usize, end: usize) -> Option<DanmakuElem> {
                 has_content = true;
                 pos = end;
             }
-            (12, 0) => elem.weight = read_varint(bytes, &mut pos).ok()? as u32,
+            (9, 0) => elem.weight = read_varint(bytes, &mut pos).ok()? as u32,
+            (11, 0) => elem.pool = read_varint(bytes, &mut pos).ok()? as u8,
             _ => skip_field(bytes, &mut pos, wire_type).ok()?,
         }
     }
@@ -348,7 +366,9 @@ mod tests {
     #[test]
     fn parses_minimal_segment() {
         // DanmakuElem { progress:1234, mode:1, fontsize:25, color:0xFFFFFF,
-        //              midHash:"abcd1234", content:"你好", weight:9 } —— 手工字节编码。
+        //              midHash:"abcd1234", content:"你好", weight:9, pool:1,
+        //              dmid:"8f2c…" } —— 手工字节编码(字段号=官方网页 schema:
+        // weight=9 varint / pool=11 varint / dmid=12 string)。
         let mut elem = Vec::new();
         elem.extend(enc_varint_field(2, 1234));
         elem.extend(enc_varint_field(3, 1));
@@ -356,7 +376,9 @@ mod tests {
         elem.extend(enc_varint_field(5, 0xFF_FF_FF));
         elem.extend(enc_bytes_field(6, b"abcd1234"));
         elem.extend(enc_bytes_field(7, "你好".as_bytes()));
-        elem.extend(enc_varint_field(12, 9));
+        elem.extend(enc_varint_field(9, 9));
+        elem.extend(enc_varint_field(11, 1));
+        elem.extend(enc_bytes_field(12, b"8f2c1d3e"));
         // DmSegMobileReply { elems: [elem] } + 一个未知字段(field 9 varint)。
         let mut reply = enc_bytes_field(1, &elem);
         reply.extend(enc_varint_field(9, 7));
@@ -370,6 +392,30 @@ mod tests {
         assert_eq!(&*seg.content(e), "你好");
         assert_eq!(e.mid_hash, Some(0xabcd1234));
         assert_eq!(e.weight, 9);
+        assert_eq!(e.pool, 1);
+    }
+
+    /// 官方 schema 交叉验证(抓取研究 §2.4):field 12 是 dmid 字符串(wire 2),
+    /// 不是 weight。若解析器仍按 (12,0) 读权重,真实数据下 weight 恒 0、
+    /// 智能屏蔽静默失效——此用例锚定修复。
+    #[test]
+    fn weight_comes_from_field9_not_field12() {
+        let mut elem = enc_bytes_field(7, b"x");
+        elem.extend(enc_varint_field(9, 7)); // weight=7(真实 wire:331 条全部如此)
+        elem.extend(enc_bytes_field(12, b"dmid-string")); // dmid 字符串,须跳过
+        let reply = enc_bytes_field(1, &elem);
+        let seg = parse_segment(reply.into()).expect("解析失败");
+        let e = &seg.elems()[0];
+        assert_eq!(e.weight, 7, "weight 必须来自 field 9");
+    }
+
+    #[test]
+    fn pool_defaults_to_zero_when_absent() {
+        let mut elem = enc_bytes_field(7, "普通池".as_bytes());
+        elem.extend(enc_varint_field(2, 100));
+        let reply = enc_bytes_field(1, &elem);
+        let seg = parse_segment(reply.into()).expect("解析失败");
+        assert_eq!(seg.elems()[0].pool, 0);
     }
 
     #[test]

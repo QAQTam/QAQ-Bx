@@ -110,16 +110,15 @@ impl AppShell {
                     || next.danmaku_max_lanes != self.settings.danmaku_max_lanes
                     || next.danmaku_font_family != self.settings.danmaku_font_family
                     || (next.danmaku_font_scale - self.settings.danmaku_font_scale).abs()
-                        > f32::EPSILON;
+                        > f32::EPSILON
+                    || (next.danmaku_density - self.settings.danmaku_density).abs() > f32::EPSILON
+                    || next.danmaku_area != self.settings.danmaku_area
+                    || (next.danmaku_speed_plus - self.settings.danmaku_speed_plus).abs()
+                        > f32::EPSILON
+                    || next.danmaku_prevent_shade != self.settings.danmaku_prevent_shade;
                 if danmaku_style_changed {
                     // 样式下发按当前承接方分流(native 透明层 / mpv 视频引擎)。
-                    self.danmaku_config(
-                        next.danmaku_enabled,
-                        next.danmaku_opacity,
-                        next.danmaku_max_lanes,
-                        &next.danmaku_font_family,
-                        next.danmaku_font_scale,
-                    );
+                    self.danmaku_config(danmaku_style_from(&next));
                 }
                 if danmaku_filter_from(&next) != danmaku_filter_from(&self.settings) {
                     // 规则变化 → 承接线程编译并对已缓存弹幕全量重滤(热更新)。

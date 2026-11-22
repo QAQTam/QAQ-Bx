@@ -2799,3 +2799,121 @@ try {
     if ($script:e28DirReady) { Remove-Item -Recurse -Force $e28Data -ErrorAction SilentlyContinue }
 }
 }
+
+# ---------- 场景 E29：弹幕设置面板接线（批次 2）：滑条/开关 → settings.json 持久化 ----------
+# 判据：设置页 4 个新控件（速度/显示区域/密度/防挡字幕）经 RangeValuePattern/TogglePattern
+# 操作后 UI 值生效，防抖落盘后 settings.json 弹幕字段=操作值；白名单口径：种子 JSON 中
+# 除本批 4 字段与 window（运行期窗口记忆，与本次操作无关）外逐字段不得变。
+if (Should-RunScenario "E29") {
+Write-Host "[E29] 设置页弹幕面板：滑条+防挡字幕 → settings.json 持久化" -ForegroundColor Cyan
+$e29Data = Join-Path $OutRoot "e29-data"
+$script:e29DirReady = $false
+$proc = $null
+try {
+    if (Test-Path $e29Data) { Remove-Item -Recurse -Force $e29Data }
+    New-Item -ItemType Directory -Force -Path $e29Data | Out-Null
+    $script:e29DirReady = $true
+    # 与 E28 同款种子：webp_hint_shown=true 压制首启模态窗；批次 2 弹幕字段缺省走 serde 默认。
+    $e29Seed = '{"quality":"Q1080","codec":"AvcFirst","home_open_mode":"FullPlayer","half_pane_width":480.0,"danmaku_enabled":true,"autoplay":false,"hardware_decode":true,"volume":80,"player_engine":"Native","webp_hint_shown":true,"portrait_mode":false,"prefer_official_cdn":true,"multi_thread_preload":true,"hover_preview":false,"reduce_animations":false,"window":null}'
+    [System.IO.File]::WriteAllText((Join-Path $e29Data "settings.json"), $e29Seed)
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.WorkingDirectory = (Split-Path $exe)
+    $psi.UseShellExecute = $false
+    $psi.EnvironmentVariables["QAQ_BX_DATA_DIR"] = $e29Data
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $hwnd = Wait-MainWindow $proc
+    [void][UiEdgeNative]::SetWindowPos($hwnd, [IntPtr]::Zero, 60, 60, 1296, 808, [UiEdgeNative]::SWP_NOZORDER)
+
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    if (-not (Select-UiaNav -Root $root -Name "设置")) { throw "E29 FAIL: 导航栏未找到「设置」项" }
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+
+    $speedSlider = Find-UiaByAutomationId -Root $root -Id "settings-danmaku-speed-plus"
+    $areaSlider = Find-UiaByAutomationId -Root $root -Id "settings-danmaku-area"
+    $densitySlider = Find-UiaByAutomationId -Root $root -Id "settings-danmaku-density"
+    $shadeToggle = Find-UiaByAutomationId -Root $root -Id "settings-danmaku-prevent-shade"
+    if (-not $speedSlider) { throw "E29 FAIL: 设置页未找到 [settings-danmaku-speed-plus] 滑条" }
+    if (-not $areaSlider) { throw "E29 FAIL: 设置页未找到 [settings-danmaku-area] 滑条" }
+    if (-not $densitySlider) { throw "E29 FAIL: 设置页未找到 [settings-danmaku-density] 滑条" }
+    if (-not $shadeToggle) { throw "E29 FAIL: 设置页未找到 [settings-danmaku-prevent-shade] 开关" }
+
+    $speedRange = $speedSlider.GetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern)
+    $areaRange = $areaSlider.GetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern)
+    $densityRange = $densitySlider.GetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern)
+    # 默认值锚定（官方默认手感）：速度 100% / 区域 100% / 密度 100%。
+    foreach ($probe in @(
+        @{ N = "速度"; R = $speedRange; E = 100.0 },
+        @{ N = "显示区域"; R = $areaRange; E = 100.0 },
+        @{ N = "密度"; R = $densityRange; E = 100.0 })) {
+        if ([Math]::Abs([double]$probe.R.Current.Value - $probe.E) -gt 0.5) {
+            throw ("E29 FAIL: 弹幕{0}默认值应为 {1}%，实际 {2}%" -f $probe.N, $probe.E, $probe.R.Current.Value)
+        }
+    }
+
+    # UIA SetValue 写滑条（等价用户拖动）：速度 160% / 区域 70% / 密度 40%。
+    $speedRange.SetValue(160)
+    Start-Sleep -Milliseconds 300
+    $areaRange.SetValue(70)
+    Start-Sleep -Milliseconds 300
+    $densityRange.SetValue(40)
+    Start-Sleep -Milliseconds 400
+
+    # 开关：默认关 → 开（TogglePattern，E22 同法）。
+    $shadePat = $shadeToggle.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
+    if ($shadePat.Current.ToggleState -ne [System.Windows.Automation.ToggleState]::Off) {
+        throw "E29 FAIL: 弹幕防挡字幕默认应为 Off"
+    }
+    $shadePat.Toggle()
+    Start-Sleep -Milliseconds 500
+
+    # UI 回读：SetValue/Toggle 后控件当前值必须已变（回调链生效）。
+    foreach ($probe in @(
+        @{ N = "速度"; R = $speedRange; E = 160.0 },
+        @{ N = "显示区域"; R = $areaRange; E = 70.0 },
+        @{ N = "密度"; R = $densityRange; E = 40.0 })) {
+        if ([Math]::Abs([double]$probe.R.Current.Value - $probe.E) -gt 0.5) {
+            throw ("E29 FAIL: 弹幕{0}操作后未生效（期望 {1}%，实际 {2}%）" -f $probe.N, $probe.E, $probe.R.Current.Value)
+        }
+    }
+    if ($shadePat.Current.ToggleState -ne [System.Windows.Automation.ToggleState]::On) {
+        throw "E29 FAIL: 弹幕防挡字幕切换后仍为 Off"
+    }
+    Capture-WindowFrame -Hwnd $hwnd -FileName "e29-0-danmaku-panel.png"
+
+    # 持久化断言：防抖落盘后弹幕字段=操作值；白名单逐字段比对（除本批 4 字段与 window）。
+    $settingsPath = Join-Path $e29Data "settings.json"
+    if (-not (Test-Path $settingsPath)) { throw "E29 FAIL: settings.json 不存在" }
+    $saved = $null
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 400
+        try { $saved = Get-Content -Raw -Path $settingsPath | ConvertFrom-Json } catch { continue }
+        if ($null -ne $saved.danmaku_speed_plus -and $null -ne $saved.danmaku_density -and
+            [Math]::Abs([double]$saved.danmaku_speed_plus - 1.6) -lt 0.01 -and
+            [Math]::Abs([double]$saved.danmaku_density - 0.4) -lt 0.01 -and
+            [int]$saved.danmaku_area -eq 70 -and
+            $saved.danmaku_prevent_shade -eq $true) { break }
+        $saved = $null
+    }
+    if ($null -eq $saved) { throw "E29 FAIL: settings.json 未在超时内持久化批次 2 弹幕字段" }
+    Write-Host "[E29] 持久化 speed_plus=$($saved.danmaku_speed_plus) area=$($saved.danmaku_area) density=$($saved.danmaku_density) prevent_shade=$($saved.danmaku_prevent_shade)" -ForegroundColor DarkCyan
+
+    $seed = $e29Seed | ConvertFrom-Json
+    $expectedChanged = @("danmaku_density", "danmaku_area", "danmaku_speed_plus", "danmaku_prevent_shade", "window")
+    foreach ($prop in $seed.PSObject.Properties) {
+        if ($prop.Name -in $expectedChanged) { continue }
+        if ("$($prop.Value)" -ne "$($saved.$($prop.Name))") {
+            throw "E29 FAIL: 白名单违规——非本批字段 $($prop.Name) 被改动: '$($prop.Value)' -> '$($saved.$($prop.Name))'"
+        }
+    }
+
+    $proc.Refresh()
+    if ($proc.HasExited) { throw "E29 FAIL: 进程提前退出 ($($proc.ExitCode))" }
+    Write-Host "[E29] PASS: 4 控件操作生效且持久化，白名单(种子非本批字段)完好" -ForegroundColor Green
+} finally {
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 400
+    if ($script:e29DirReady) { Remove-Item -Recurse -Force $e29Data -ErrorAction SilentlyContinue }
+}
+}

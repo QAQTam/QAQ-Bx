@@ -33,8 +33,12 @@ impl AppShell {
                         fontsize: e.fontsize,
                         color: e.color,
                         content: ContentRef::new(data.clone(), e.content_off, e.content_len),
+                        lane: 0,
+                        y_off: 0.0,
+                        est_width: 0.0,
                         mid_hash: e.mid_hash,
                         weight: e.weight,
+                        pool: e.pool,
                     })
                     .collect();
                 self.danmaku_append(items);
@@ -100,18 +104,11 @@ impl AppShell {
     }
 
 
-    pub(in crate::shell) fn danmaku_config(
-        &self,
-        enabled: bool,
-        opacity: f32,
-        max_lanes: usize,
-        family: &str,
-        scale: f32,
-    ) {
+    pub(in crate::shell) fn danmaku_config(&self, style: DanmakuStyle) {
         if let Some(stage) = self.stage_sink() {
-            stage.set_danmaku_config(enabled, opacity, max_lanes, family, scale);
+            stage.set_danmaku_config(style);
         } else if let Some(engine) = &self.engine {
-            engine.set_danmaku_config(enabled, opacity, max_lanes, family, scale);
+            engine.set_danmaku_config(style);
         }
     }
 
@@ -153,13 +150,7 @@ impl AppShell {
         self.danmaku_epoch = self.danmaku_epoch.wrapping_add(1);
         self.danmaku_replace(Vec::new());
         let st = self.settings.clone();
-        self.danmaku_config(
-            st.danmaku_enabled,
-            st.danmaku_opacity,
-            st.danmaku_max_lanes,
-            &st.danmaku_font_family,
-            st.danmaku_font_scale,
-        );
+        self.danmaku_config(danmaku_style_from(&st));
         self.danmaku_filter(danmaku_filter_from(&st));
         self.fetch_danmaku(self.playback_gen, start_secs, context);
     }

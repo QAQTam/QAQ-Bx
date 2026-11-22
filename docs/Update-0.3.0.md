@@ -1,7 +1,9 @@
 # QAQ-Bx v0.3.0 计划:弹幕引擎升级 + 系统媒体引擎正式化
 
 > 状态:混合。**M 段(系统媒体引擎正式化)已实施并验收**(逐条带证据);
-> D1–D5(弹幕引擎升级:轨道避让/排版缓存/密度)仍是**计划**,实施时回填 ✅。
+> D1–D5(弹幕引擎升级:轨道避让/排版缓存/密度):**D1+D3 已于 2026-11 实施回填 ✅**,
+> D2/D4/D5 仍是计划。触发契机:实测发现 `pull_mode=1` 弹幕数据缺陷修复后,
+> 旧哈希分轨的「一窝蜂/互叠」观感成为首要体验问题。
 > 两条轨共用 0.3.0(2026-11 决策:媒体引擎正式化并入本文,不再单开版本号)。
 > 2026-11-19:workspace 公共版本号升到 **0.3.0**(与本文对齐,M7 + TitleBar 幽灵
 > 回调修复一并入包,`QAQ-Bx-Dev_0.3.0.1` 起),修订号仍由 `just dev` 自增。
@@ -107,18 +109,21 @@ R2L(右→左)准入判据:
 
 ### D1 滚动弹幕轨道避让(P0)
 
-- [ ] `OverlayDanmaku` 增加分配结果字段:`lane: u16` + `est_width: f32`(精确宽度,替代 `chars×char_width` 估算)。
-- [ ] 引擎线程新增 `LaneAllocator`:输入按 progress 升序的弹幕流 + 面板 DIP 宽度 + `ROLL_SECONDS`,
-      逐条用 §2.1 双条件判据选轨;全满 → 默认丢弃(与 B 站网页一致),设置项 `danmaku_overflow: drop|force`
-      提供 `findMin` 强放兜底。
-- [ ] 触发时机:`AppendDanmaku`(增量:从排序插入点继续模拟)/`SetDanmaku`/`SetDanmakuFilter`(全量重跑)/
-      `Resize`(宽度变化影响准入窗口,全量重跑)。去重表、过滤、轨道分配统一进 ingest 管线
-      `filter_batch → allocate_lanes`。
-- [ ] `draw_danmaku_overlay` 改读 `elem.lane`,删除 `progress_ms % max_lanes` 哈希分轨。
-- [ ] 速度模型:维持恒定 `ROLL_SECONDS`;`danmaku_speed_mode: duration|velocity` 设置项预埋接口
-      (velocity 模型 = B 站网页式恒速,duration 随宽度伸缩;实现放 D4)。
-- 测试:同轨不重叠(构造宽度混排序列,断言任意两同轨条目区间不交)、增量到货与全量重跑结果一致、
-  丢弃/强放两策略、resize 后重分配。
+- [x] `OverlayDanmaku` 增加分配结果字段:`lane: u16` + `est_width: f32`(✅ 2026-11;宽度暂为
+      估算口径 `danmaku_est_width`(全宽 1.0em / 半宽 0.55em,与字号档位 16/22/30 联动),
+      D2 落地后换 layout metrics,§5 解耦口径)。
+- [x] 引擎线程新增分配器:实现为**纯函数 `allocate_lanes`**(ingest 全量重跑,§2.3 同款
+      stateless 渲染不变式;增量到货每段重跑,与一次到位结果一致的测试锚定)。滚动双条件
+      准入 + `DanmakuOverflow::{Drop,Force}`(Force = findMin 最早空出强放)进 `VideoConfig`
+      (默认 Drop;设置页接线随 D4/D5 批次)。
+- [x] 触发时机:`SetDanmaku`/`AppendDanmaku`/`SetDanmakuFilter`/`SetDanmakuConfig`(轨道数/
+      字号缩放变化)/`Resize`(引擎与透明层两管线同源接线)。
+- [x] `draw_danmaku_overlay` 改读 `elem.lane`,删除 `progress_ms % max_lanes` 哈希分轨;
+      滚动改 duration 模型 x 几何(头部自右缘起笔,横穿 `屏宽+文本宽`,画框随 est_width 伸缩,
+      废弃固定 600px 槽宽)。
+- [x] 速度模型:`ROLL_SECONDS` 8s→**10s**(对齐 B 站网页端 ~10s 手感);`danmaku_speed_mode`
+      预埋接口**未做**,留 D4。
+- [x] 测试(5 项全绿):估宽联动、同轨双条件独立重算校验、增量=全量、drop/force、D3 槽位。
 
 ### D2 D2D 排版/刷子缓存(P0,性能)
 
@@ -132,11 +137,11 @@ R2L(右→左)准入判据:
 
 ### D3 顶部/底部驻留堆叠(P1)
 
-- [ ] 驻留弹幕 ingress 时按 `progress` 升序做 `fixEndTime` 槽位分配:顶/底各自独立槽序列,
-      槽 i 空闲条件 `spawn_new >= fixEndTime[i]`,分配后 `fixEndTime[i] = spawn + PIN_SECONDS`;
-      全满按溢出策略(D1 同款)。
-- [ ] 渲染:y = 槽位基线(顶部自上而下 / 底部自下而上),替换现固定 `y=8.0` / `height-...` 的互叠。
-- 测试:同刻 5 条顶驻留 → 5 个不同槽;槽随超时释放(时间轴模拟断言)。
+- [x] 驻留弹幕 ingress 时按 `progress` 升序做槽位分配:顶/底各自独立槽序列(上限同轨道数),
+      槽 i 空闲条件 `spawn_new >= fixEnd[i]`,分配后 `fixEnd[i] = spawn + PIN_SECONDS`;
+      全满按溢出策略(D1 同款)。(✅ 2026-11,并入 `allocate_lanes`)
+- [x] 渲染:y = 槽位基线(顶部自上而下 / 底部自下而上,行距 text_slot_h),替换固定 y 互叠。
+- [x] 测试:同刻 3 条顶驻留 → 槽 0/1/2;顶/底槽序独立;`PIN_SECONDS` 后槽位复用。
 
 ### D4 恒定速度模型(可选项,P2)
 
@@ -153,6 +158,8 @@ R2L(右→左)准入判据:
 ## 4. 验收判据(实施时逐项回填)
 
 - [ ] `cargo test --workspace` 全绿(video 新增避让/缓存/堆叠用例)
+- [x] `cargo test --workspace` 全绿 ✅(2026-11 回填:core 93 + fixtures 6 + login 7 +
+  ui 132 + video 41,video 新增 D1/D3 用例 5 项;D2 未做,布局缓存用例随之)
 - [ ] `just selftest all` 12/12 PASS(half-pane 含弹幕开关断言)
 - [ ] 弹幕多的视频实测:任意时刻同轨无重叠(肉眼 + 可选 debug 叠加轨道线)
 - [ ] 60fps 满刷新下引擎线程 CPU 占用对比 0.2.x 有可测量下降(任务管理器,记录数字)

@@ -161,6 +161,67 @@ pub fn settings_page(
         }
     };
 
+    // 弹幕样式三滑条 + 防挡字幕开关(官方 DanmuWebPlayerConfig 对齐;DM 批次)。
+    let speed_plus_pct = (settings.danmaku_speed_plus * 100.0)
+        .round()
+        .clamp(50.0, 200.0) as i32;
+    let density_pct = (settings.danmaku_density * 100.0)
+        .round()
+        .clamp(10.0, 100.0) as i32;
+
+    let on_speed_plus = {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |val: f64| {
+            let pct = val.round().clamp(50.0, 200.0);
+            let speed = (pct / 100.0) as f32;
+            if (speed - base.danmaku_speed_plus).abs() > f32::EPSILON {
+                let mut next = base.clone();
+                next.danmaku_speed_plus = speed;
+                cb.call(next);
+            }
+        }
+    };
+
+    let on_area = {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |val: f64| {
+            let area = val.round().clamp(10.0, 100.0) as u8;
+            if area != base.danmaku_area {
+                let mut next = base.clone();
+                next.danmaku_area = area;
+                cb.call(next);
+            }
+        }
+    };
+
+    let on_density = {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |val: f64| {
+            let pct = val.round().clamp(10.0, 100.0);
+            let density = (pct / 100.0) as f32;
+            if (density - base.danmaku_density).abs() > f32::EPSILON {
+                let mut next = base.clone();
+                next.danmaku_density = density;
+                cb.call(next);
+            }
+        }
+    };
+
+    let on_prevent_shade = {
+        let base = settings.clone();
+        let cb = on_change.clone();
+        move |on: bool| {
+            if on != base.danmaku_prevent_shade {
+                let mut next = base.clone();
+                next.danmaku_prevent_shade = on;
+                cb.call(next);
+            }
+        }
+    };
+
     // 弹幕屏蔽类型四选(网页版弹幕设置对齐):get/set 函数对生成回调。
     let mk_block_cb = |get: fn(&AppSettings) -> bool, set: fn(&mut AppSettings, bool)| {
         let base = settings.clone();
@@ -456,6 +517,41 @@ pub fn settings_page(
             .spin_button_placement_mode(NumberBoxSpinButtonPlacementMode::Inline)
             .value(settings.danmaku_max_lanes as f64)
             .on_value_changed(on_lanes)
+            .into(),
+        Slider::new()
+            .automation_id("settings-danmaku-speed-plus")
+            .header(format!("弹幕速度 {}%", speed_plus_pct))
+            .minimum(50.0)
+            .maximum(200.0)
+            .step_frequency(10.0)
+            .value(f64::from(speed_plus_pct))
+            .on_value_changed(on_speed_plus)
+            .into(),
+        Slider::new()
+            .automation_id("settings-danmaku-area")
+            .header(format!("弹幕显示区域 {}%", settings.danmaku_area))
+            .minimum(10.0)
+            .maximum(100.0)
+            .step_frequency(10.0)
+            .value(f64::from(settings.danmaku_area))
+            .on_value_changed(on_area)
+            .into(),
+        Slider::new()
+            .automation_id("settings-danmaku-density")
+            .header(format!("弹幕密度 {}%", density_pct))
+            .minimum(10.0)
+            .maximum(100.0)
+            .step_frequency(10.0)
+            .value(f64::from(density_pct))
+            .on_value_changed(on_density)
+            .into(),
+        ToggleSwitch::new()
+            .automation_id("settings-danmaku-prevent-shade")
+            .header("弹幕防挡字幕")
+            .on_content("开")
+            .off_content("关")
+            .is_on(settings.danmaku_prevent_shade)
+            .on_toggled(on_prevent_shade)
             .into(),
         // 弹幕屏蔽(网页版弹幕设置对齐):类型四选 + 规则 + 去重 + 智能权重。
         StackPanel::new()

@@ -21,6 +21,11 @@ impl AppShell {
                     if size.width.is_finite() && size.width > 0.0 {
                         self.fullscreen_window_width = size.width;
                     }
+                    // 真实全屏高度同步喂给竖屏单列播放页(视频面满铺用),走同一
+                    // settled 收敛:dispatch 重绘后单列树按新高度原地改属性。
+                    if size.height.is_finite() && size.height > 0.0 {
+                        self.fullscreen_window_height = size.height;
+                    }
                     // #5:HUD 宽度改按需读取——拖拽帧不再重绘,去抖到期经普通
                     // dispatch 的 settled 消息统一收敛静默累计的新宽度。
                     if self.grid_rebuild_timer.is_none() {

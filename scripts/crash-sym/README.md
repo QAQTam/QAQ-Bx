@@ -12,11 +12,26 @@ Windows 事件查看器 `Application Error`(Event ID 1000)给出:
 必要时从微软符号服务器(msdl)下载对应 PDB(自断点续传),然后在 publics
 符号流中定位包含该 RVA 的函数,并打印故障点前后的符号与可选反汇编。
 
+配套脚本:
+
+- `minidump-info.py` — 纯 Python 粗读 full dump(异常码/ExceptionAddress/
+  故障模块+RVA/线程栈范围)。
+- `minidump-stackscan.py` — 崩溃线程栈启发式扫描(候选返回地址按模块聚合)。
+- **`minidump-stowed.py` — 0xC000027B(stowed exception)包解析**(Win11 24H2+
+  'SE02' 记录格式:HRESULT/origin tag('XAML'/'XAMW')/完整 VA 帧数组,
+  帧按模块表归属;`--all` 打印全部记录,`--cv <模块>` 打印 PDB GUID+age)。
+- **`batch-sym.py` — 批量 RVA→符号**(每 PDB 只解析一次;支持
+  `--pdb <显式路径>` 并做 GUID 匹配校验;适合成栈逐帧符号化)。
+
 ## 用法
 
 ```powershell
 python scripts/crash-sym/symbolize.py "C:\Program Files\WindowsApps\<包名>\<Module>.dll" 359595
 python scripts/crash-sym/symbolize.py <dll> 359595 --disasm     # 反汇编故障点(需 capstone)
+python scripts/crash-sym/minidump-stowed.py data/crash-dumps/qaq-bx-ui.exe.<pid>.dmp
+python scripts/crash-sym/minidump-stowed.py <dmp> --cv "ui.xaml"      # 拿 PDB GUID
+python scripts/crash-sym/batch-sym.py <dll> <rva> [<rva>...]          # 批量符号化
+python scripts/crash-sym/batch-sym.py <exe> <rva>... --pdb target/debug/qaq_bx_ui.pdb
 ```
 
 - PDB 缓存在 `%LOCALAPPDATA%\qaq-bx\crash-sym\`,可用 `--cache` 覆盖。
@@ -60,3 +75,8 @@ WerFault 交接点(实测在 ntdll),以 ExceptionStream 的 ExceptionAddress 为
   → `?XamlRoot@?$consume_Microsoft_UI_Xaml_IUIElement@VTitleBar@@@impl@winrt@@QEBA@XZ`
   (ICF 折叠,同址含 ScrollView/SwipeControl/PipsPager 等所有 UIElement 派生控件
   的 `consume_IUIElement<D>::XamlRoot`)。详见 `docs/dev-notes/crash-0x359595-xamlroot.md`。
+- `Microsoft.ui.xaml.dll` `FailFastWithStowedExceptions`(0xC000027B,
+  ExceptionAddress RVA 0x3d1699)→ 包内 54 条 stowed 记录:致命 =
+  **0x88000fa8 `AG_E_LAYOUT_CYCLE`**(布局循环 250 轮不收敛,播放页
+  ScrollViewer+ItemsRepeater 变高行振荡);49 条 'XAMW' = 引擎最后 8 轮的
+  布局循环警告上下文。详见 `docs/dev-notes/crash-0x88000fa8-layoutcycle.md`。

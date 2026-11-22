@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """minidump-stowed.py — 解析 0xC000027B(stowed exception)full dump,无 SDK/无网络。
 
-0xC000027B 的 ExceptionInformation:
-  [0] = STOWED_EXCEPTION_INFORMATION* 数组指针
-  [1] = 元素个数
-每条记录(V1 form=0 / V2 form=1)携带原始 HRESULT 与可选栈回溯
-(ULONG32 帧,为模块内 RVA;按模块 ImageBase 排序归属)。
+Win11 24H2+ 新记录格式(实测本 dump,签名在 +4):
+  +00 ULONG Size
+  +04 ULONG Sig 'SE02'
+  +08 HRESULT ResultCode
+  +0C ULONG ThreadId
+  +20 PVOID FrameArray(完整 VA 的返回地址数组)
+  +28 CHAR[4] OriginTag('XAML'/'XAMW'…)
+  +30 PVOID StackContext{hash,tid,count,frames[]}
 
 用法:
-  python minidump-stowed.py <dmp> [--all] [--cv <模块名子串>]
-  --all    打印全部 stowed 记录(默认只打印前 5 条 + 汇总)
-  --cv     额外打印匹配模块的 PDB CV 记录(GUID+age,供 msdl 下载)
+  python minidump-stowed.py <dmp> [--all] [--cv <模块名子串>] [--mod <模块名子串>]
+  --all  打印全部记录完整帧;默认打印前 8 条 + 按模块聚合
+  --cv   打印匹配模块的 PDB CV(GUID+age)
+  --mod  只打印命中模块的帧
 """
 import struct
 import sys
 import bisect
+from collections import Counter
+
+SE02 = 0x53453032  # 'SE02'
 
 
 def load(path):
@@ -48,6 +55,7 @@ def modules(data, streams):
             pth = data[cv_rva + 24:cv_rva + cv_size].split(b"\x00")[0].decode("utf-8", "replace")
             cv = (guid, age, pth)
         mods.append((img, size, name, ts, cv))
+    mods.sort()
     return mods
 
 
@@ -95,57 +103,19 @@ def read_mem(data, runs, addr, size):
     return data[off:off + size]
 
 
-def mod_of(mods, a):
-    starts = [m[0] for m in mods]
-    i = bisect.bisect_right(starts, a) - 1
-    if i >= 0:
-        img, size, name, ts, cv = mods[i]
-        if img <= a < img + size:
-            return name, a - img
-    return None, None
+class ModResolver:
+    def __init__(self, mods):
+        self.mods = mods
+        self.starts = [m[0] for m in mods]
 
-
-def parse_record(data, runs, mods, ptr):
-    hdr = read_mem(data, runs, ptr, 0x2000)
-    if hdr is None:
-        return None
-    sig, size = struct.unpack_from("<II", hdr, 0)
-    if sig != 0x53455347:  # 'SESG'
-        return {"bad_sig": hex(sig)}
-    result_code = struct.unpack_from("<i", hdr, 8)[0]
-    form = struct.unpack_from("<I", hdr, 12)[0]
-    rec = {"sig": "SESG", "size": size, "result": result_code, "form": form}
-    if form == 0:
-        rec["address"] = struct.unpack_from("<Q", hdr, 16)[0]
-    else:
-        tid, flags = struct.unpack_from("<II", hdr, 16)
-        rec["thread"] = tid
-        rec["flags"] = flags
-    nested_type, = struct.unpack_from("<I", hdr, 24)
-    nested_ptr, = struct.unpack_from("<Q", hdr, 32)
-    rec["nested_type"] = nested_type
-    rec["nested_ptr"] = nested_ptr
-    # V2(form=1) 栈回溯:ULONG BackTraceSize + ULONG32 frames
-    if form == 1:
-        bt_size, = struct.unpack_from("<I", hdr, 40)
-        bt_size = min(bt_size, 32)
-        frames = []
-        for k in range(bt_size):
-            f, = struct.unpack_from("<I", hdr, 44 + k * 4)
-            frames.append(f)
-        rec["frames"] = frames
-    # nested PSK1 = 打包的 EXCEPTION_RECORD64
-    if nested_ptr:
-        nr = read_mem(data, runs, nested_ptr, 0x60)
-        if nr:
-            code, flags2 = struct.unpack_from("<II", nr, 0)
-            rec["nested_code"] = code
-            rec["nested_flags"] = flags2
-            addr64, = struct.unpack_from("<Q", nr, 16)
-            rec["nested_addr"] = addr64
-            nparams, = struct.unpack_from("<II", nr, 24)
-            rec["nested_params"] = [struct.unpack_from("<Q", nr, 32 + 8 * k)[0] for k in range(min(nparams, 2))]
-    return rec
+    def of(self, a):
+        i = bisect.bisect_right(self.starts, a) - 1
+        if i >= 0:
+            img, size, name, ts, cv = self.mods[i]
+            if img <= a < img + size:
+                short = name.rsplit("\\", 1)[-1]
+                return short, a - img
+        return None, None
 
 
 def main():
@@ -156,10 +126,14 @@ def main():
     cv_want = None
     if "--cv" in args:
         i = args.index("--cv"); cv_want = args[i + 1].lower(); del args[i:i + 2]
+    mod_want = None
+    if "--mod" in args:
+        i = args.index("--mod"); mod_want = args[i + 1].lower(); del args[i:i + 2]
     path = args[0]
     data, streams = load(path)
     mods = modules(data, streams)
     runs = memory_runs(data, streams)
+    res = ModResolver(mods)
 
     if cv_want:
         for img, size, name, ts, cv in mods:
@@ -170,58 +144,65 @@ def main():
                     struct.unpack_from("<H", guid, 4)[0],
                     struct.unpack_from("<H", guid, 6)[0],
                     guid[8:10].hex().upper(), guid[10:16].hex().upper())
-                print(f"[cv] {name} age={age} guid={g} pdb={pth}")
+                print(f"[cv] {name}\n     age={age} guid={g} pdb={pth}")
                 return
+        sys.exit(f"no module matching {cv_want} with CV record")
 
-    # 异常流
-    er, esz = streams[6]
+    er = streams[6][0]
     tid = struct.unpack_from("<I", data, er)[0]
     code = struct.unpack_from("<I", data, er + 8)[0]
     addr = struct.unpack_from("<Q", data, er + 24)[0]
     nparams = struct.unpack_from("<I", data, er + 32)[0]
     params = [struct.unpack_from("<Q", data, er + 40 + 8 * k)[0] for k in range(nparams)]
-    fmod, frva = mod_of(mods, addr)
-    print(f"[exception] thread={tid} code=0x{code:08x} addr=0x{addr:x}")
-    print(f"[fault-module] {fmod} RVA=0x{frva:x}" if fmod else f"[fault-module] ?")
-    print(f"[params] {len(params)}: " + " ".join(f"0x{p:x}" for p in params))
+    fmod, frva = res.of(addr)
+    print(f"[exception] thread={tid} code=0x{code:08x} addr=0x{addr:x}"
+          + (f" ({fmod}+0x{frva:x})" if fmod else ""))
+    print(f"[params] " + " ".join(f"0x{p:x}" for p in params))
     if code != 0xC000027B or len(params) < 2:
-        print("not a stowed-exception crash (or params missing)")
+        print("not a stowed-exception crash")
         return
     arr_ptr, count = params[0], params[1]
     arr = read_mem(data, runs, arr_ptr, 8 * min(count, 64))
     if arr is None:
         sys.exit(f"FATAL: stowed array @0x{arr_ptr:x} 不在 dump 内存中")
     print(f"[stowed] count={count}")
-    from collections import Counter
-    codes = Counter()
+
+    agg = Counter()
     shown = 0
     for i in range(min(count, 64)):
         ptr, = struct.unpack_from("<Q", arr, i * 8)
-        if not ptr:
+        blk = read_mem(data, runs, ptr, 0x58)
+        if blk is None or struct.unpack_from("<I", blk, 4)[0] != SE02:
+            print(f"elem[{i}] @0x{ptr:x}: unreadable/bad")
             continue
-        rec = parse_record(data, runs, mods, ptr)
-        if not rec:
-            continue
-        codes[rec.get("result", rec.get("bad_sig"))] += 1
-        if not show_all and shown >= 5:
+        size = struct.unpack_from("<I", blk, 0)[0]
+        rc = struct.unpack_from("<I", blk, 8)[0]
+        stid = struct.unpack_from("<I", blk, 0xC)[0]
+        fa = struct.unpack_from("<Q", blk, 0x20)[0]
+        tag = blk[0x28:0x2C].decode("ascii", "replace")
+        sc = struct.unpack_from("<Q", blk, 0x30)[0]
+        cnt2 = 0
+        if sc:
+            hdr2 = read_mem(data, runs, sc, 0x20)
+            if hdr2:
+                cnt2 = struct.unpack_from("<I", hdr2, 0xC)[0]
+        print(f"\n=== stowed[{i}] @0x{ptr:x} size={size} rc=0x{rc:08x} tid={stid} origin='{tag}' frames={cnt2}")
+        if not show_all and shown >= 7:
             continue
         shown += 1
-        print(f"\n--- stowed[{i}] @0x{ptr:x} ---")
-        print(f"  ResultCode=0x{rec['result'] & 0xffffffff:08x}" if "result" in rec else f"  bad_sig={rec.get('bad_sig')}")
-        if "thread" in rec:
-            print(f"  form=1 thread={rec['thread']} flags=0x{rec['flags']:x}")
-        if "address" in rec:
-            nm, rva = mod_of(mods, rec["address"])
-            print(f"  form=0 address=0x{rec['address']:x}" + (f" ({nm}+0x{rva:x})" if nm else ""))
-        if "nested_code" in rec:
-            nm, rva = mod_of(mods, rec["nested_addr"]) if rec.get("nested_addr") else (None, None)
-            print(f"  nested type=0x{rec['nested_type']:08x} code=0x{rec['nested_code'] & 0xffffffff:08x} addr=0x{rec['nested_addr']:x}"
-                  + (f" ({nm}+0x{rva:x})" if nm else "")
-                  + f" params={[hex(p) for p in rec['nested_params']]}")
-        for f in rec.get("frames", []):
-            nm, rva = mod_of(mods, f)
-            print(f"    frame 0x{f:08x}" + (f"  -> {nm}+0x{rva:x}" if nm else "  -> ?"))
-    print(f"\n[summary] ResultCode 分布: " + ", ".join(f"0x{(c & 0xffffffff):08x}×{n}" for c, n in codes.most_common()))
+        farr = read_mem(data, runs, fa, 8 * cnt2) if fa and cnt2 else None
+        if farr is None:
+            print("  frames: NOT IN DUMP")
+            continue
+        for k in range(cnt2):
+            f, = struct.unpack_from("<Q", farr, k * 8)
+            m, rva = res.of(f)
+            agg[m] += 1
+            if m and (not mod_want or mod_want in m.lower()):
+                print(f"  [{k:02d}] {m}+0x{rva:x}")
+            elif not m:
+                print(f"  [{k:02d}] ??? 0x{f:x}")
+    print(f"\n[summary] 帧模块分布: " + ", ".join(f"{m or '?'}({n})" for m, n in agg.most_common(12)))
 
 
 if __name__ == "__main__":

@@ -103,4 +103,40 @@
   来自用户 shell.rs test block 未完成的 EngineSwitchAction,与本修复无关)。
   **待用户跑复现步骤裁决;E16(ui-edge)已入库;C(upstream issue)待写。**
 
+- 追加 7(2026-11-21 深夜,**新崩溃 0xC000027B 锁定=布局循环,非 AV**):
+  `data/crash-dumps/qaq-bx-ui.exe.3108.dmp`(0.6.0.5,920MB full)解析闭环——
+  故障 = `Microsoft.ui.xaml.dll FailFastWithStowedExceptions`(RVA 0x3d1699):
+  播放页 **ScrollViewer(ScrollBar)↔ItemsRepeater(StackLayout 变高评论行)**
+  布局振荡,单次 UpdateLayout 250 轮(MaxLayoutIterations)不收敛 → 引擎主动抛
+  **AG_E_LAYOUT_CYCLE 0x88000fa8** → UnhandledError 无人处理 → fail-fast;
+  包内 49 条 'XAMW' 记录 = 引擎最后 8 轮警告上下文,含 ScrollBar
+  UpdateTrackLayout→Margin 与 ItemsRepeater SetLayoutExtent/
+  EffectiveViewportChanged 两形态振荡栈,与上游源码(main@aeec1c7f)逐字对齐
+  (LayoutManager.cpp:470 / ScrollBar_Partial.cpp:1691 "…cycles that involve
+  a ScrollBar")。次要发现:reactor reconcile 写 IInspectable 属性时
+  PropertyValue::AreEqual stow **RO_E_METADATA_INVALID_TYPE_FORMAT**×3、
+  模板 binding connect stow CLASS_E_CLASSNOTAVAILABLE×1(均非致命)。
+  完整文档 **docs/dev-notes/crash-0x88000fa8-layoutcycle.md**(§6 修复三层:
+  A 评论行/相关卡显式定宽断振荡 + E17 回归;B UnhandledError 注册决策项;
+  C upstream issue 要素齐备待写;D reactor 元数据噪声排查)。
+  新工具:`scripts/crash-sym/minidump-stowed.py`(stowed 包解析,'SE02'
+  格式)+ `batch-sym.py`(批量符号化,PDB GUID 校验);PDB 缓存已重建
+  (Controls 345MB + engine 302MB,`%LOCALAPPDATA%\qaq-bx\crash-sym`)。
+
+- 追加 8(2026-11-22 凌晨,**定责复核 + A 已落地 + 装机 0.6.0.6**):
+  用户质疑"又是上游问题"→ 实证复核:①堆串提取(heap-scan-strings.py 新工具)
+  拿到引擎记录的振荡实际值——指示块 Margin.top 467.15→468.46→468.69、
+  Height 456.01→457.29(track 981,= viewport/extent 比值×track)单调爬行
+  ≈0.3%/轮,Visibility=0×6;②XAMW 记录所有写入者均为引擎内部(排除 app
+  回调直写);③app 层反馈环假设证伪(content_height=window−chrome 来自
+  窗口事件);④最小复现 D:/QAQ-Work/layoutcycle-repro 两轮几何 + app A/B
+  压测(ui-stress-layoutcycle.ps1 新脚本,修复前后各 180s 滚动+resize)
+  **均未引爆** → 定责悬置:环在引擎、扳机未锁定,不得断言纯上游。
+  **已落地**:reactor fork 补 IItemsRepeater::{put_Horizontal/Vertical
+  CacheLength} 绑定 + NativeVirtualItems::new 双置 0(断 realization 窗口
+  大幅移动;feed 离屏封面启发式需观察,可回调 0.5/1.0);reactor 测试绿、
+  app workspace 279 绿、**0.6.0.6 已装机**(just dev)。2.6.5 无
+  Application.UnhandledError API(B 保命方案证伪)。终审=实网观察:
+  再崩→新 dump 的 XAMW 串直接定位翻转属性。
+
 

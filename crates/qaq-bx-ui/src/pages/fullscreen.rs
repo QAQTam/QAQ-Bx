@@ -465,8 +465,12 @@ impl Component for FullscreenPlayer {
 
         // HUD 覆盖模式下不挂载任何渲染面:播放面由 shell 中稳定 keyed 的播放页
         // 继续持有。普通模式下 VideoSurface 仍在 keyed("fs-canvas") 首层。
+        // hud_only 补一块全窗命中层(fs-hit):根 Border 虽透明可命中但无处理器,
+        // 没有它画布点击/移动全部落空 —— HUD 自动隐藏后无法用鼠标唤醒、双击
+        // 无法退全屏(v0.6.0 换 hud_only 时丢失)。命中层在 HUD 条之下,
+        // 条内控件命中不会被本层截走。
         let mut layers: Vec<KeyedView> = if input.hud_only {
-            Vec::new()
+            vec![keyed("fs-hit", View::from(hit_overlay))]
         } else {
             vec![keyed(
                 "fs-canvas",

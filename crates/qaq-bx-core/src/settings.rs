@@ -275,6 +275,14 @@ pub struct AppSettings {
     pub danmaku_weight_min: u32,
     /// 屏蔽词规则(每行一条;`re:` 前缀=正则,`u:` 前缀=用户 midHash,其余=关键词)。
     pub danmaku_filter_rules: String,
+    /// 弹幕显示密度(官方 dmdensity 口径 10..=100 → 引擎 0.1..=1.0;100=最密)。
+    pub danmaku_density: f32,
+    /// 弹幕显示区域(官方 dmarea 口径 10..=100%;字幕池弹幕豁免)。
+    pub danmaku_area: u8,
+    /// 弹幕滚动速度倍率(官方 speedplus 50..=200 → 引擎 0.5..=2.0;100=官方默认)。
+    pub danmaku_speed_plus: f32,
+    /// 弹幕防挡字幕(官方 preventshade:碰撞可用高度×0.85,底部 15% 让位)。
+    pub danmaku_prevent_shade: bool,
     pub autoplay: bool,
     pub hardware_decode: bool,
     pub volume: u32,
@@ -321,6 +329,10 @@ impl Default for AppSettings {
             danmaku_block_repeat: false,
             danmaku_weight_min: 0,
             danmaku_filter_rules: String::new(),
+            danmaku_density: 1.0,
+            danmaku_area: 100,
+            danmaku_speed_plus: 1.0,
+            danmaku_prevent_shade: false,
             autoplay: true,
             hardware_decode: true,
             volume: 80,
@@ -356,6 +368,17 @@ impl AppSettings {
             1.0
         };
         self.danmaku_weight_min = self.danmaku_weight_min.clamp(0, 10);
+        self.danmaku_density = if self.danmaku_density.is_finite() {
+            self.danmaku_density.clamp(0.1, 1.0)
+        } else {
+            1.0
+        };
+        self.danmaku_area = self.danmaku_area.clamp(10, 100);
+        self.danmaku_speed_plus = if self.danmaku_speed_plus.is_finite() {
+            self.danmaku_speed_plus.clamp(0.5, 2.0)
+        } else {
+            1.0
+        };
         self.volume = self.volume.min(100);
         self.half_pane_width = if self.half_pane_width.is_finite() {
             self.half_pane_width.clamp(340.0, 820.0)
@@ -447,6 +470,10 @@ mod tests {
             danmaku_block_repeat: true,
             danmaku_weight_min: 5,
             danmaku_filter_rules: "前方高能\nre:^\\d+$\nu:abcd1234".into(),
+            danmaku_density: 0.7,
+            danmaku_area: 60,
+            danmaku_speed_plus: 1.5,
+            danmaku_prevent_shade: true,
             autoplay: false,
             hardware_decode: false,
             volume: 45,
@@ -547,14 +574,23 @@ fn danmaku_filter_defaults_for_legacy_configs_and_weight_clamped() {
     assert!(!legacy.danmaku_block_repeat);
     assert_eq!(legacy.danmaku_weight_min, 0);
     assert_eq!(legacy.danmaku_filter_rules, "");
+    // 新弹幕样式四项(DM 批次):旧配置缺失 → 官方默认手感。
+    assert!((legacy.danmaku_density - 1.0).abs() < f32::EPSILON);
+    assert_eq!(legacy.danmaku_area, 100);
+    assert!((legacy.danmaku_speed_plus - 1.0).abs() < f32::EPSILON);
+    assert!(!legacy.danmaku_prevent_shade);
 
     let weird: AppSettings = serde_json::from_str::<AppSettings>(
-        r#"{"danmaku_weight_min": 99, "danmaku_filter_rules": "前方高能"}"#,
+        r#"{"danmaku_weight_min": 99, "danmaku_filter_rules": "前方高能",
+            "danmaku_density": 7, "danmaku_area": 3, "danmaku_speed_plus": 0.1}"#,
     )
     .unwrap()
     .normalized();
     assert_eq!(weird.danmaku_weight_min, 10);
     assert_eq!(weird.danmaku_filter_rules, "前方高能");
+    assert!((weird.danmaku_density - 1.0).abs() < f32::EPSILON, "越界密度钳回 1.0");
+    assert_eq!(weird.danmaku_area, 10, "越界区域钳回下界 10");
+    assert!((weird.danmaku_speed_plus - 0.5).abs() < f32::EPSILON, "越界速度钳回 0.5");
 }
 
 /// S4:播放引擎设置项 —— 旧配置缺字段按 tier1 默认回落 **native**(弹幕满帧率

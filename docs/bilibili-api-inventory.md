@@ -45,6 +45,12 @@
   → **protobuf 二进制**（实测 338KB/段，magic `0a…`）。结构为 DmSegMobileReply 反复嵌套
   `DmSegMobileReply.elems[]`：`id/progress(毫秒)/mode(1滚动 4底部 5顶部)/fontsize/color/content/mid`。
   Rust 解析建议 `prost` 自定义 message，或先手写字段探测。
+- **progress 语义（2026-11 实测，probe_dm_progress 两视频交叉）**：全片**绝对毫秒**（seg#2 起
+  min ≥ 360000），非段相对；渲染侧直接与播放位置对齐。
+- **pull_mode 陷阱（2026-11 实测，probe_dm_pullmode 两视频交叉）**：`pull_mode=1` 时
+  `segment_index=1` 只返回开头 ~1 分钟的弹幕（例：130/510 条、23/53 条，max≈00:53–00:58），
+  之后到段尾全空；seg#2 起无影响。`pull_mode=0` 与缺省均覆盖全段 → 客户端必须用 0
+  （danmaku.rs 已修），否则播放开头「一窝蜂」且随后长期无弹幕。
 
 ## 4. 评论 ✅ 实测 code=0（replies=20）
 
