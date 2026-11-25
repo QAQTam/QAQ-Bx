@@ -459,15 +459,14 @@ impl Component for VideoCard {
         let metrics = input.metrics;
         let content: View = match &input.slot {
             HomeSlot::Skeleton { .. } => skeleton_card_view(metrics, input.grid_col.is_some()),
-            HomeSlot::Video { item, .. } => {
-                populated_card_view(
-                    item,
-                    input.is_focused,
-                    metrics,
-                    &input.on_open,
-                    input.unplayable_badge.as_deref(),
-                )
-            }
+            HomeSlot::Video { item, .. } => populated_card_view(
+                item,
+                input.is_focused,
+                metrics,
+                input.grid_col.is_some(),
+                &input.on_open,
+                input.unplayable_badge.as_deref(),
+            ),
         };
 
         // #4:行 Grid 内的卡不定宽(Grid.Column 附加属性 + Stretch 随列宽);
@@ -581,6 +580,7 @@ fn populated_card_view(
     item: &VideoItem,
     is_focused: bool,
     metrics: CardMetrics,
+    stretch: bool,
     on_open: &Callback<String>,
     unplayable_badge: Option<&str>,
 ) -> View {
@@ -797,22 +797,28 @@ fn populated_card_view(
         .content(StackPanel::new().children((View::from(cover), View::from(text_area))));
 
     if compact {
-        return card_body
-            .width(metrics.card_width)
+        let card = card_body
             .height(metrics.card_height)
-            .on_pointer_released(move |_| on_click.call(bvid.clone()))
-            .into();
+            .on_pointer_released(move |_| on_click.call(bvid.clone()));
+        return if stretch {
+            card.into()
+        } else {
+            card.width(metrics.card_width).into()
+        };
     }
 
-    Button::new()
+    let btn = Button::new()
         .style(ButtonStyle::Subtle)
-        .width(metrics.card_width)
         .height(metrics.card_height)
         .horizontal_content_alignment(HorizontalAlignment::Stretch)
         .vertical_content_alignment(VerticalAlignment::Stretch)
         .on_click(move || on_click.call(bvid.clone()))
-        .content(card_body)
-        .into()
+        .content(card_body);
+    if stretch {
+        btn.into()
+    } else {
+        btn.width(metrics.card_width).into()
+    }
 }
 
 #[cfg(test)]

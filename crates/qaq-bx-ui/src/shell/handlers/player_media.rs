@@ -560,6 +560,51 @@ impl AppShell {
             .unwrap_or(0.0)
     }
 
+    /// 直播 HLS 装载(m3u8 直链):与 native_load_choice 共用注入/世代/弹幕
+    /// 透明层状态机,但不受「播放引擎」设置约束——直播按协议分流(HLS→
+    /// native,FLV→mpv),无画质/分P/续播语义(start=0,单源无音轨)。
+    pub(in crate::shell) fn native_load_live(&mut self, m3u8_url: &str, autoplay: bool) -> bool {
+        let player = match &self.native_player {
+            Some(player) => player.clone(),
+            None => {
+                let player = Arc::new(NativePlayer::new());
+                self.native_player = Some(player.clone());
+                player
+            }
+        };
+        // 诊断锚(E 系场景按此断言,勿改文案)。
+        eprintln!("[qaq-bx-ui] native live load: hls m3u8 装载中");
+        if let Err(e) = player.load_live(m3u8_url, autoplay) {
+            eprintln!("[qaq-bx-ui] native live load failed: {e}");
+            let _ = player.stop();
+            self.native_load_epoch = None;
+            self.release_stage();
+            return false;
+        }
+        // Bug 2B:停掉 mpv 解码并清 mpv 世代,防双引擎同播。
+        if let Some(engine) = &self.engine {
+            engine.stop();
+        }
+        self.mpv_load_epoch = None;
+        self.media_probe_at = None;
+        self.native_video_probe_at = None;
+        self.native_stall_probe_at = None;
+        if !self.native_playback {
+            self.reset_smtc_writer(true);
+        }
+        // 弹幕改由透明层承接(视频面归 MPE,mpv 引擎保持 idle;直播无弹幕段)。
+        self.ensure_stage();
+        self.native_playback = true;
+        self.media_load_pending = true;
+        self.video_loading = true;
+        // 记账本次装载世代:begin() 在 load_live() 内同步自增,快照即新世代。
+        self.native_load_epoch = Some(player.status().request_seq);
+        // 音量先记账(未 attach 时 SetVolume 无对象,attach 时由引擎统一施加)。
+        let _ = player.set_volume(f64::from(self.volume));
+        self.playing = autoplay;
+        true
+    }
+
 
     /// 经 CDN 择优与本地并发代理装入一对 DASH 分轨到 mpv。
     pub(in crate::shell) fn mpv_load_choice(

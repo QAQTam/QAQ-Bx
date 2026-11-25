@@ -79,7 +79,7 @@ impl AppShell {
                         let restore = self.portrait_dock_restore.take();
                         self.portrait_docked = false;
                         if let Some(prev) = restore {
-                            context.run_window(move |window| {
+                            let _ = context.run_window(move |window| {
                                 crate::winrt_ext::restore_window_bounds(window.as_raw(), prev);
                                 Message::PortraitSynced {
                                     docked: false,

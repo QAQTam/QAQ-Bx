@@ -94,7 +94,10 @@ pub enum Message {
     /// U4:点击直播间卡(roomid, title, uname)→ 房间流直链 mpv 播放。
     LiveRoomSelected(u64, String, String),
     /// U4:房间流就绪。
-    LiveReady { gen_id: u64, result: Result<String, String> },
+    LiveReady {
+        gen_id: u64,
+        result: Result<qaq_bx_core::live::LiveStreamUrl, String>,
+    },
     /// U4:直播页加载更多。
     LiveMore,
     /// U5:历史页就绪(page 失配即丢弃)。
@@ -225,7 +228,7 @@ pub enum Message {
     /// 200ms 宽限到期收起 tick。
     PeekGraceTick(u64),
     /// 挂载帧 → 翻牌帧(Composition 两帧进场)。
-    PeekAnimTick(u64),
+    PeekAnimTick,
     /// 指针移入/移出 PeekCard 本体(移入撤销收起)。
     PeekPointerEntered,
     PeekPointerExited,

@@ -23,12 +23,16 @@ mod player_media;
 pub(in crate::shell) use self::comments::CommentsSessionState;
 pub(in crate::shell) use self::home_feed::{apply_feed_page, mount_pulse_active, spawn_feed_batch};
 pub(in crate::shell) use self::lists::spawn_popular_fetch;
+pub(in crate::shell) use self::player_media::{CachedMedia, spawn_resolve_media};
+pub(in crate::shell) use self::window::ResizeStormTrack;
+// tests.rs 经 shell 域 `use super::*` 依赖下列纯函数/类型;非测试构建无引用,
+// 仅在 test 配置下再导出,避免 unused_imports 告警。
+#[cfg(test)]
 pub(in crate::shell) use self::player_media::{
-    CachedMedia, missing_media_track, missing_native_video_track, MissingTrack, mpv_load_gate_settled,
-    mpv_should_show_loading, native_load_gate_settled, native_load_stalled, native_should_show_loading,
-    pages_menu_from, spawn_resolve_media,
+    missing_media_track, missing_native_video_track, MissingTrack, mpv_load_gate_settled,
+    mpv_should_show_loading, native_load_gate_settled, native_load_stalled,
+    native_should_show_loading,
 };
-pub(in crate::shell) use self::window::{ResizeStorm, ResizeStormTrack};
 
 use super::*;
 
@@ -122,7 +126,7 @@ pub(super) fn dispatch(m: &mut AppShell, message: Message, context: &ComponentCo
         Message::PeekPrefetchTick(..) => Domain::Peek,
         Message::PeekPopTick(..) => Domain::Peek,
         Message::PeekGraceTick(..) => Domain::Peek,
-        Message::PeekAnimTick(..) => Domain::Peek,
+        Message::PeekAnimTick => Domain::Peek,
         Message::PeekPointerEntered => Domain::Peek,
         Message::PeekPointerExited => Domain::Peek,
         Message::PeekDescReady { .. } => Domain::Peek,

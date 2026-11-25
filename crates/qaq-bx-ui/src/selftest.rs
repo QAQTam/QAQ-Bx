@@ -462,14 +462,14 @@ fn mobile(s: &mut Scenario) -> Result<(), String> {
     s.sync()?;
     assert_eq!(s.probe.borrow().route_tag, "watch-later");
 
-    // 4. Medium 半屏（640x900）：处于 2 列区间即保持 Mobile，且顶栏右上可呼出悬浮搜索浮窗并提交跳 Search
+    // 4. Medium 半屏（640x900）：处于 Mobile 3 列区间，且顶栏右上可呼出悬浮搜索浮窗并提交跳 Search
     s.send(Message::WindowResized(windows_reactor::WindowSize {
         width: 640.0,
         height: 900.0,
     }))?;
     s.sync()?;
-    assert!(s.probe.borrow().is_mobile, "640px 2 列区应保持 Mobile 形态");
-    assert_eq!(s.probe.borrow().grid_cols, 2, "640px 应铺满 2 列");
+    assert!(s.probe.borrow().is_mobile, "640px Medium 区应保持 Mobile 形态");
+    assert_eq!(s.probe.borrow().grid_cols, 3, "640px Medium 区应渲染 3 列");
     s.send(Message::ToggleSearchOverlay)?;
     s.sync()?;
     assert!(
@@ -594,9 +594,9 @@ fn fullscreen(s: &mut Scenario) -> Result<(), String> {
     }
 
     // 6. 竖屏模式(实验)全屏进退彻底隔离回归:
-    // 在 1280x800 桌面尺寸下开启 portrait_mode → 立即收敛至竖屏 Mobile 2 列(859 DIP);
-    // 打开视频 → 进入全屏 → 收到 1920x1080 全屏 WindowResized → 底层视口保持 Mobile 2 列不被污染;
-    // 退出全屏首帧立即维持 Mobile 2 列,0 闪回 Desktop 布局。
+    // 在 1280x800 桌面尺寸下开启 portrait_mode → 立即收敛至竖屏 Mobile 3 列(859 DIP);
+    // 打开视频 → 进入全屏 → 收到 1920x1080 全屏 WindowResized → 底层视口保持 Mobile 3 列不被污染;
+    // 退出全屏首帧立即维持 Mobile 3 列,0 闪回 Desktop 布局;再拖窄到 480 DIP 验证自动退回 2 列。
     s.send(Message::WindowResized(windows_reactor::WindowSize {
         width: 1280.0,
         height: 800.0,
@@ -613,7 +613,7 @@ fn fullscreen(s: &mut Scenario) -> Result<(), String> {
         let p = s.probe.borrow();
         assert!(p.portrait_mode, "竖屏模式开关应已置位");
         assert!(p.is_mobile, "开启竖屏模式当帧必须立即切换为 Mobile 壳层");
-        assert_eq!(p.grid_cols, 2, "开启竖屏模式当帧必须立即收敛为 2 列");
+        assert_eq!(p.grid_cols, 3, "开启竖屏模式在 859 DIP 下必须收敛为 3 列");
         assert!(
             p.window_width < crate::layout::MOBILE_BREAKPOINT,
             "开启竖屏模式后有效布局宽度必须被钳制在 < 860 DIP"
@@ -650,7 +650,7 @@ fn fullscreen(s: &mut Scenario) -> Result<(), String> {
         let p = s.probe.borrow();
         assert!(p.is_fullscreen, "竖屏模式下应正常进入全屏");
         assert!(
-            p.is_mobile && p.grid_cols == 2 && p.window_width < crate::layout::MOBILE_BREAKPOINT,
+            p.is_mobile && p.grid_cols == 3 && p.window_width < crate::layout::MOBILE_BREAKPOINT,
             "全屏 1920x1080 WindowResized 严禁污染底层竖屏布局(is_mobile={}, cols={}, w={})",
             p.is_mobile,
             p.grid_cols,
@@ -663,11 +663,11 @@ fn fullscreen(s: &mut Scenario) -> Result<(), String> {
         let p = s.probe.borrow();
         assert!(!p.is_fullscreen, "ExitFullscreen 应立即退出全屏");
         assert!(
-            p.is_mobile && p.grid_cols == 2 && p.window_width < crate::layout::MOBILE_BREAKPOINT,
+            p.is_mobile && p.grid_cols == 3 && p.window_width < crate::layout::MOBILE_BREAKPOINT,
             "退出全屏首帧(窗口尚未异步缩回前)必须严格保持竖屏 Mobile 布局,不得闪回 Desktop"
         );
     }
-    // 即使在非全屏下收到异常超宽 WindowResized,竖屏模式也必须死锁在 Mobile 2 列
+    // 即使在非全屏下收到异常超宽 WindowResized,竖屏模式也必须死锁在 Mobile 带内(859 DIP -> 3 列)
     s.send(Message::WindowResized(windows_reactor::WindowSize {
         width: 1920.0,
         height: 1080.0,
@@ -676,8 +676,22 @@ fn fullscreen(s: &mut Scenario) -> Result<(), String> {
     {
         let p = s.probe.borrow();
         assert!(
-            p.is_mobile && p.grid_cols == 2 && p.window_width < crate::layout::MOBILE_BREAKPOINT,
+            p.is_mobile && p.grid_cols == 3 && p.window_width < crate::layout::MOBILE_BREAKPOINT,
             "竖屏模式开启期间任意超宽 WindowResized 均不得突破 Mobile 边界"
+        );
+    }
+    // 缩回默认 480x860 竖屏宽度，验证退回 2 列
+    s.send(Message::WindowResized(windows_reactor::WindowSize {
+        width: crate::layout::DEFAULT_PORTRAIT_WIDTH,
+        height: crate::layout::DEFAULT_PORTRAIT_HEIGHT,
+    }))?;
+    s.sync()?;
+    {
+        let p = s.probe.borrow();
+        assert!(
+            p.is_mobile && p.grid_cols == 2,
+            "竖屏 480 DIP 默认宽度应为 Mobile 2 列(cols={})",
+            p.grid_cols
         );
     }
     s.send(Message::NavTagSelected(Some("home".into())))?;
@@ -798,9 +812,11 @@ fn unplayable(s: &mut Scenario) -> Result<(), String> {
 /// 老配置必须默认 mpv)、真实 `UpdateSettings` 路径与真实直播打开路径:
 /// ① 切 native 只记账 —— 没有装载时 `native_playback` 必须保持 false(引擎切换
 ///    不得偷偷重开/接管任何通路);
-/// ② 直播即使设成 native 也永不接管 —— 控制/弹幕/视图三路分流单标志不被劫持,
-///    否则进度与音量会打到已卸载的系统媒体引擎上;
-/// ③ 切回 mpv 的收口不炸(透明层与 SMTC 写权此时本就未建立)。
+/// ② 直播按协议分流 —— HLS(系统引擎原生支持)由 native 整体接管,三路分流
+///    (控制/弹幕/视图)随 `native_playback` 一致翻转,无劫持窗口;FLV 仍走 mpv;
+///    两种情况下设置项本身都不被直播改动;
+/// ③ 切回 mpv 只记账 —— 在播的直播 HLS 继续由 native 承载;关播后 native 侧
+///    资源收口(`native_playback=false`)。
 fn engine(s: &mut Scenario) -> Result<(), String> {
     s.sync()?;
     {
@@ -823,7 +839,7 @@ fn engine(s: &mut Scenario) -> Result<(), String> {
         );
     }
 
-    // 直播(FLV):即使设置项是 native,也必须整条留在 mpv。
+    // 直播(v2 HLS):系统引擎原生支持 m3u8,整条走 native(协议分流,不看设置项)。
     s.send(Message::NavTagSelected(Some("live".into())))?;
     s.wait_for(Duration::from_secs(30), |p| p.route_tag == "live" && p.live_rooms > 0)
         .map_err(|err| format!("直播数据未就绪:{err}"))?;
@@ -835,10 +851,11 @@ fn engine(s: &mut Scenario) -> Result<(), String> {
         p.route_tag == "player" && p.now_playing_bvid.as_deref() == Some(expect.as_str())
     })
     .map_err(|err| format!("直播首房打开失败:{err}"))?;
+    s.wait_for(Duration::from_secs(60), |p| p.native_playback)
+        .map_err(|err| format!("直播 HLS 未由 native 接管:{err}"))?;
     {
         let p = s.probe.borrow();
         assert_eq!(p.player_engine, "native", "直播不应改动生效引擎");
-        assert!(!p.native_playback, "直播被 native 劫持:控制/弹幕会打到已卸载引擎");
     }
 
     s.send(Message::UpdateSettings(AppSettings {
@@ -849,8 +866,16 @@ fn engine(s: &mut Scenario) -> Result<(), String> {
     {
         let p = s.probe.borrow();
         assert_eq!(p.player_engine, "mpv", "切回 mpv 后生效引擎应回到 mpv");
-        assert!(!p.native_playback, "切回 mpv 后三路分流必须整体下线 native");
+        assert!(
+            p.native_playback,
+            "只记账口径:在播的直播 HLS 继续由 native 承载,切换不得打断"
+        );
     }
+
+    // 关播收口:离开播放页 → stop_playback 释放 native 侧(层线程 + player)。
+    s.send(Message::Back)?;
+    s.wait_for(Duration::from_secs(15), |p| !p.native_playback)
+        .map_err(|err| format!("关播后 native 侧未收口:{err}"))?;
     Ok(())
 }
 

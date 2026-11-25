@@ -1,6 +1,5 @@
 use super::*;
 
-use super::*;
 use qaq_bx_core::settings::{CodecPref, QualityPref};
 
 #[test]

@@ -80,7 +80,19 @@ impl AppShell {
                     return true;
                 }
                 match result {
-                    Ok(url) => {
+                    // 直播按协议分流:HLS→native(系统引擎原生支持),FLV→mpv(现状)。
+                    Ok(qaq_bx_core::live::LiveStreamUrl::Hls(url)) => {
+                        if self.native_load_live(&url, self.settings.autoplay) {
+                            self.playing = self.settings.autoplay;
+                            self.current_video_url = url;
+                        } else {
+                            self.player_notice = Some("直播 HLS 装载失败".into());
+                            self.video_loading = false;
+                            self.media_load_pending = false;
+                            self.native_load_epoch = None;
+                        }
+                    }
+                    Ok(qaq_bx_core::live::LiveStreamUrl::Flv(url)) => {
                         self.mpv_load_streams(&url, None, 0.0, self.settings.autoplay, context);
                         self.playing = self.settings.autoplay;
                         self.current_video_url = url;
@@ -554,11 +566,13 @@ impl AppShell {
         self.meta_fetch_inflight_seq = None;
         self.playback_avatar_dirty = false;
         self.playback_avatar_timer = None;
-        // 直播恒走 mpv(FLV,MF 不支持):先彻底停掉上一视频的双引擎残余。
+        // 直播按协议分流(HLS→native,FLV→mpv):先彻底停掉上一视频的双引擎残余;
+        // mpv 引擎延迟到 LiveReady 按协议创建(仅 FLV 需要,HLS 不碰 libmpv)。
         self.teardown_native_side(context);
-        let engine = self.ensure_engine();
-        engine.stop();
-        engine.set_danmaku(Vec::new());
+        if let Some(engine) = &self.engine {
+            engine.stop();
+            engine.set_danmaku(Vec::new());
+        }
         self.comment_draft.clear();
         self.composer_notice = None;
         let mut item = minimal_video_item(&format!("{LIVE_BVID_PREFIX}{roomid}"), &title);

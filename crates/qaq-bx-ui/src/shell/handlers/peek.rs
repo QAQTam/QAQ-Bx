@@ -120,7 +120,7 @@ impl AppShell {
                     }
                 }
             }
-            Message::PeekAnimTick(_) => {
+            Message::PeekAnimTick => {
                 // 翻牌帧:此后视图发布 Scale 1.15/Opacity 终值(composition 隐式过渡)。
                 if self.peek.phase_open() {
                     self.peek_anim_pending = false;
@@ -283,8 +283,8 @@ impl AppShell {
         } else {
             self.peek_anim_pending = true;
             self.peek_anim_timer =
-                Some(context.set_local_timeout(peek::PEEK_ANIM_SETTLE, move || {
-                    Message::PeekAnimTick(seq)
+                Some(context.set_local_timeout(peek::PEEK_ANIM_SETTLE, || {
+                    Message::PeekAnimTick
                 }));
         }
     }

@@ -690,7 +690,6 @@ pub(crate) fn danmaku_est_width(fontsize: i32, font_scale: f32, text: &str) -> f
                     | 0x2025..=0x2026   // 两点引导/省略号 ‥ …(实测 1.0em)
                     | 0x2190..=0x2199   // 箭头(实测 ↑ 1.0em)
                     | 0x2600..=0x27BF   // 杂项符号/装饰 ★☆♥ 等(实测 ★ 1.0em)
-                    | 0x301C            // 波浪号 〜(实测 1.0em)
                     | 0xFF00..=0xFF60   // 全角形式
                     | 0xFFE0..=0xFFE6   // 全角符号
                     | 0x20000..=0x2FA1F // CJK 扩展 B–F

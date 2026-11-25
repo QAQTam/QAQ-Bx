@@ -85,7 +85,7 @@ impl AppShell {
         on_open: &Callback<String>,
         context: &mut ViewContext<Self>,
     ) -> Option<KeyedView> {
-        let (Some(item), Some(engine)) = (self.now_playing.as_ref(), self.engine.as_ref()) else {
+        let (Some(item), Some(_)) = (self.now_playing.as_ref(), self.engine.as_ref()) else {
             return None;
         };
         let max_width =

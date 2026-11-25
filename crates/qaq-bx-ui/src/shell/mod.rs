@@ -480,7 +480,8 @@ pub struct AppShell {
     audio_fallback_done: bool,
     /// 播放状态节拍定时器：Drop 即取消投递，必须持有。
     timer: Option<ComponentTimer>,
-    /// 冒烟辅助:QAQ_BX_FS=1 的自动全屏一次性定时器(句柄必须存活)。
+    /// 冒烟辅助:QAQ_BX_FS=1 的自动全屏一次性定时器(句柄必须存活,Drop 即取消)。
+    #[allow(dead_code)]
     smoke_fs_timer: Option<ComponentTimer>,
     /// 登录轮询定时器（2s，独立于播放节拍）。
     login_timer: Option<ComponentTimer>,
@@ -550,11 +551,16 @@ use self::view::nav_item;
 
 // 跨域共享的状态类型与纯函数(P3 自 impl AppShell/自由函数迁移,调用点零改动):
 use self::handlers::{
-    apply_feed_page, CachedMedia, CommentsSessionState, missing_media_track,
-    missing_native_video_track, MissingTrack, mount_pulse_active, mpv_load_gate_settled,
-    mpv_should_show_loading, native_load_gate_settled, native_load_stalled,
-    native_should_show_loading, pages_menu_from, ResizeStorm, ResizeStormTrack,
+    apply_feed_page, CachedMedia, CommentsSessionState, mount_pulse_active, ResizeStormTrack,
     spawn_feed_batch, spawn_popular_fetch, spawn_resolve_media,
+};
+// shell/tests.rs 经 `use super::*` 依赖下列跨域纯函数/类型;非测试构建无引用,
+// 仅在 test 配置下引入,避免 unused_imports 告警。
+#[cfg(test)]
+use self::handlers::{
+    missing_media_track, missing_native_video_track, MissingTrack, mpv_load_gate_settled,
+    mpv_should_show_loading, native_load_gate_settled, native_load_stalled,
+    native_should_show_loading,
 };
 
 pub use self::message::Message;
@@ -1117,7 +1123,7 @@ impl Component for AppShell {
         context.window_title(crate::notifications::APP_DISPLAY_NAME);
         let portrait = self.settings.portrait_mode;
         let (client_w, client_h) = if portrait {
-            (PORTRAIT_MAX_WIDTH_DIPS, layout::DEFAULT_WINDOW_HEIGHT)
+            (layout::DEFAULT_PORTRAIT_WIDTH, layout::DEFAULT_PORTRAIT_HEIGHT)
         } else {
             (layout::DEFAULT_WINDOW_WIDTH, layout::DEFAULT_WINDOW_HEIGHT)
         };

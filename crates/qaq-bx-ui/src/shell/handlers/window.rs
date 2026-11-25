@@ -125,7 +125,7 @@ impl AppShell {
                 let restore = self.portrait_dock_restore.take();
                 let current_dips = self.viewport_layout.window_width;
                 let target_dips = PORTRAIT_MAX_WIDTH_DIPS;
-                context.run_window(move |window| {
+                let _ = context.run_window(move |window| {
                     let raw = window.as_raw();
                     if docked {
                         let prev = crate::winrt_ext::dock_window_right(

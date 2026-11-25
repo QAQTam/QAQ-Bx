@@ -38,7 +38,7 @@ use windows::Foundation::Uri;
 use windows::Media::Core::MediaSource;
 use windows::Media::Playback::{MediaPlayer, MediaPlaybackSession, MediaPlaybackState};
 use windows::Media::Streaming::Adaptive::AdaptiveMediaSourceCreationStatus;
-use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
+use windows::Storage::Streams::{DataReader, DataWriter, InMemoryRandomAccessStream};
 use windows::Web::Http::HttpClient;
 use windows_time::TimeSpan;
 
@@ -49,6 +49,8 @@ const REFERER: &str = "https://www.bilibili.com";
 /// 分段下载必须带浏览器 UA + Referer 两条头,与 mpv 路径一致。
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36";
 const MPD_CONTENT_TYPE: &str = "application/dash+xml";
+/// HLS manifest(m3u8,fMP4/TS)的内容类型(直播装载走此分支)。
+const HLS_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
 /// 面板重建换源的最小间隔:快速伸缩窗口会连续拆树/重建,每个节拍都重建既浪费
 /// 线程,也让管线反复开局。节流期内断点保持未消费,由后续节拍继续。
 const REBUILD_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1_500);
@@ -89,6 +91,11 @@ pub struct NativeStatus {
 struct AgileBox(#[allow(dead_code)] Box<dyn std::any::Any>);
 unsafe impl Send for AgileBox {}
 unsafe impl Sync for AgileBox {}
+
+/// 装载工作线程与 WinRT 线程池回调之间的结果通道包装:WinRT 对象均为 agile
+/// (默认 MTA 自由封送),与 [`AgileBox`] 同一安全性依据,仅补回类型。
+struct SendWinRT<T>(T);
+unsafe impl<T> Send for SendWinRT<T> {}
 
 /// attach 前挂起的装载产物(MediaSource 等 UI 注入 MPE 后接管 player)。
 struct PendingSource {
@@ -269,6 +276,8 @@ struct LoadRequest {
     mpd: String,
     video_base_url: String,
     audio_base_url: Option<String>,
+    /// 直播 HLS(m3u8 直链):非 None 时走 HLS 建源分支(mpd/base_url 留空)。
+    hls_url: Option<String>,
 }
 
 /// 系统媒体引擎(attach 模式;字段以 Mutex/RwLock 保护,Arc 共享合法)。
@@ -556,9 +565,29 @@ impl NativePlayer {
                 mpd: mpd.to_string(),
                 video_base_url: video_base_url.to_string(),
                 audio_base_url: audio_base_url.map(str::to_string),
+                hls_url: None,
             },
             autoplay,
             start_secs,
+        );
+        Ok(())
+    }
+
+    /// 直播 HLS 装载(m3u8 直链;系统引擎原生支持 HLS,无需 MPD 包装):
+    /// 单源无音轨、无续播语义(start=0),与 VOD 共用世代/注入/产物回收状态机。
+    pub fn load_live(self: &Arc<Self>, m3u8_url: &str, autoplay: bool) -> Result<(), String> {
+        if m3u8_url.is_empty() {
+            return Err("m3u8 地址为空".to_string());
+        }
+        self.start_build(
+            LoadRequest {
+                mpd: String::new(),
+                video_base_url: String::new(),
+                audio_base_url: None,
+                hls_url: Some(m3u8_url.to_string()),
+            },
+            autoplay,
+            0.0,
         );
         Ok(())
     }
@@ -592,7 +621,13 @@ impl NativePlayer {
         // 静音会把 want_play 写成 false,新意图必须在其后落定(面板重建续播
         // 以此为准,不能因为「刚静音过」就把用户的播放意愿丢掉)。
         self.want_play.store(autoplay, Ordering::SeqCst);
-        self.spawn_build(request.mpd, request.video_base_url, request.audio_base_url, seq);
+        self.spawn_build(
+            request.mpd,
+            request.video_base_url,
+            request.audio_base_url,
+            request.hls_url,
+            seq,
+        );
     }
 
     /// 渲染面板卸载(NativeSurface 随视图树拆走):暂停并作废旧元素自持的
@@ -838,6 +873,7 @@ impl NativePlayer {
         mpd: String,
         video_base_url: String,
         audio_base_url: Option<String>,
+        hls_url: Option<String>,
         seq: u64,
     ) {
         let weak = Arc::downgrade(self);
@@ -853,7 +889,11 @@ impl NativePlayer {
                     }
                     return;
                 };
-                let outcome = engine.build_source(&mpd, &video_base_url, audio_base_url.as_deref());
+                let outcome = if let Some(hls_url) = hls_url {
+                    engine.build_source_hls(&hls_url)
+                } else {
+                    engine.build_source(&mpd, &video_base_url, audio_base_url.as_deref())
+                };
                 engine.collect_build(seq, outcome);
                 if uninit {
                     unsafe { CoUninitialize() };
@@ -904,18 +944,7 @@ impl NativePlayer {
     ) -> Result<(MediaSource, Vec<AgileBox>), String> {
         let mut keep = Vec::with_capacity(2);
         // 1) 带 Referer 的 HttpClient(系统管线拉分段全走它)。
-        let client = HttpClient::new().map_err(|e| format!("HttpClient 创建失败:{e}"))?;
-        let headers = client
-            .DefaultRequestHeaders()
-            .map_err(|e| format!("请求头获取失败:{e}"))?;
-        let referer = Uri::CreateUri(&HSTRING::from(REFERER))
-            .map_err(|e| format!("Referer Uri 构造失败:{e}"))?;
-        headers
-            .SetReferer(&referer)
-            .map_err(|e| format!("Referer 头设置失败:{e}"))?;
-        headers
-            .Insert(&HSTRING::from("User-Agent"), &HSTRING::from(BROWSER_UA))
-            .map_err(|e| format!("User-Agent 头设置失败:{e}"))?;
+        let client = referer_client()?;
 
         // 2) MPD 文本 → InMemoryRandomAccessStream。
         let stream =
@@ -994,6 +1023,132 @@ impl NativePlayer {
         keep.push(AgileBox(Box::new(ams)));
         Ok((media_source, keep))
     }
+
+    /// HLS(m3u8 直链)→ MediaSource(直播装载;fMP4 v7 + EXT-X-MAP 实测 guest 可拉):
+    /// 先带 Referer 拉 manifest 文本入内存流,再以 m3u8 URL 为基准建源 ——
+    /// 分段/子 playlist 相对解析全走同一 client(Referer/UA 注入);直播滑动窗
+    /// playlist(无 ENDLIST)由 AMS 自动进入 live 模式持续取新分片。
+    fn build_source_hls(&self, m3u8_url: &str) -> Result<(MediaSource, Vec<AgileBox>), String> {
+        let mut keep = Vec::with_capacity(1);
+        let client = referer_client()?;
+        // 1) manifest 文本(GetAsync 可能死等,复用 BUILD_TIMEOUT 取消)。
+        let manifest_uri = Uri::CreateUri(&HSTRING::from(m3u8_url))
+            .map_err(|e| format!("m3u8 Uri 构造失败:{e}"))?;
+        let op = client
+            .GetAsync(&manifest_uri)
+            .map_err(|e| format!("m3u8 拉取失败:{e}"))?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        op.when(move |res| {
+            let _ = tx.send(res.map(SendWinRT));
+        })
+        .map_err(|e| format!("m3u8 回调注册失败:{e}"))?;
+        let response = match rx.recv_timeout(BUILD_TIMEOUT) {
+            Ok(res) => res.map_err(|e| format!("m3u8 拉取失败:{e}"))?.0,
+            Err(_) => {
+                let _ = op.Cancel();
+                return Err("m3u8 拉取超时".to_string());
+            }
+        };
+        let content = response
+            .Content()
+            .map_err(|e| format!("m3u8 响应体获取失败:{e}"))?;
+        let buf_op = content
+            .ReadAsBufferAsync()
+            .map_err(|e| format!("m3u8 缓冲读取失败:{e}"))?;
+        let (btx, brx) = std::sync::mpsc::sync_channel(1);
+        buf_op
+            .when(move |res| {
+                let _ = btx.send(res.map(SendWinRT));
+            })
+            .map_err(|e| format!("m3u8 缓冲回调注册失败:{e}"))?;
+        let buffer = match brx.recv_timeout(BUILD_TIMEOUT) {
+            Ok(res) => res.map_err(|e| format!("m3u8 缓冲读取失败:{e}"))?.0,
+            Err(_) => {
+                let _ = buf_op.Cancel();
+                return Err("m3u8 缓冲读取超时".to_string());
+            }
+        };
+        let reader = DataReader::FromBuffer(&buffer)
+            .map_err(|e| format!("m3u8 数据读取失败:{e}"))?;
+        let mut bytes = vec![0u8; buffer.Length().map_err(|e| format!("m3u8 长度读取失败:{e}"))? as usize];
+        reader
+            .ReadBytes(&mut bytes)
+            .map_err(|e| format!("m3u8 数据读出失败:{e}"))?;
+
+        // 2) 文本入内存流(与 MPD 路径同构:manifest 文本 + 真实 URI 基准)。
+        let stream =
+            InMemoryRandomAccessStream::new().map_err(|e| format!("内存流创建失败:{e}"))?;
+        let writer =
+            DataWriter::CreateDataWriter(&stream).map_err(|e| format!("DataWriter 创建失败:{e}"))?;
+        writer
+            .WriteBytes(&bytes)
+            .map_err(|e| format!("m3u8 写入失败:{e}"))?;
+        writer
+            .StoreAsync()
+            .and_then(|op| op.join())
+            .map_err(|e| format!("m3u8 流提交失败:{e}"))?;
+        stream
+            .Seek(0)
+            .map_err(|e| format!("m3u8 流回卷失败:{e}"))?;
+
+        // 3) AdaptiveMediaSource(基准 = m3u8 直链)。
+        let op =
+            windows::Media::Streaming::Adaptive::AdaptiveMediaSource::CreateFromStreamWithDownloaderAsync(
+                &stream,
+                &manifest_uri,
+                &HSTRING::from(HLS_CONTENT_TYPE),
+                &client,
+            )
+            .map_err(|e| format!("AdaptiveMediaSource 创建失败:{e}"))?;
+        let (ctx_tx, ctx_rx) = std::sync::mpsc::sync_channel(1);
+        op.when(move |res| {
+            let _ = ctx_tx.send(res);
+        })
+        .map_err(|e| format!("AdaptiveMediaSource 回调注册失败:{e}"))?;
+        let creation = match ctx_rx.recv_timeout(BUILD_TIMEOUT) {
+            Ok(res) => res.map_err(|e| format!("AdaptiveMediaSource 创建失败:{e}"))?,
+            Err(_) => {
+                let _ = op.Cancel();
+                return Err("AdaptiveMediaSource 构建超时".to_string());
+            }
+        };
+        if creation
+            .Status()
+            .map_err(|e| format!("AMS status 读取失败:{e}"))?
+            != AdaptiveMediaSourceCreationStatus::Success
+        {
+            return Err(format!(
+                "m3u8 解析失败(status={:?},extended={:?})",
+                creation.Status(),
+                creation.ExtendedError().map(|e| e.0)
+            ));
+        }
+        let ams = creation.MediaSource().map_err(|e| format!("AMS 获取失败:{e}"))?;
+        if let Ok(advanced) = ams.AdvancedSettings() {
+            let _ = advanced.SetAllSegmentsIndependent(true);
+        }
+        let media_source =
+            MediaSource::CreateFromAdaptiveMediaSource(&ams).map_err(|e| format!("MediaSource 包装失败:{e}"))?;
+        keep.push(AgileBox(Box::new(ams)));
+        Ok((media_source, keep))
+    }
+}
+
+/// 带 Referer/UA 的 HttpClient(系统管线拉 manifest 与分段全走它)。
+fn referer_client() -> Result<HttpClient, String> {
+    let client = HttpClient::new().map_err(|e| format!("HttpClient 创建失败:{e}"))?;
+    let headers = client
+        .DefaultRequestHeaders()
+        .map_err(|e| format!("请求头获取失败:{e}"))?;
+    let referer = Uri::CreateUri(&HSTRING::from(REFERER))
+        .map_err(|e| format!("Referer Uri 构造失败:{e}"))?;
+    headers
+        .SetReferer(&referer)
+        .map_err(|e| format!("Referer 头设置失败:{e}"))?;
+    headers
+        .Insert(&HSTRING::from("User-Agent"), &HSTRING::from(BROWSER_UA))
+        .map_err(|e| format!("User-Agent 头设置失败:{e}"))?;
+    Ok(client)
 }
 
 #[cfg(test)]
@@ -1273,6 +1428,7 @@ mod tests {
             mpd: "<MPD/>".into(),
             video_base_url: "https://invalid.invalid/v.mpd".into(),
             audio_base_url: None,
+            hls_url: None,
         });
         *engine.resume.lock().unwrap() = Some((true, 42.5));
         engine.want_play.store(true, Ordering::SeqCst);
@@ -1288,6 +1444,7 @@ mod tests {
             mpd: "<not-dash>".into(),
             video_base_url: "https://invalid.invalid/v.mpd".into(),
             audio_base_url: None,
+            hls_url: None,
         });
         *engine.resume.lock().unwrap() = Some((true, 12.0));
         *engine.last_rebuild_at.lock().unwrap() = Some(std::time::Instant::now());
@@ -1328,6 +1485,7 @@ mod tests {
             mpd: "<not-dash>".into(),
             video_base_url: "https://invalid.invalid/v.mpd".into(),
             audio_base_url: None,
+            hls_url: None,
         });
         *engine.resume.lock().unwrap() = Some((true, 21.0));
         *engine.last_rebuild_at.lock().unwrap() = Some(std::time::Instant::now());

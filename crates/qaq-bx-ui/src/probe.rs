@@ -18,6 +18,14 @@
 //! 全程写 `data/xamlroot-probe.log`。探针状态机全部在 UI 线程
 //! (thread_local),仅 THREAD 阶段显式跨线程。只在 probe feature 下编译。
 
+#![allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code,
+    clippy::all
+)]
+
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 

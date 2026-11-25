@@ -157,10 +157,43 @@ pub fn set_maximizable(hwnd_raw: *mut core::ffi::c_void, enabled: bool) -> bool 
     ok
 }
 
+/// 推算当前窗口 DPI 缩放倍率：优先采用 Win32 `GetDpiForWindow`，缺失时回退到客户区物理像素/逻辑 DIP 比值。
+fn resolve_dpi_scale(hwnd_dpi: Option<u32>, inner_width_px: i32, current_client_dips: f64) -> f64 {
+    if let Some(dpi) = hwnd_dpi
+        && dpi >= 96
+    {
+        return (f64::from(dpi) / 96.0).clamp(0.5, 4.0);
+    }
+    if current_client_dips.is_finite() && current_client_dips > 0.0 && inner_width_px > 0 {
+        (f64::from(inner_width_px) / current_client_dips).clamp(0.5, 4.0)
+    } else {
+        1.0
+    }
+}
+
+fn window_dpi(hwnd_raw: *mut core::ffi::c_void) -> Option<u32> {
+    if hwnd_raw.is_null() {
+        return None;
+    }
+    let dpi = unsafe {
+        windows::Win32::winuser::GetDpiForWindow(hwnd_raw as windows::Win32::windef::HWND)
+    };
+    (dpi >= 96).then_some(dpi)
+}
+
+/// 最小外框像素（向上取整，保证分数倍 DPI 下物理像素反算回 DIP ≥ min_dips）。
+fn dips_to_outer_min_px(min_dips: f64, scale: f64, non_client_px: i32) -> i32 {
+    ((min_dips * scale).ceil().max(1.0) as i32).saturating_add(non_client_px)
+}
+
+/// 最大外框像素（向下取整，保证分数倍 DPI 下物理像素反算回 DIP ≤ max_dips）。
+fn dips_to_outer_max_px(max_dips: f64, scale: f64, non_client_px: i32) -> i32 {
+    ((max_dips * scale).floor().max(1.0) as i32).saturating_add(non_client_px)
+}
+
 /// 竖屏模式「贴边最大化」:右缘贴边 × 邻近屏工作区全高,客户区宽对齐
-/// `client_width_dips`(DIP→像素按当前 `inner.width / current_client_dips`
-/// 推算,不依赖任何 DPI API)。返回停靠前外框 (x, y, w, h) 物理像素供还原;
-/// 失败返回 None(调用方保持现状)。
+/// `client_width_dips`(优先取 Win32 DPI,兜底按 `inner.width / current_client_dips`
+/// 推算)。返回停靠前外框 (x, y, w, h) 物理像素供还原;失败返回 None。
 pub fn dock_window_right(
     hwnd_raw: *mut core::ffi::c_void,
     client_width_dips: f64,
@@ -187,14 +220,9 @@ pub fn dock_window_right(
         outer.width,
         outer.height,
     );
-    let scale = if current_client_dips.is_finite() && current_client_dips > 0.0 {
-        f64::from(inner.width) / current_client_dips
-    } else {
-        1.0
-    };
+    let scale = resolve_dpi_scale(window_dpi(hwnd_raw), inner.width, current_client_dips);
     let non_client_width = outer.width.saturating_sub(inner.width);
-    let target_client_w = (client_width_dips * scale).round().max(1.0) as i32;
-    let target_outer_w = target_client_w.saturating_add(non_client_width);
+    let target_outer_w = dips_to_outer_max_px(client_width_dips, scale, non_client_width);
     let target_outer_h = work.height.max(1);
     let x = work.x.saturating_add(work.width.saturating_sub(target_outer_w));
     app_window
@@ -261,22 +289,16 @@ pub fn enforce_portrait_window_policy(
     let Ok(inner) = app_window.cast::<IAppWindow2>().and_then(|w| w.ClientSize()) else {
         return false;
     };
-    let scale = if current_client_dips.is_finite() && current_client_dips > 0.0 && inner.width > 0 {
-        (f64::from(inner.width) / current_client_dips).clamp(0.5, 4.0)
-    } else {
-        1.0
-    };
+    let scale = resolve_dpi_scale(window_dpi(hwnd_raw), inner.width, current_client_dips);
     let non_client_w = outer.width.saturating_sub(inner.width);
     let non_client_h = outer.height.saturating_sub(inner.height);
-    let to_outer_w = |dips: f64| ((dips * scale).round().max(1.0) as i32).saturating_add(non_client_w);
-    let to_outer_h = |dips: f64| ((dips * scale).round().max(1.0) as i32).saturating_add(non_client_h);
 
     if let Ok(presenter) = app_window.Presenter()
         && let Ok(p3) = presenter.cast::<IOverlappedPresenter3>()
     {
-        let min_w = Some(to_outer_w(min_client_width_dips));
-        let min_h = Some(to_outer_h(min_client_height_dips));
-        let max_w = max_client_width_dips.map(to_outer_w);
+        let min_w = Some(dips_to_outer_min_px(min_client_width_dips, scale, non_client_w));
+        let min_h = Some(dips_to_outer_min_px(min_client_height_dips, scale, non_client_h));
+        let max_w = max_client_width_dips.map(|dips| dips_to_outer_max_px(dips, scale, non_client_w));
         let _ = p3.SetPreferredMinimumWidth(min_w);
         let _ = p3.SetPreferredMinimumHeight(min_h);
         let _ = p3.SetPreferredMaximumWidth(max_w);
@@ -288,11 +310,11 @@ pub fn enforce_portrait_window_policy(
         && max_dips.is_finite()
         && max_dips > 0.0
     {
-        let max_outer_w = to_outer_w(max_dips);
+        let max_outer_w = dips_to_outer_max_px(max_dips, scale, non_client_w);
         if outer.width > max_outer_w
             && let Ok(pos) = app_window.Position()
         {
-            let min_outer_h = to_outer_h(min_client_height_dips);
+            let min_outer_h = dips_to_outer_min_px(min_client_height_dips, scale, non_client_h);
             let _ = app_window.MoveAndResize(RectInt32 {
                 x: pos.x,
                 y: pos.y,
@@ -375,5 +397,24 @@ mod tests {
             859.0,
             true,
         ));
+    }
+
+    #[test]
+    fn dpi_scale_and_inward_pixel_rounding_preserve_portrait_band() {
+        assert!((resolve_dpi_scale(Some(144), 1000, 800.0) - 1.5).abs() < 1e-9);
+        // DPI 缺失时回退物理像素/DIP 比值。
+        assert!((resolve_dpi_scale(None, 1074, 859.0) - (1074.0 / 859.0)).abs() < 1e-6);
+        assert_eq!(resolve_dpi_scale(None, 0, 0.0), 1.0);
+
+        for dpi in [96u32, 120, 144, 168, 192, 216] {
+            let scale = resolve_dpi_scale(Some(dpi), 0, 0.0);
+            let non_client = 16;
+            let min_outer = dips_to_outer_min_px(390.0, scale, non_client);
+            let max_outer = dips_to_outer_max_px(859.0, scale, non_client);
+            let min_dips = f64::from(min_outer - non_client) / scale;
+            let max_dips = f64::from(max_outer - non_client) / scale;
+            assert!(min_dips >= 390.0, "dpi={dpi}: min_dips={min_dips}");
+            assert!(max_dips <= 859.0 && max_dips < 860.0, "dpi={dpi}: max_dips={max_dips}");
+        }
     }
 }

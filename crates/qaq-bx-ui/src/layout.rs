@@ -17,6 +17,9 @@ pub const MOBILE_BREAKPOINT: f64 = 860.0;
 pub const EXPANDED_BREAKPOINT: f64 = 860.0;
 /// 竖屏模式（实验）客户区宽度上限：底栏出现边界 − 1 DIP，严格锁定在 Mobile 宽度带 `[390, 859]`。
 pub const PORTRAIT_MAX_WIDTH_DIPS: f64 = MOBILE_BREAKPOINT - 1.0;
+/// 竖屏模式（实验）初始默认客户区尺寸（9:16 竖屏手感；可向右拖宽至 859 或贴边进入 3 列）。
+pub const DEFAULT_PORTRAIT_WIDTH: f64 = 480.0;
+pub const DEFAULT_PORTRAIT_HEIGHT: f64 = 860.0;
 
 /// 默认桌面窗口尺寸。
 pub const DEFAULT_WINDOW_WIDTH: f64 = 1280.0;
@@ -40,7 +43,9 @@ pub const DESKTOP_MARGIN_X: f64 = 36.0;
 
 pub const MOBILE_MARGIN_X: f64 = 12.0;
 pub const MOBILE_CARD_GAP: f64 = 8.0;
-pub const MOBILE_CARD_TEXT_ALLOWANCE: f64 = 77.0;
+/// Mobile 3 列切入参考最小卡宽（`599` DIP 仍为 2 列，`600` DIP 起自动升为 3 列，`859` DIP 3 列 273px）。
+pub const MOBILE_CARD_MIN_WIDTH: f64 = 186.5;
+pub const MOBILE_CARD_TEXT_ALLOWANCE: f64 = 84.0;
 
 // ---------------------------------------------------------------------------
 // 卡片文本列严格不变量（首页/热门/搜索共用 `VideoCard`，#10）
@@ -57,12 +62,12 @@ pub const MOBILE_CARD_TEXT_ALLOWANCE: f64 = 77.0;
 pub const CARD_LINE_EM: f64 = 1.48;
 /// 标题定高槽恒预留的行数（1 行标题也在槽内顶对齐，余量沉底不外溢）。
 pub const CARD_TITLE_MAX_LINES: f64 = 2.0;
-/// 标题字号（#10 调小一档）：桌面 14→13，紧凑 12.5→12。
+/// 标题字号：桌面 13.0，紧凑/竖屏 13.5（适配 PC 视距与 2~3 列卡宽）。
 pub const CARD_TITLE_FONT_DESKTOP: f64 = 13.0;
-pub const CARD_TITLE_FONT_COMPACT: f64 = 12.0;
-/// UP 主行字号（沿用原值，纳入不变量推导）。
+pub const CARD_TITLE_FONT_COMPACT: f64 = 13.5;
+/// UP 主行字号（纳入不变量推导）。
 pub const CARD_AUTHOR_FONT_DESKTOP: f64 = 12.0;
-pub const CARD_AUTHOR_FONT_COMPACT: f64 = 11.0;
+pub const CARD_AUTHOR_FONT_COMPACT: f64 = 12.0;
 /// 播放量·弹幕统计行字号。
 pub const CARD_STATS_FONT: f64 = 11.0;
 /// 文本列行距（与 StackPanel::spacing 同源，供高度推导）。
@@ -70,8 +75,8 @@ pub const CARD_TEXT_SPACING: f64 = 4.0;
 /// 文本列容器上/下缘距（与 video_card.rs margins 同值，供高度推导）。
 pub const CARD_TEXT_MARGIN_DESKTOP_TOP: f64 = 10.0;
 pub const CARD_TEXT_MARGIN_DESKTOP_BOTTOM: f64 = 12.0;
-pub const CARD_TEXT_MARGIN_COMPACT_TOP: f64 = 6.0;
-pub const CARD_TEXT_MARGIN_COMPACT_BOTTOM: f64 = 8.0;
+pub const CARD_TEXT_MARGIN_COMPACT_TOP: f64 = 8.0;
+pub const CARD_TEXT_MARGIN_COMPACT_BOTTOM: f64 = 10.0;
 
 /// 一行定高（Noto Sans SC 最坏行高向上取整到整 DIP）。
 pub fn card_line_slot(font: f64) -> f64 {
@@ -145,16 +150,20 @@ impl CardTextLayout {
     }
 
     /// UP 主行顶边（相对文本列容器顶）：纯常量，与标题换行无关。
+    /// 当前仅测试模块用作布局不变量断言，非测试构建不参与编译。
+    #[cfg(test)]
     pub fn author_top(self) -> f64 {
         self.top_margin() + self.title_slot() + self.spacing()
     }
 
     /// 统计行顶边（紧凑卡无统计行，本值仅桌面态有意义）。
+    #[cfg(test)]
     pub fn stats_top(self) -> f64 {
         self.author_top() + self.author_slot() + self.spacing()
     }
 
     /// 文本列总占高（含上下缘距）；紧凑卡文本列只有标题+UP 两槽。
+    #[cfg(test)]
     pub fn total_height(self) -> f64 {
         if self.compact {
             self.author_top() + self.author_slot() + self.bottom_margin()
@@ -164,6 +173,7 @@ impl CardTextLayout {
     }
 
     /// 文本列可用额度（card_height − cover_height，两态均为常量）。
+    #[cfg(test)]
     pub fn allowance(compact: bool) -> f64 {
         if compact {
             MOBILE_CARD_TEXT_ALLOWANCE
@@ -253,12 +263,15 @@ impl CardMetrics {
         }
         match chrome {
             ShellChromeMode::Mobile => {
-                let cols = 2usize;
                 let margin_x = MOBILE_MARGIN_X;
                 let gap = MOBILE_CARD_GAP;
-                let card_width = ((content_width - margin_x * 2.0 - gap) / cols as f64)
+                let inner = (content_width - margin_x * 2.0).max(160.0 * 2.0 + gap);
+                let cols = ((inner + gap) / (MOBILE_CARD_MIN_WIDTH + gap))
                     .floor()
-                    .clamp(160.0, 414.0);
+                    .clamp(2.0, 3.0) as usize;
+                let card_width = ((inner - gap * (cols as f64 - 1.0)) / cols as f64)
+                    .floor()
+                    .clamp(160.0, 320.0);
                 let cover_height = (card_width * 9.0 / 16.0).round();
                 let card_height = cover_height + MOBILE_CARD_TEXT_ALLOWANCE;
                 Self {
@@ -328,9 +341,14 @@ impl ViewportLayout {
 
     pub fn for_window(width: f64, height: f64, portrait_mode: bool) -> Self {
         let default_w = if portrait_mode {
-            PORTRAIT_MAX_WIDTH_DIPS
+            DEFAULT_PORTRAIT_WIDTH
         } else {
             DEFAULT_WINDOW_WIDTH
+        };
+        let default_h = if portrait_mode {
+            DEFAULT_PORTRAIT_HEIGHT
+        } else {
+            DEFAULT_WINDOW_HEIGHT
         };
         let raw_w = if width.is_finite() && width > 0.0 {
             width.max(MIN_WINDOW_WIDTH)
@@ -345,7 +363,7 @@ impl ViewportLayout {
         let win_h = if height.is_finite() && height > 0.0 {
             height.max(MIN_WINDOW_HEIGHT)
         } else {
-            DEFAULT_WINDOW_HEIGHT
+            default_h
         };
         let chrome = if portrait_mode {
             ShellChromeMode::Mobile
@@ -370,12 +388,12 @@ impl ViewportLayout {
     }
 
     pub fn initial(portrait_mode: bool) -> Self {
-        let w = if portrait_mode {
-            PORTRAIT_MAX_WIDTH_DIPS
+        let (w, h) = if portrait_mode {
+            (DEFAULT_PORTRAIT_WIDTH, DEFAULT_PORTRAIT_HEIGHT)
         } else {
-            DEFAULT_WINDOW_WIDTH
+            (DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
         };
-        Self::for_window(w, DEFAULT_WINDOW_HEIGHT, portrait_mode)
+        Self::for_window(w, h, portrait_mode)
     }
 
     pub fn is_mobile(self) -> bool {
@@ -478,7 +496,7 @@ mod tests {
         assert!(m390.cards.compact_card);
         assert_eq!(m390.cards.card_width, 179.0);
         assert_eq!(m390.cards.cover_height, 101.0);
-        assert_eq!(m390.cards.card_height, 178.0);
+        assert_eq!(m390.cards.card_height, 185.0);
         assert_eq!(m390.player_video_height(), 206.0);
 
         let m599 = ViewportLayout::from_window_size(599.0, 800.0);
@@ -488,13 +506,14 @@ mod tests {
         assert_eq!(m599.cards.card_width, 283.0);
         assert!(!m599.shows_title_search_button());
 
-        // 600..859：同样处于 2 列区间，直接切为等宽铺满 Mobile 壳层，并保留顶栏右上悬浮搜索按钮
+        // 600..859：Medium 内容档起自动切入 Mobile 3 列（186..273px），保留顶栏右上悬浮搜索按钮
         let m600 = ViewportLayout::from_window_size(600.0, 800.0);
         assert_eq!(m600.chrome, ShellChromeMode::Mobile);
         assert_eq!(m600.tier, ContentLayoutTier::Medium);
         assert!(m600.cards.compact_card);
-        assert_eq!(m600.cards.cols, 2);
-        assert_eq!(m600.cards.card_width, 284.0);
+        assert_eq!(m600.cards.cols, 3);
+        assert_eq!(m600.cards.card_width, 186.0);
+        assert_eq!(m600.cards.cover_height, 105.0);
         assert!(m600.is_single_column());
         assert!(m600.shows_title_search_button());
         assert!(!m600.shows_inline_title_search());
@@ -502,15 +521,17 @@ mod tests {
         let m640 = ViewportLayout::from_window_size(640.0, 900.0);
         assert_eq!(m640.chrome, ShellChromeMode::Mobile);
         assert_eq!(m640.tier, ContentLayoutTier::Medium);
-        assert_eq!(m640.cards.cols, 2);
-        assert_eq!(m640.cards.card_width, 304.0);
+        assert_eq!(m640.cards.cols, 3);
+        assert_eq!(m640.cards.card_width, 200.0);
+        assert_eq!(m640.cards.cover_height, 113.0);
         assert_eq!(m640.player_video_height(), 347.0);
         assert!(m640.is_single_column());
 
         let m859 = ViewportLayout::from_window_size(859.0, 800.0);
         assert!(m859.is_mobile());
-        assert_eq!(m859.cards.cols, 2);
-        assert_eq!(m859.cards.card_width, 413.0);
+        assert_eq!(m859.cards.cols, 3);
+        assert_eq!(m859.cards.card_width, 273.0);
+        assert_eq!(m859.cards.cover_height, 154.0);
 
         // 860px 起桌面端正好排下 3 列标准卡（56+72+236*3+24），同步切回 Desktop Expanded
         let d860 = ViewportLayout::from_window_size(860.0, 800.0);
@@ -574,9 +595,10 @@ mod tests {
         );
 
         let compact = CardTextLayout { compact: true };
-        assert_eq!(compact.title_font(), 12.0, "紧凑标题应为调小一档后的 12px");
-        assert_eq!(compact.title_slot(), 36.0);
-        assert_eq!(compact.author_top(), 6.0 + 36.0 + 4.0);
+        assert_eq!(compact.title_font(), 13.5, "紧凑标题应为 PC 视距友好的 13.5px");
+        assert_eq!(compact.title_slot(), 40.0);
+        assert_eq!(compact.author_slot(), 18.0);
+        assert_eq!(compact.author_top(), 8.0 + 40.0 + 4.0);
         assert!(compact.total_height() <= CardTextLayout::allowance(true));
 
         // 不变量的「构造性」：CardTextLayout 上不存在标题输入通道；再跨整条
@@ -671,16 +693,19 @@ mod tests {
     #[test]
     fn portrait_mode_strictly_clamps_to_mobile_band_across_all_widths() {
         let init = ViewportLayout::initial(true);
-        assert_eq!(init.window_width, PORTRAIT_MAX_WIDTH_DIPS);
+        assert_eq!(init.window_width, DEFAULT_PORTRAIT_WIDTH);
+        assert_eq!(init.window_height, DEFAULT_PORTRAIT_HEIGHT);
         assert_eq!(init.chrome, ShellChromeMode::Mobile);
-        assert_eq!(init.tier, ContentLayoutTier::Medium);
+        assert_eq!(init.tier, ContentLayoutTier::Compact);
         assert_eq!(init.cards.cols, 2);
+        assert_eq!(init.cards.card_width, 224.0);
+        assert_eq!(init.cards.cover_height, 126.0);
         assert!(init.cards.compact_card);
         assert!(init.is_mobile());
         assert!(init.is_single_column());
         assert!(!init.shows_inline_title_search());
 
-        for width in [0.0, f64::NAN, 320.0, 390.0, 640.0, 859.0, 860.0, 1280.0, 1920.0, 3840.0] {
+        for width in [0.0, f64::NAN, 320.0, 390.0, 480.0, 599.0, 600.0, 640.0, 859.0, 860.0, 1280.0, 1920.0, 3840.0] {
             let l = ViewportLayout::for_window(width, 1080.0, true);
             assert!(
                 l.window_width >= MIN_WINDOW_WIDTH && l.window_width <= PORTRAIT_MAX_WIDTH_DIPS,
@@ -689,9 +714,48 @@ mod tests {
             );
             assert_eq!(l.chrome, ShellChromeMode::Mobile, "width={width}: 必须恒为 Mobile");
             assert_ne!(l.tier, ContentLayoutTier::Expanded, "width={width}: 严禁进入 Expanded");
-            assert_eq!(l.cards.cols, 2, "width={width}: 竖屏卡片列数必须恒为 2");
+            let expected_cols = if l.tier == ContentLayoutTier::Compact { 2 } else { 3 };
+            assert_eq!(l.cards.cols, expected_cols, "width={width}: 竖屏列数应随档位 2/3 自适应");
             assert!(l.cards.compact_card, "width={width}: 竖屏必须恒为紧凑卡");
             assert!(!l.shows_inline_title_search(), "width={width}: 竖屏严禁出现桌面内嵌搜索框");
+        }
+    }
+
+    #[test]
+    fn mobile_and_portrait_dpi_matrix_preserves_bounds_and_16_9() {
+        let scales = [1.0_f64, 1.25, 1.5, 1.75, 2.0, 2.25];
+        for scale in scales {
+            // 任意 DPI 下向下取整到物理像素后再反推 DIP，必须严格小于 MOBILE_BREAKPOINT。
+            let max_client_px = (PORTRAIT_MAX_WIDTH_DIPS * scale).floor();
+            assert!(
+                max_client_px / scale < MOBILE_BREAKPOINT,
+                "scale={scale}: 竖屏上限物理像素越界"
+            );
+            let min_client_px = (MIN_WINDOW_WIDTH * scale).ceil();
+            assert!(
+                min_client_px / scale >= MIN_WINDOW_WIDTH,
+                "scale={scale}: 竖屏下限物理像素越界"
+            );
+
+            for width in (390..=859).step_by(17).chain([390, 480, 599, 600, 750, 859]) {
+                let layout = ViewportLayout::for_window(f64::from(width), 860.0, true);
+                let m = layout.cards;
+                assert_eq!(m.card_width.fract(), 0.0);
+                assert_eq!(m.cover_height.fract(), 0.0);
+                assert!(
+                    (m.cover_height - m.card_width * 9.0 / 16.0).abs() <= 0.5 + 1e-9,
+                    "width={width}: 封面高度偏离 16:9 超过 0.5 DIP ({}/{})",
+                    m.cover_height,
+                    m.card_width
+                );
+                let used = m.cols as f64 * m.card_width + (m.cols as f64 - 1.0) * m.gap;
+                let inner = layout.content_width() - 2.0 * m.margin_x;
+                assert!(used <= inner + 0.5, "width={width}: 行宽溢出");
+                assert!(
+                    CardTextLayout { compact: true }.total_height() <= m.card_height - m.cover_height,
+                    "width={width}: 文本槽溢出"
+                );
+            }
         }
     }
 }

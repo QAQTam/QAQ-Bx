@@ -28,6 +28,14 @@
 //! 独立 composition 子树):播放页真机截图验证,结论记
 //! docs/dev-notes/liquid-glass-research.md。
 
+#![allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code,
+    clippy::all
+)]
+
 use std::{
     cell::RefCell,
     rc::Rc,
