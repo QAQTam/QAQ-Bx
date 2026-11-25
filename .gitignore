@@ -21,3 +21,7 @@
 /promo-video/.cache/
 /promo-video/assets/raw-demo.mp4
 /target/ui-demo/
+
+# Python 缓存
+__pycache__/
+*.pyc
